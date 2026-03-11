@@ -21,6 +21,13 @@ def save_auth(payload: dict) -> None:
     AUTH_PATH.write_text(json.dumps(payload, indent=2))
 
 
+def update_auth(updates: dict) -> dict:
+    current = load_auth()
+    current.update(updates)
+    save_auth(current)
+    return current
+
+
 def clear_auth() -> None:
     if AUTH_PATH.exists():
         AUTH_PATH.unlink()

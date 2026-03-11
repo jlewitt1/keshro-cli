@@ -1,10 +1,17 @@
 import json
 from pathlib import Path
 
+import httpx
 import pytest
 
-from keshro_cli import __version__
-from keshro_cli import cli
+from keshro_cli import __version__, cli
+
+
+def _auth_with_org():
+    return {
+        "default_org_id": "org-456",
+        "default_org_name": "Demo Inc",
+    }
 
 
 class _FakeResponse:
@@ -31,20 +38,95 @@ class _FakeClient:
     def get(self, path, params=None):
         self.calls.append(("GET", path, params))
         if path == "/api/plans/templates":
-            return _FakeResponse([{
-                "key": "aws-batch-to-airflow",
-                "title": "AWS Batch to Airflow",
-                "summary": "Saved migration template for AWS Batch to Airflow.",
-                "why_use_it": "Separate scheduling/orchestration logic from the containerized job payload first.",
-                "plan_steps": [
-                    {"title": "Capture current AWS Batch migration context"},
-                    {"title": "Capture migration outcome and follow-up work"},
-                ],
-            }])
+            return _FakeResponse(
+                [
+                    {
+                        "key": "aws-batch-to-airflow",
+                        "title": "AWS Batch to Airflow",
+                        "summary": "Saved migration template for AWS Batch to Airflow.",
+                        "why_use_it": "Separate scheduling/orchestration logic from the containerized job payload first.",
+                        "plan_steps": [
+                            {"title": "Capture current AWS Batch migration context"},
+                            {"title": "Capture migration outcome and follow-up work"},
+                        ],
+                    }
+                ]
+            )
+        if path == "/api/orgs":
+            return _FakeResponse(
+                [
+                    {"id": "org-123", "name": "Acme"},
+                    {"id": "org-456", "name": "Demo Inc"},
+                ]
+            )
+        if path == "/api/plans":
+            return _FakeResponse(
+                [
+                    {
+                        "id": "plan-123",
+                        "title": "AWS Batch to Airflow pilot",
+                        "status": "draft",
+                        "source_type": "AWS Batch",
+                        "target_type": "Airflow",
+                        "summary": "Pilot plan for the first DAG migration.",
+                        "template_key": "aws-batch-to-airflow",
+                        "org_id": "org-123",
+                        "updated_at": "2026-03-11T15:30:00Z",
+                    }
+                ]
+            )
+        if path == "/api/plans/plan-123":
+            return _FakeResponse(
+                {
+                    "id": "plan-123",
+                    "title": "AWS Batch to Airflow pilot",
+                    "status": "draft",
+                    "source_type": "AWS Batch",
+                    "target_type": "Airflow",
+                    "summary": "Pilot plan for the first DAG migration.",
+                    "template_key": "aws-batch-to-airflow",
+                    "import_source": "template",
+                    "org_id": "org-123",
+                    "updated_at": "2026-03-11T15:30:00Z",
+                    "plan_steps": [
+                        {
+                            "id": "review-schedules",
+                            "order": 1,
+                            "title": "Review EventBridge schedules",
+                            "description": "Map cron schedules into DAG schedules",
+                            "status": "todo",
+                            "owner": None,
+                            "notes": None,
+                            "blocked_reason": "Waiting on environment access",
+                            "artifact_links": [
+                                "https://linear.app/acme/issue/ENG-42",
+                                "https://github.com/acme/migrations/pull/19",
+                            ],
+                        }
+                    ],
+                }
+            )
         return _FakeResponse({"ok": True})
 
     def post(self, path, json=None):
         self.calls.append(("POST", path, json))
+        if path.endswith("/tasks"):
+            return _FakeResponse(
+                {
+                    "id": "plan-123",
+                    "title": "AWS Batch to Airflow pilot",
+                    "plan_steps": [
+                        {
+                            "id": "task-999",
+                            "title": json.get("title"),
+                            "status": json.get("status") or "todo",
+                            "owner": json.get("owner"),
+                            "blocked_reason": json.get("blocked_reason"),
+                            "artifact_links": json.get("artifact_links") or [],
+                        }
+                    ],
+                }
+            )
         return _FakeResponse({"path": path, "payload": json})
 
     def patch(self, path, json=None):
@@ -55,14 +137,13 @@ class _FakeClient:
 @pytest.fixture
 def fake_client(monkeypatch):
     client = _FakeClient()
-    monkeypatch.setattr(cli, "make_client", lambda args: client)
+    monkeypatch.setattr(cli, "make_client", lambda api_url=None, token=None: client)
     return client
 
 
-def test_whoami_command_removed_from_parser():
-    parser = cli.build_parser()
-    with pytest.raises(SystemExit):
-        parser.parse_args(["whoami"])
+def test_whoami_is_not_a_valid_command():
+    code = cli.main(["whoami"])
+    assert code != 0
 
 
 def test_main_without_args_prints_version(capsys):
@@ -97,11 +178,19 @@ def test_templates_alias_can_show_single_template_details(fake_client, capsys):
     assert "Plan steps:" in out
 
 
-def test_templates_alias_can_show_single_template_details_with_name_flag(fake_client, capsys):
+def test_templates_alias_can_show_single_template_details_with_name_flag(
+    fake_client, capsys
+):
     cli.main(["templates", "-n", "aws-batch-to-airflow"])
     out = capsys.readouterr().out
     assert "aws-batch-to-airflow" in out
     assert "Why use it:" in out
+
+
+def test_templates_list_alias_is_accepted(fake_client, capsys):
+    cli.main(["templates", "list"])
+    out = capsys.readouterr().out.strip().splitlines()
+    assert out == ["aws-batch-to-airflow"]
 
 
 def test_plan_create_from_template_hits_template_endpoint(fake_client, capsys):
@@ -117,6 +206,108 @@ def test_plan_create_from_template_hits_template_endpoint(fake_client, capsys):
     out = json.loads(capsys.readouterr().out)
     assert out["path"] == "/api/plans/from-template"
     assert out["payload"]["template_key"] == "aws-batch-to-airflow"
+
+
+def test_plan_list_is_concise_by_default(fake_client, capsys, monkeypatch):
+    monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: {})
+    monkeypatch.setattr("keshro_cli.client.load_auth", lambda: {})
+    cli.main(["plan", "list"])
+    out = capsys.readouterr().out
+    assert "plan-123" in out
+    assert "AWS Batch to Airflow pilot" in out
+    assert "AWS Batch -> Airflow" in out
+    assert "Pilot plan for the first DAG migration." not in out
+    assert "for org" not in out
+
+
+def test_plan_list_verbose_includes_summary_and_timestamp(fake_client, capsys):
+    cli.main(["plan", "list", "--verbose"])
+    out = capsys.readouterr().out
+    assert "Pilot plan for the first DAG migration." in out
+    assert "Updated:" in out
+    assert "2026-03-11T15:30:00Z" in out
+
+
+def test_plan_list_empty_state_shows_org_context(fake_client, capsys, monkeypatch):
+    monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_org)
+    monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_org)
+
+    class _EmptyClient(_FakeClient):
+        def get(self, path, params=None):
+            if path == "/api/plans":
+                return _FakeResponse([])
+            return super().get(path, params=params)
+
+    monkeypatch.setattr(
+        cli, "make_client", lambda api_url=None, token=None: _EmptyClient()
+    )
+    cli.main(["plan", "list"])
+    out = capsys.readouterr().out.strip()
+    assert out == "No plans found for org Demo Inc."
+
+
+def test_plan_view_shows_active_org_context(fake_client, capsys, monkeypatch):
+    monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_org)
+    monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_org)
+    cli.main(["plan", "view", "plan-123"])
+    out = capsys.readouterr().out
+    assert "for org Demo Inc" in out
+
+
+def test_plan_view_is_human_readable_by_default(fake_client, capsys, monkeypatch):
+    monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: {})
+    monkeypatch.setattr("keshro_cli.client.load_auth", lambda: {})
+    cli.main(["plan", "view", "plan-123"])
+    out = capsys.readouterr().out
+    assert "AWS Batch to Airflow pilot" in out
+    assert "Steps:" in out
+    assert "Owner: Unassigned" in out
+    assert "Map cron schedules into DAG schedules" in out
+    assert "Blocked: Waiting on environment access" in out
+    assert "Artifacts:" in out
+    assert "https://github.com/acme/migrations/pull/19" in out
+    assert "for org" not in out
+
+
+def test_json_flag_can_appear_after_subcommand(fake_client, capsys):
+    cli.main(["plan", "list", "--json"])
+    out = json.loads(capsys.readouterr().out)
+    assert out[0]["id"] == "plan-123"
+
+
+def test_config_set_persists_default_org_by_id(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "keshro_cli.cli.update_auth",
+        lambda payload: {"api_url": "http://localhost:8000", **payload},
+    )
+    code = cli.main(["config", "set", "--org-id", "org-123"])
+    out = capsys.readouterr().out.strip()
+    assert code == 0
+    assert out == "Saved default context: org-123"
+
+
+def test_config_set_can_resolve_default_org_by_name(fake_client, monkeypatch, capsys):
+    monkeypatch.setattr(
+        "keshro_cli.cli.update_auth",
+        lambda payload: {"api_url": "http://localhost:8000", **payload},
+    )
+    code = cli.main(["config", "set", "--org", "Acme"])
+    out = capsys.readouterr().out.strip()
+    assert code == 0
+    assert out == "Saved default context: Acme"
+
+
+def test_config_set_can_resolve_default_org_by_partial_name(
+    fake_client, monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        "keshro_cli.cli.update_auth",
+        lambda payload: {"api_url": "http://localhost:8000", **payload},
+    )
+    code = cli.main(["config", "set", "--org", "demo"])
+    out = capsys.readouterr().out.strip()
+    assert code == 0
+    assert out == "Saved default context: Demo Inc"
 
 
 def test_plan_create_from_claude_markdown_parses_steps(
@@ -157,11 +348,19 @@ def test_plan_task_alias_posts_task_update(fake_client, capsys):
             "Validate pilot DAG",
             "--description",
             "Run the pilot DAG end to end",
+            "--blocked-reason",
+            "Waiting on staging DAG deployment",
+            "--link",
+            "https://linear.app/acme/issue/ENG-42",
         ]
     )
     out = json.loads(capsys.readouterr().out)
-    assert out["path"] == "/api/plans/plan-123/tasks"
-    assert out["payload"]["title"] == "Validate pilot DAG"
+    assert out["id"] == "plan-123"
+    assert out["plan_steps"][0]["title"] == "Validate pilot DAG"
+    assert out["plan_steps"][0]["blocked_reason"] == "Waiting on staging DAG deployment"
+    assert out["plan_steps"][0]["artifact_links"] == [
+        "https://linear.app/acme/issue/ENG-42"
+    ]
 
 
 def test_edit_task_alias_patches_existing_task(fake_client, capsys):
@@ -175,11 +374,34 @@ def test_edit_task_alias_patches_existing_task(fake_client, capsys):
             "in_progress",
             "--owner",
             "Platform team",
+            "--link",
+            "https://github.com/acme/migrations/pull/19",
         ]
     )
     out = json.loads(capsys.readouterr().out)
     assert out["path"] == "/api/plans/plan-123/tasks/task-456"
     assert out["payload"]["status"] == "in_progress"
+    assert out["payload"]["artifact_links"] == [
+        "https://github.com/acme/migrations/pull/19"
+    ]
+
+
+def test_plan_task_human_output_shows_owner(fake_client, capsys):
+    cli.main(
+        [
+            "plan_task",
+            "plan-123",
+            "--title",
+            "Validate pilot DAG",
+            "--description",
+            "Run the pilot DAG end to end",
+            "--owner",
+            "Platform team",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert "Task:" in out
+    assert "Platform team" in out
 
 
 def test_config_prints_saved_auth_metadata(monkeypatch, capsys):
@@ -218,7 +440,9 @@ def test_auth_login_with_token_prints_human_text_by_default(monkeypatch, capsys)
             return _FakeResponse({"email": "cli@example.com", "id": "user-1"})
 
     monkeypatch.setattr("keshro_cli.auth.httpx.Client", lambda **kwargs: _AuthClient())
-    monkeypatch.setattr("keshro_cli.auth.save_auth", lambda payload: saved.update(payload))
+    monkeypatch.setattr(
+        "keshro_cli.auth.save_auth", lambda payload: saved.update(payload)
+    )
 
     cli.main(["login", "--token", "ksh_pat_test"])
     out = capsys.readouterr().out.strip()
@@ -242,7 +466,9 @@ def test_auth_login_with_token_validates_with_auth_me(monkeypatch, capsys):
             return _FakeResponse({"email": "cli@example.com", "id": "user-1"})
 
     monkeypatch.setattr("keshro_cli.auth.httpx.Client", lambda **kwargs: _AuthClient())
-    monkeypatch.setattr("keshro_cli.auth.save_auth", lambda payload: saved.update(payload))
+    monkeypatch.setattr(
+        "keshro_cli.auth.save_auth", lambda payload: saved.update(payload)
+    )
 
     cli.main(["--json", "login", "--token", "ksh_pat_test"])
     out = json.loads(capsys.readouterr().out)
@@ -300,8 +526,12 @@ def test_auth_login_without_args_uses_browser_flow(monkeypatch, capsys):
                 }
             )
 
-    monkeypatch.setattr("keshro_cli.auth.httpx.Client", lambda **kwargs: _BrowserClient())
-    monkeypatch.setattr("keshro_cli.auth.save_auth", lambda payload: saved.update(payload))
+    monkeypatch.setattr(
+        "keshro_cli.auth.httpx.Client", lambda **kwargs: _BrowserClient()
+    )
+    monkeypatch.setattr(
+        "keshro_cli.auth.save_auth", lambda payload: saved.update(payload)
+    )
     monkeypatch.setattr("keshro_cli.auth.webbrowser.open", lambda url: True)
     monkeypatch.setattr("keshro_cli.auth.time.sleep", lambda _: None)
 
@@ -310,3 +540,54 @@ def test_auth_login_without_args_uses_browser_flow(monkeypatch, capsys):
     out = json.loads(out_text[out_text.index("{") :])
     assert out["status"] == "ok"
     assert saved["token"] == "jwt-123"
+
+
+def test_http_404_errors_render_cleanly(monkeypatch, capsys):
+    class _ErrorClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, path, json=None):
+            request = httpx.Request("POST", f"http://localhost:8000{path}")
+            response = httpx.Response(
+                404, request=request, json={"detail": "Template not found"}
+            )
+            raise httpx.HTTPStatusError("not found", request=request, response=response)
+
+    monkeypatch.setattr(
+        cli, "make_client", lambda api_url=None, token=None: _ErrorClient()
+    )
+
+    code = cli.main(["plan", "create", "--from-template", "missing-template"])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert captured.out == ""
+    assert captured.err.strip() == "Keshro API error (404): Template not found"
+
+
+def test_request_errors_render_connection_help(monkeypatch, capsys):
+    class _OfflineClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, path, params=None):
+            request = httpx.Request("GET", f"http://localhost:8000{path}")
+            raise httpx.ConnectError("connection refused", request=request)
+
+    monkeypatch.setattr(
+        cli, "make_client", lambda api_url=None, token=None: _OfflineClient()
+    )
+
+    code = cli.main(["templates"])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert (
+        "Could not reach Keshro at http://localhost:8000/api/plans/templates."
+        in captured.err
+    )

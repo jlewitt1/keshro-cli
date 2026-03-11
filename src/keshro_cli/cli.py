@@ -1,47 +1,213 @@
-import argparse
 import json
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Annotated, Optional
+
+import click
+import httpx
+import typer
 
 from . import __version__
 from .auth import cmd_auth_login, cmd_auth_logout
-from .client import make_client, print_output
-from .config import DEFAULT_API_URL, load_auth
+from .client import get_default_org_id, make_client, print_output
+from .config import DEFAULT_API_URL, load_auth, update_auth
 
 
 RESET = "\033[0m"
 DIM = "\033[2m"
 CYAN = "\033[36m"
 GREEN = "\033[32m"
+YELLOW = "\033[33m"
+
+
+# ---------------------------------------------------------------------------
+# Global state – populated by the app callback before any subcommand runs
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _State:
+    api_url: str = ""
+    token: str | None = None
+    json: bool = False
+
+
+_state = _State()
+
+
+# ---------------------------------------------------------------------------
+# Typer apps
+# ---------------------------------------------------------------------------
+
+app = typer.Typer(add_completion=False, no_args_is_help=False)
+auth_app = typer.Typer(help="Authentication")
+plan_app = typer.Typer(help="Plan management")
+outcome_app = typer.Typer(help="Outcome tracking")
+config_app = typer.Typer(help="Configuration", invoke_without_command=True)
+
+app.add_typer(auth_app, name="auth")
+app.add_typer(plan_app, name="plan")
+app.add_typer(outcome_app, name="outcome")
+app.add_typer(config_app, name="config")
+
+
+# ---------------------------------------------------------------------------
+# Helpers (logic unchanged from argparse version)
+# ---------------------------------------------------------------------------
+
+
+def _clean(value: str | None) -> str:
+    return (value or "").strip()
+
+
+def _current_org_id(org_id: str | None = None) -> str | None:
+    resolved = _clean(get_default_org_id(org_id))
+    return resolved or None
+
+
+def _current_context_label() -> str | None:
+    auth = load_auth()
+    return _clean(auth.get("default_org_name") or auth.get("default_org_id")) or None
+
+
+def _resolve_org_context(
+    org_id: str | None = None, org_name: str | None = None
+) -> tuple[str | None, str | None]:
+    explicit_id = _clean(org_id)
+    if explicit_id:
+        return explicit_id, None
+    explicit_name = _clean(org_name)
+    if not explicit_name:
+        return None, None
+    with make_client(_state.api_url, _state.token) as client:
+        res = client.get("/api/orgs")
+        res.raise_for_status()
+        orgs = res.json()
+    needle = explicit_name.lower()
+    exact_matches = [org for org in orgs if _clean(org.get("name")).lower() == needle]
+    if len(exact_matches) == 1:
+        match = exact_matches[0]
+        return (
+            _clean(match.get("id")) or None,
+            _clean(match.get("name")) or explicit_name,
+        )
+    partial_matches = [org for org in orgs if needle in _clean(org.get("name")).lower()]
+    if not partial_matches:
+        raise SystemExit(f"Workspace not found: {explicit_name}")
+    if len(partial_matches) > 1:
+        options = ", ".join(
+            sorted(
+                _clean(org.get("name"))
+                for org in partial_matches
+                if _clean(org.get("name"))
+            )
+        )
+        raise SystemExit(
+            f"Multiple workspaces match '{explicit_name}': {options}. Use a more specific name or --org-id."
+        )
+    match = partial_matches[0]
+    return _clean(match.get("id")) or None, _clean(match.get("name")) or explicit_name
+
+
+def _print_plan_summary(
+    plan: dict, verbose: bool = False, context_label: str | None = None
+) -> None:
+    plan_id = plan.get("id", "")
+    title = plan.get("title") or "Untitled plan"
+    status = _clean(plan.get("status") or "draft") or "draft"
+    source = plan.get("source_type") or "Unknown source"
+    target = plan.get("target_type") or "Unknown target"
+    suffix = f"  {DIM}for org {context_label}{RESET}" if context_label else ""
+    print(
+        f"{CYAN}{plan_id}{RESET}  {title}  {DIM}[{status}]{RESET}  {source} -> {target}{suffix}"
+    )
+    if verbose:
+        if plan.get("summary"):
+            print(f"  {plan['summary']}")
+        if plan.get("template_key"):
+            print(f"  {DIM}Template:{RESET} {plan['template_key']}")
+        if plan.get("org_id"):
+            print(f"  {DIM}Org:{RESET} {plan['org_id']}")
+        if plan.get("updated_at"):
+            print(f"  {DIM}Updated:{RESET} {plan['updated_at']}")
+
+
+def _print_plan_detail(plan: dict, context_label: str | None = None) -> None:
+    _print_plan_summary(plan, verbose=True, context_label=context_label)
+    if plan.get("import_source"):
+        print(f"{DIM}Import source:{RESET} {plan['import_source']}")
+    if plan.get("migration_id"):
+        print(f"{DIM}Migration:{RESET} {plan['migration_id']}")
+    steps = plan.get("plan_steps") or []
+    if steps:
+        print(f"{DIM}Steps:{RESET}")
+        for step in steps:
+            title = step.get("title") or "Untitled step"
+            status = _clean(step.get("status") or "todo") or "todo"
+            owner = _clean(step.get("owner")) or "Unassigned"
+            step_id = _clean(step.get("id"))
+            line = f"  {step.get('order', '?')}. {title} [{status}]"
+            if step_id:
+                line = f"{line} {DIM}({step_id}){RESET}"
+            print(line)
+            print(f"     Owner: {owner}")
+            if step.get("description"):
+                print(f"     {step['description']}")
+            if step.get("blocked_reason"):
+                print(f"     Blocked: {step['blocked_reason']}")
+            links = step.get("artifact_links") or []
+            if links:
+                print("     Artifacts:")
+                for link in links:
+                    print(f"       - {link}")
+            if step.get("notes"):
+                print(f"     Notes: {step['notes']}")
+    else:
+        print(f"{DIM}Steps:{RESET} none")
+
+
+def _print_task_detail(
+    plan: dict, task_id: str | None = None, title_hint: str | None = None
+) -> None:
+    steps = plan.get("plan_steps") or []
+    task = None
+    if task_id:
+        task = next(
+            (step for step in steps if _clean(step.get("id")) == _clean(task_id)), None
+        )
+    if task is None and title_hint:
+        task = next(
+            (
+                step
+                for step in reversed(steps)
+                if _clean(step.get("title")) == _clean(title_hint)
+            ),
+            None,
+        )
+    if task is None and steps:
+        task = steps[-1]
+    if task is None:
+        print("Task updated, but no task details were returned.")
+        return
+    print(f"{DIM}Plan:{RESET} {plan.get('title') or plan.get('id') or 'Untitled plan'}")
+    print(f"{DIM}Task:{RESET} {task.get('title') or 'Untitled task'}")
+    print(f"{DIM}Status:{RESET} {_clean(task.get('status') or 'todo') or 'todo'}")
+    print(f"{DIM}Owner:{RESET} {_clean(task.get('owner')) or 'Unassigned'}")
+    if task.get("blocked_reason"):
+        print(f"{DIM}Blocked:{RESET} {task['blocked_reason']}")
+    links = task.get("artifact_links") or []
+    if links:
+        print(f"{DIM}Artifacts:{RESET}")
+        for link in links:
+            print(f"  - {link}")
 
 
 def _read_json_file(path: str | None):
     if not path:
         return []
     return json.loads(Path(path).read_text())
-
-
-def cmd_config(args):
-    auth = load_auth()
-    payload = {
-        "api_url": auth.get("api_url") or DEFAULT_API_URL,
-        "authenticated": bool(auth.get("token")),
-        "user": auth.get("user") or {},
-    }
-    if args.json:
-        print_output(payload, True)
-        return
-    user = payload["user"] or {}
-    print(f"{DIM}API URL:{RESET} {CYAN}{payload['api_url']}{RESET}")
-    print(
-        f"{DIM}Authenticated:{RESET} "
-        f"{GREEN if payload['authenticated'] else CYAN}{'yes' if payload['authenticated'] else 'no'}{RESET}"
-    )
-    if user.get("email"):
-        print(f"{DIM}User:{RESET} {CYAN}{user['email']}{RESET}")
-    if user.get("name"):
-        print(f"{DIM}Name:{RESET} {user['name']}")
 
 
 def _infer_types_from_title(title: str) -> tuple[str | None, str | None]:
@@ -92,60 +258,70 @@ def _parse_text_steps(text: str) -> tuple[str | None, list[dict]]:
     return title, steps
 
 
-def _plan_payload_from_file(args, import_source: str) -> dict:
-    body = Path(args.from_path).read_text()
-    parsed = json.loads(body) if args.from_path.endswith(".json") else None
+def _plan_payload_from_file(
+    from_path: str,
+    import_source: str,
+    title: str | None = None,
+    source_type: str | None = None,
+    target_type: str | None = None,
+    summary: str | None = None,
+    status: str | None = None,
+    migration_id: str | None = None,
+    link: list[str] | None = None,
+) -> dict:
+    body = Path(from_path).read_text()
+    parsed = json.loads(body) if from_path.endswith(".json") else None
     if isinstance(parsed, dict):
-        title = args.title or parsed.get("title") or ""
-        source_type = args.source_type or parsed.get("source_type") or ""
-        target_type = args.target_type or parsed.get("target_type") or ""
-        inferred_source, inferred_target = _infer_types_from_title(title)
+        chosen_title = title or parsed.get("title") or ""
+        chosen_source = source_type or parsed.get("source_type") or ""
+        chosen_target = target_type or parsed.get("target_type") or ""
+        inferred_source, inferred_target = _infer_types_from_title(chosen_title)
         return {
-            "title": title,
-            "source_type": source_type or inferred_source or "",
-            "target_type": target_type or inferred_target or "",
-            "summary": args.summary or parsed.get("summary"),
-            "status": args.status,
+            "title": chosen_title,
+            "source_type": chosen_source or inferred_source or "",
+            "target_type": chosen_target or inferred_target or "",
+            "summary": summary or parsed.get("summary"),
+            "status": status,
             "template_key": parsed.get("template_key"),
             "import_source": import_source,
-            "org_id": args.org_id,
-            "migration_id": args.migration_id,
+            "org_id": _current_org_id(),
+            "migration_id": migration_id,
             "plan_steps": parsed.get("plan_steps") or parsed.get("steps") or [],
-            "external_links": parsed.get("external_links") or args.link or [],
+            "external_links": parsed.get("external_links") or link or [],
         }
     if isinstance(parsed, list):
-        title = args.title or "Imported plan"
-        source_type = args.source_type or ""
-        target_type = args.target_type or ""
-        inferred_source, inferred_target = _infer_types_from_title(title)
+        chosen_title = title or "Imported plan"
+        chosen_source = source_type or ""
+        chosen_target = target_type or ""
+        inferred_source, inferred_target = _infer_types_from_title(chosen_title)
         return {
-            "title": title,
-            "source_type": source_type or inferred_source or "",
-            "target_type": target_type or inferred_target or "",
-            "summary": args.summary,
-            "status": args.status,
+            "title": chosen_title,
+            "source_type": chosen_source or inferred_source or "",
+            "target_type": chosen_target or inferred_target or "",
+            "summary": summary,
+            "status": status,
             "import_source": import_source,
-            "org_id": args.org_id,
-            "migration_id": args.migration_id,
+            "org_id": _current_org_id(),
+            "migration_id": migration_id,
             "plan_steps": parsed,
-            "external_links": args.link or [],
+            "external_links": link or [],
         }
-    title, steps = _parse_text_steps(body)
-    chosen_title = args.title or title or "Imported plan"
-    source_type = args.source_type or ""
-    target_type = args.target_type or ""
+    file_title, steps = _parse_text_steps(body)
+    chosen_title = title or file_title or "Imported plan"
+    chosen_source = source_type or ""
+    chosen_target = target_type or ""
     inferred_source, inferred_target = _infer_types_from_title(chosen_title)
     return {
         "title": chosen_title,
-        "source_type": source_type or inferred_source or "",
-        "target_type": target_type or inferred_target or "",
-        "summary": args.summary,
-        "status": args.status,
+        "source_type": chosen_source or inferred_source or "",
+        "target_type": chosen_target or inferred_target or "",
+        "summary": summary,
+        "status": status,
         "import_source": import_source,
-        "org_id": args.org_id,
-        "migration_id": args.migration_id,
+        "org_id": _current_org_id(),
+        "migration_id": migration_id,
         "plan_steps": steps,
-        "external_links": args.link or [],
+        "external_links": link or [],
     }
 
 
@@ -162,21 +338,178 @@ def _validate_plan_payload(payload: dict) -> None:
         )
 
 
-def cmd_plan_templates(args):
-    with make_client(args) as client:
+# ---------------------------------------------------------------------------
+# App callback – sets global state
+# ---------------------------------------------------------------------------
+
+
+@app.callback(invoke_without_command=True)
+def _app_callback(
+    ctx: typer.Context,
+    version: Annotated[bool, typer.Option("--version", help="Show version.")] = False,
+    api_url: Annotated[str, typer.Option("--api-url", help="Keshro API URL.")] = "",
+    token: Annotated[Optional[str], typer.Option(help="Bearer token.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="JSON output.")] = False,
+):
+    _state.api_url = api_url or load_auth().get("api_url", DEFAULT_API_URL)
+    _state.token = token
+    _state.json = json_output
+    if version:
+        print(__version__)
+        raise typer.Exit()
+    if ctx.invoked_subcommand is None:
+        print(__version__)
+        raise typer.Exit()
+
+
+# ---------------------------------------------------------------------------
+# Auth commands
+# ---------------------------------------------------------------------------
+
+
+def _do_login(
+    email: str | None = None,
+    password: str | None = None,
+    token: str | None = None,
+):
+    cmd_auth_login(
+        api_url=_state.api_url,
+        token=token,
+        email=email,
+        password=password,
+        json_output=_state.json,
+    )
+
+
+def _do_logout():
+    cmd_auth_logout(json_output=_state.json)
+
+
+@auth_app.command("login")
+def _auth_login(
+    email: Annotated[Optional[str], typer.Option(help="Email address.")] = None,
+    password: Annotated[Optional[str], typer.Option(help="Password.")] = None,
+    token: Annotated[Optional[str], typer.Option(help="Personal access token.")] = None,
+):
+    """Authenticate with Keshro."""
+    _do_login(email=email, password=password, token=token)
+
+
+@auth_app.command("logout")
+def _auth_logout():
+    """Clear locally stored credentials."""
+    _do_logout()
+
+
+@app.command("login")
+def _login_alias(
+    email: Annotated[Optional[str], typer.Option(help="Email address.")] = None,
+    password: Annotated[Optional[str], typer.Option(help="Password.")] = None,
+    token: Annotated[Optional[str], typer.Option(help="Personal access token.")] = None,
+):
+    """Authenticate with Keshro."""
+    _do_login(email=email, password=password, token=token)
+
+
+@app.command("logout")
+def _logout_alias():
+    """Clear local credentials."""
+    _do_logout()
+
+
+# ---------------------------------------------------------------------------
+# Config commands
+# ---------------------------------------------------------------------------
+
+
+def _config_show():
+    auth = load_auth()
+    payload = {
+        "api_url": auth.get("api_url") or DEFAULT_API_URL,
+        "authenticated": bool(auth.get("token")),
+        "default_org_id": auth.get("default_org_id"),
+        "default_org_name": auth.get("default_org_name"),
+        "user": auth.get("user") or {},
+    }
+    if _state.json:
+        print_output(payload, True)
+        return
+    user = payload["user"] or {}
+    print(f"{DIM}API URL:{RESET} {CYAN}{payload['api_url']}{RESET}")
+    print(
+        f"{DIM}Authenticated:{RESET} "
+        f"{GREEN if payload['authenticated'] else CYAN}{'yes' if payload['authenticated'] else 'no'}{RESET}"
+    )
+    default_context = (
+        payload["default_org_name"] or payload["default_org_id"] or "personal"
+    )
+    print(f"{DIM}Default context:{RESET} " f"{YELLOW}{default_context}{RESET}")
+    if user.get("email"):
+        print(f"{DIM}User:{RESET} {CYAN}{user['email']}{RESET}")
+    if user.get("name"):
+        print(f"{DIM}Name:{RESET} {user['name']}")
+
+
+@config_app.callback(invoke_without_command=True)
+def _config_callback(ctx: typer.Context):
+    if ctx.invoked_subcommand is None:
+        _config_show()
+
+
+@config_app.command("set")
+def _config_set(
+    org_id: Annotated[Optional[str], typer.Option("--org-id", help="Org ID.")] = None,
+    org: Annotated[Optional[str], typer.Option("--org", help="Org name.")] = None,
+    personal: Annotated[
+        bool, typer.Option("--personal", help="Use personal context.")
+    ] = False,
+):
+    """Set default workspace context."""
+    updates: dict = {}
+    if personal:
+        updates["default_org_id"] = None
+        updates["default_org_name"] = None
+    elif org_id is not None or org is not None:
+        resolved_id, resolved_name = _resolve_org_context(org_id, org)
+        updates["default_org_id"] = resolved_id
+        updates["default_org_name"] = resolved_name
+    auth = update_auth(updates)
+    payload = {
+        "api_url": auth.get("api_url") or DEFAULT_API_URL,
+        "default_org_id": auth.get("default_org_id"),
+        "default_org_name": auth.get("default_org_name"),
+    }
+    if _state.json:
+        print_output(payload, True)
+        return
+    org_label = auth.get("default_org_name") or auth.get("default_org_id") or "personal"
+    print(f"Saved default context: {org_label}")
+
+
+# ---------------------------------------------------------------------------
+# Templates
+# ---------------------------------------------------------------------------
+
+
+def _cmd_plan_templates(
+    template_name: str | None = None,
+    name: str | None = None,
+    verbose: bool = False,
+):
+    with make_client(_state.api_url, _state.token) as client:
         res = client.get("/api/plans/templates")
         res.raise_for_status()
         templates = res.json()
-        template_name = getattr(args, "template_name", None) or getattr(
-            args, "name", None
-        )
-        if template_name:
+        effective_name = template_name or name
+        if effective_name == "list":
+            effective_name = None
+        if effective_name:
             match = next(
-                (item for item in templates if item.get("key") == template_name), None
+                (item for item in templates if item.get("key") == effective_name), None
             )
             if not match:
-                raise SystemExit(f"Template not found: {template_name}")
-            if args.json:
+                raise SystemExit(f"Template not found: {effective_name}")
+            if _state.json:
                 print_output(match, True)
                 return
             print(f"{CYAN}{match['key']}{RESET}")
@@ -192,10 +525,10 @@ def cmd_plan_templates(args):
                 for step in steps:
                     print(f"  - {step.get('title', 'Untitled step')}")
             return
-        if args.json:
+        if _state.json:
             print_output(templates, True)
             return
-        if getattr(args, "verbose", False):
+        if verbose:
             for template in templates:
                 print(f"{CYAN}{template['key']}{RESET}")
                 if template.get("title"):
@@ -207,295 +540,575 @@ def cmd_plan_templates(args):
             print(template["key"])
 
 
-def cmd_plan_create(args):
-    if args.from_template:
+@app.command("templates")
+def _templates_alias(
+    template_name: Annotated[
+        Optional[str], typer.Argument(help="Template key.")
+    ] = None,
+    name: Annotated[
+        Optional[str], typer.Option("-n", "--name", help="Template key.")
+    ] = None,
+    verbose: Annotated[
+        bool, typer.Option("-v", "--verbose", help="Verbose output.")
+    ] = False,
+):
+    """List available plan templates, or show details for one."""
+    _cmd_plan_templates(template_name, name, verbose)
+
+
+@plan_app.command("templates")
+def _plan_templates(
+    template_name: Annotated[
+        Optional[str], typer.Argument(help="Template key.")
+    ] = None,
+    name: Annotated[
+        Optional[str], typer.Option("-n", "--name", help="Template key.")
+    ] = None,
+    verbose: Annotated[
+        bool, typer.Option("-v", "--verbose", help="Verbose output.")
+    ] = False,
+):
+    """List available plan templates, or show details for one."""
+    _cmd_plan_templates(template_name, name, verbose)
+
+
+# ---------------------------------------------------------------------------
+# Plan commands
+# ---------------------------------------------------------------------------
+
+
+@plan_app.command("create")
+def _plan_create(
+    title: Annotated[Optional[str], typer.Option(help="Plan title.")] = None,
+    source_type: Annotated[
+        Optional[str], typer.Option("--source-type", help="Source type.")
+    ] = None,
+    target_type: Annotated[
+        Optional[str], typer.Option("--target-type", help="Target type.")
+    ] = None,
+    summary: Annotated[Optional[str], typer.Option(help="Plan summary.")] = None,
+    status: Annotated[str, typer.Option(help="Plan status.")] = "draft",
+    org_id: Annotated[Optional[str], typer.Option("--org-id", help="Org ID.")] = None,
+    migration_id: Annotated[
+        Optional[str], typer.Option("--migration-id", help="Migration ID.")
+    ] = None,
+    steps_file: Annotated[
+        Optional[str], typer.Option("--steps-file", help="JSON file with plan steps.")
+    ] = None,
+    link: Annotated[
+        Optional[list[str]], typer.Option("--link", help="External link.")
+    ] = None,
+    from_template: Annotated[
+        Optional[str], typer.Option("--from-template", help="Create from template.")
+    ] = None,
+    from_file: Annotated[
+        Optional[str], typer.Option("--from-file", help="Import from file.")
+    ] = None,
+    from_claude: Annotated[
+        Optional[str], typer.Option("--from-claude", help="Import from Claude output.")
+    ] = None,
+):
+    """Create a new migration plan from scratch, a template, or a file."""
+    if from_file and from_claude:
+        raise typer.BadParameter("Cannot use both --from-file and --from-claude.")
+
+    if from_template:
         payload = {
-            "template_key": args.from_template,
-            "title": args.title,
-            "summary": args.summary,
-            "org_id": args.org_id,
-            "migration_id": args.migration_id,
+            "template_key": from_template,
+            "title": title,
+            "summary": summary,
+            "org_id": _current_org_id(org_id),
+            "migration_id": migration_id,
             "import_source": "template",
         }
-        with make_client(args) as client:
+        with make_client(_state.api_url, _state.token) as client:
             res = client.post("/api/plans/from-template", json=payload)
             res.raise_for_status()
-            print_output(res.json(), args.json)
+            print_output(res.json(), _state.json)
         return
 
-    if args.from_path:
+    from_path = from_file or from_claude
+    if from_path:
+        import_mode = "claude" if from_claude else "file"
         payload = _plan_payload_from_file(
-            args,
-            "claude" if args.import_mode == "claude" else "file",
+            from_path,
+            import_mode,
+            title=title,
+            source_type=source_type,
+            target_type=target_type,
+            summary=summary,
+            status=status,
+            migration_id=migration_id,
+            link=link,
         )
     else:
         payload = {
-            "title": args.title,
-            "source_type": args.source_type,
-            "target_type": args.target_type,
-            "summary": args.summary,
-            "status": args.status,
+            "title": title,
+            "source_type": source_type,
+            "target_type": target_type,
+            "summary": summary,
+            "status": status,
             "import_source": "manual",
-            "org_id": args.org_id,
-            "migration_id": args.migration_id,
-            "plan_steps": _read_json_file(args.steps_file),
-            "external_links": args.link or [],
+            "org_id": _current_org_id(org_id),
+            "migration_id": migration_id,
+            "plan_steps": _read_json_file(steps_file),
+            "external_links": link or [],
         }
     _validate_plan_payload(payload)
-    with make_client(args) as client:
+    with make_client(_state.api_url, _state.token) as client:
         res = client.post("/api/plans", json=payload)
         res.raise_for_status()
-        print_output(res.json(), args.json)
+        print_output(res.json(), _state.json)
 
 
-def cmd_plan_list(args):
-    params = {}
-    if args.org_id:
-        params["org_id"] = args.org_id
-    with make_client(args) as client:
+@plan_app.command("list")
+def _plan_list(
+    org_id: Annotated[
+        Optional[str], typer.Option("--org-id", help="Filter by org.")
+    ] = None,
+    verbose: Annotated[
+        bool, typer.Option("-v", "--verbose", help="Verbose output.")
+    ] = False,
+):
+    """List plans, optionally filtered by workspace."""
+    params: dict = {}
+    resolved_org = _current_org_id(org_id)
+    context_label = _current_context_label() if resolved_org else None
+    if resolved_org:
+        params["org_id"] = resolved_org
+    with make_client(_state.api_url, _state.token) as client:
         res = client.get("/api/plans", params=params)
         res.raise_for_status()
-        print_output(res.json(), args.json)
+        plans = res.json()
+        if _state.json:
+            print_output(plans, True)
+            return
+        if not plans:
+            if context_label:
+                print(f"No plans found for org {context_label}.")
+            else:
+                print("No plans found.")
+            return
+        for plan in plans:
+            _print_plan_summary(plan, verbose=verbose, context_label=context_label)
 
 
-def cmd_plan_view(args):
-    with make_client(args) as client:
-        res = client.get(f"/api/plans/{args.plan_id}")
+@plan_app.command("view")
+def _plan_view(
+    plan_id: Annotated[str, typer.Argument(help="Plan ID.")],
+):
+    """Show full details for a plan including steps."""
+    with make_client(_state.api_url, _state.token) as client:
+        res = client.get(f"/api/plans/{plan_id}")
         res.raise_for_status()
-        print_output(res.json(), args.json)
+        plan = res.json()
+        if _state.json:
+            print_output(plan, True)
+            return
+        context_label = _current_context_label() if _current_org_id() else None
+        _print_plan_detail(plan, context_label=context_label)
 
 
-def cmd_plan_update(args):
-    payload = {}
-    for key in [
-        "title",
-        "source_type",
-        "target_type",
-        "summary",
-        "status",
-        "migration_id",
+@plan_app.command("update")
+def _plan_update(
+    plan_id: Annotated[str, typer.Argument(help="Plan ID.")],
+    title: Annotated[Optional[str], typer.Option(help="Plan title.")] = None,
+    source_type: Annotated[
+        Optional[str], typer.Option("--source-type", help="Source type.")
+    ] = None,
+    target_type: Annotated[
+        Optional[str], typer.Option("--target-type", help="Target type.")
+    ] = None,
+    summary: Annotated[Optional[str], typer.Option(help="Plan summary.")] = None,
+    status: Annotated[Optional[str], typer.Option(help="Plan status.")] = None,
+    migration_id: Annotated[
+        Optional[str], typer.Option("--migration-id", help="Migration ID.")
+    ] = None,
+    steps_file: Annotated[
+        Optional[str], typer.Option("--steps-file", help="JSON file with plan steps.")
+    ] = None,
+    link: Annotated[
+        Optional[list[str]], typer.Option("--link", help="External link.")
+    ] = None,
+):
+    """Update an existing plan's metadata or steps."""
+    payload: dict = {}
+    for key, value in [
+        ("title", title),
+        ("source_type", source_type),
+        ("target_type", target_type),
+        ("summary", summary),
+        ("status", status),
+        ("migration_id", migration_id),
     ]:
-        value = getattr(args, key, None)
         if value is not None:
             payload[key] = value
-    if args.steps_file:
-        payload["plan_steps"] = _read_json_file(args.steps_file)
-    if args.link is not None:
-        payload["external_links"] = args.link
-    with make_client(args) as client:
-        res = client.patch(f"/api/plans/{args.plan_id}", json=payload)
+    if steps_file:
+        payload["plan_steps"] = _read_json_file(steps_file)
+    if link is not None:
+        payload["external_links"] = link
+    with make_client(_state.api_url, _state.token) as client:
+        res = client.patch(f"/api/plans/{plan_id}", json=payload)
         res.raise_for_status()
-        print_output(res.json(), args.json)
+        print_output(res.json(), _state.json)
 
 
-def cmd_plan_task(args):
+# ---------------------------------------------------------------------------
+# Task commands
+# ---------------------------------------------------------------------------
+
+
+def _do_task_add(
+    plan_id: str,
+    title: str,
+    description: str,
+    status: str = "todo",
+    owner: str | None = None,
+    notes: str | None = None,
+    linear_issue_id: str | None = None,
+    blocked_reason: str | None = None,
+    link: list[str] | None = None,
+):
     payload = {
-        "title": args.title,
-        "description": args.description,
-        "status": args.status,
-        "owner": args.owner,
-        "notes": args.notes,
-        "linear_issue_id": args.linear_issue_id,
+        "title": title,
+        "description": description,
+        "status": status,
+        "owner": owner,
+        "notes": notes,
+        "linear_issue_id": linear_issue_id,
+        "blocked_reason": blocked_reason,
+        "artifact_links": link or [],
     }
-    with make_client(args) as client:
-        res = client.post(f"/api/plans/{args.plan_id}/tasks", json=payload)
+    with make_client(_state.api_url, _state.token) as client:
+        res = client.post(f"/api/plans/{plan_id}/tasks", json=payload)
         res.raise_for_status()
-        print_output(res.json(), args.json)
+        plan = res.json()
+        if _state.json:
+            print_output(plan, True)
+            return
+        _print_task_detail(plan, title_hint=title)
 
 
-def cmd_edit_task(args):
-    payload = {}
-    for key in ["title", "description", "status", "owner", "notes", "linear_issue_id"]:
-        value = getattr(args, key, None)
+def _do_task_update(
+    plan_id: str,
+    task_id: str,
+    title: str | None = None,
+    description: str | None = None,
+    status: str | None = None,
+    owner: str | None = None,
+    notes: str | None = None,
+    linear_issue_id: str | None = None,
+    blocked_reason: str | None = None,
+    link: list[str] | None = None,
+):
+    payload: dict = {}
+    for key, value in [
+        ("title", title),
+        ("description", description),
+        ("status", status),
+        ("owner", owner),
+        ("notes", notes),
+        ("linear_issue_id", linear_issue_id),
+        ("blocked_reason", blocked_reason),
+    ]:
         if value is not None:
             payload[key] = value
-    with make_client(args) as client:
+    if link is not None:
+        payload["artifact_links"] = link
+    with make_client(_state.api_url, _state.token) as client:
         res = client.patch(
-            f"/api/plans/{args.plan_id}/tasks/{args.task_id}",
+            f"/api/plans/{plan_id}/tasks/{task_id}",
             json=payload,
         )
         res.raise_for_status()
-        print_output(res.json(), args.json)
+        plan = res.json()
+        if _state.json:
+            print_output(plan, True)
+            return
+        _print_task_detail(plan, task_id=task_id)
 
 
-def cmd_outcome_view(args):
-    with make_client(args) as client:
-        res = client.get(f"/api/plans/{args.plan_id}/outcome")
+# Shared option definitions for task commands
+_task_add_options = dict(
+    title=typer.Option(..., "--title", help="Task title."),
+    description=typer.Option(..., "--description", help="Task description."),
+    status=typer.Option("todo", help="Task status."),
+    owner=typer.Option(None, help="Task owner."),
+    notes=typer.Option(None, help="Task notes."),
+    linear_issue_id=typer.Option(None, "--linear-issue-id", help="Linear issue ID."),
+    blocked_reason=typer.Option(None, "--blocked-reason", help="Blocked reason."),
+    link=typer.Option(None, "--link", help="Artifact link."),
+)
+
+
+@plan_app.command("task-add")
+def _plan_task_add(
+    plan_id: Annotated[str, typer.Argument(help="Plan ID.")],
+    title: Annotated[str, typer.Option("--title", help="Task title.")],
+    description: Annotated[
+        str, typer.Option("--description", help="Task description.")
+    ],
+    status: Annotated[str, typer.Option(help="Task status.")] = "todo",
+    owner: Annotated[Optional[str], typer.Option(help="Task owner.")] = None,
+    notes: Annotated[Optional[str], typer.Option(help="Task notes.")] = None,
+    linear_issue_id: Annotated[
+        Optional[str], typer.Option("--linear-issue-id", help="Linear issue ID.")
+    ] = None,
+    blocked_reason: Annotated[
+        Optional[str], typer.Option("--blocked-reason", help="Blocked reason.")
+    ] = None,
+    link: Annotated[
+        Optional[list[str]], typer.Option("--link", help="Artifact link.")
+    ] = None,
+):
+    """Add a new task to a plan."""
+    _do_task_add(
+        plan_id,
+        title,
+        description,
+        status,
+        owner,
+        notes,
+        linear_issue_id,
+        blocked_reason,
+        link,
+    )
+
+
+@plan_app.command("task-update")
+def _plan_task_update(
+    plan_id: Annotated[str, typer.Argument(help="Plan ID.")],
+    task_id: Annotated[str, typer.Argument(help="Task ID.")],
+    title: Annotated[Optional[str], typer.Option("--title", help="Task title.")] = None,
+    description: Annotated[
+        Optional[str], typer.Option("--description", help="Task description.")
+    ] = None,
+    status: Annotated[Optional[str], typer.Option(help="Task status.")] = None,
+    owner: Annotated[Optional[str], typer.Option(help="Task owner.")] = None,
+    notes: Annotated[Optional[str], typer.Option(help="Task notes.")] = None,
+    linear_issue_id: Annotated[
+        Optional[str], typer.Option("--linear-issue-id", help="Linear issue ID.")
+    ] = None,
+    blocked_reason: Annotated[
+        Optional[str], typer.Option("--blocked-reason", help="Blocked reason.")
+    ] = None,
+    link: Annotated[
+        Optional[list[str]], typer.Option("--link", help="Artifact link.")
+    ] = None,
+):
+    """Update an existing task's status, owner, or details."""
+    _do_task_update(
+        plan_id,
+        task_id,
+        title,
+        description,
+        status,
+        owner,
+        notes,
+        linear_issue_id,
+        blocked_reason,
+        link,
+    )
+
+
+# Legacy aliases
+
+
+@app.command("plan_task", hidden=True)
+def _plan_task_alias(
+    plan_id: Annotated[str, typer.Argument(help="Plan ID.")],
+    title: Annotated[str, typer.Option("--title", help="Task title.")],
+    description: Annotated[
+        str, typer.Option("--description", help="Task description.")
+    ],
+    status: Annotated[str, typer.Option(help="Task status.")] = "todo",
+    owner: Annotated[Optional[str], typer.Option(help="Task owner.")] = None,
+    notes: Annotated[Optional[str], typer.Option(help="Task notes.")] = None,
+    linear_issue_id: Annotated[
+        Optional[str], typer.Option("--linear-issue-id", help="Linear issue ID.")
+    ] = None,
+    blocked_reason: Annotated[
+        Optional[str], typer.Option("--blocked-reason", help="Blocked reason.")
+    ] = None,
+    link: Annotated[
+        Optional[list[str]], typer.Option("--link", help="Artifact link.")
+    ] = None,
+):
+    _do_task_add(
+        plan_id,
+        title,
+        description,
+        status,
+        owner,
+        notes,
+        linear_issue_id,
+        blocked_reason,
+        link,
+    )
+
+
+@app.command("edit_task", hidden=True)
+def _edit_task_alias(
+    plan_id: Annotated[str, typer.Argument(help="Plan ID.")],
+    task_id: Annotated[str, typer.Argument(help="Task ID.")],
+    title: Annotated[Optional[str], typer.Option("--title", help="Task title.")] = None,
+    description: Annotated[
+        Optional[str], typer.Option("--description", help="Task description.")
+    ] = None,
+    status: Annotated[Optional[str], typer.Option(help="Task status.")] = None,
+    owner: Annotated[Optional[str], typer.Option(help="Task owner.")] = None,
+    notes: Annotated[Optional[str], typer.Option(help="Task notes.")] = None,
+    linear_issue_id: Annotated[
+        Optional[str], typer.Option("--linear-issue-id", help="Linear issue ID.")
+    ] = None,
+    blocked_reason: Annotated[
+        Optional[str], typer.Option("--blocked-reason", help="Blocked reason.")
+    ] = None,
+    link: Annotated[
+        Optional[list[str]], typer.Option("--link", help="Artifact link.")
+    ] = None,
+):
+    _do_task_update(
+        plan_id,
+        task_id,
+        title,
+        description,
+        status,
+        owner,
+        notes,
+        linear_issue_id,
+        blocked_reason,
+        link,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Outcome commands
+# ---------------------------------------------------------------------------
+
+
+@outcome_app.command("view")
+def _outcome_view(
+    plan_id: Annotated[str, typer.Argument(help="Plan ID.")],
+):
+    """View the outcome record for a plan."""
+    with make_client(_state.api_url, _state.token) as client:
+        res = client.get(f"/api/plans/{plan_id}/outcome")
         res.raise_for_status()
-        print_output(res.json(), args.json)
+        print_output(res.json(), _state.json)
 
 
-def cmd_outcome_save(args):
+@outcome_app.command("save")
+def _outcome_save(
+    plan_id: Annotated[str, typer.Argument(help="Plan ID.")],
+    status: Annotated[str, typer.Option(help="Outcome status.")],
+    summary: Annotated[Optional[str], typer.Option(help="Outcome summary.")] = None,
+    notes: Annotated[Optional[str], typer.Option(help="Outcome notes.")] = None,
+    actual_hours: Annotated[
+        Optional[int], typer.Option("--actual-hours", help="Actual hours.")
+    ] = None,
+    actual_cost: Annotated[
+        Optional[int], typer.Option("--actual-cost", help="Actual cost.")
+    ] = None,
+):
+    """Save the outcome of a completed migration plan."""
     payload = {
-        "status": args.status,
-        "summary": args.summary,
-        "notes": args.notes,
-        "actual_hours": args.actual_hours,
-        "actual_cost": args.actual_cost,
+        "status": status,
+        "summary": summary,
+        "notes": notes,
+        "actual_hours": actual_hours,
+        "actual_cost": actual_cost,
     }
-    with make_client(args) as client:
-        res = client.post(f"/api/plans/{args.plan_id}/outcome", json=payload)
+    with make_client(_state.api_url, _state.token) as client:
+        res = client.post(f"/api/plans/{plan_id}/outcome", json=payload)
         res.raise_for_status()
-        print_output(res.json(), args.json)
+        print_output(res.json(), _state.json)
 
 
-def _add_create_args(create):
-    create.add_argument("--title")
-    create.add_argument("--source-type")
-    create.add_argument("--target-type")
-    create.add_argument("--summary")
-    create.add_argument("--status", default="draft")
-    create.add_argument("--org-id")
-    create.add_argument("--migration-id")
-    create.add_argument("--steps-file")
-    create.add_argument("--link", action="append")
-    create.add_argument("--from-template")
-    mode = create.add_mutually_exclusive_group()
-    mode.add_argument("--from-file", dest="from_path")
-    mode.add_argument("--from-claude", dest="from_path")
+# ---------------------------------------------------------------------------
+# Error handlers
+# ---------------------------------------------------------------------------
 
 
-def _add_task_create_args(parser):
-    parser.add_argument("plan_id")
-    parser.add_argument("--title", required=True)
-    parser.add_argument("--description", required=True)
-    parser.add_argument("--status", default="todo")
-    parser.add_argument("--owner")
-    parser.add_argument("--notes")
-    parser.add_argument("--linear-issue-id")
-    parser.set_defaults(func=cmd_plan_task)
+def _extract_error_detail(response: httpx.Response) -> str:
+    try:
+        payload = response.json()
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        detail = payload.get("detail")
+        if isinstance(detail, str) and detail.strip():
+            return detail.strip()
+        if isinstance(detail, list) and detail:
+            first = detail[0]
+            if isinstance(first, dict):
+                msg = first.get("msg") or first.get("message")
+                if isinstance(msg, str) and msg.strip():
+                    return msg.strip()
+    text = response.text.strip()
+    if text:
+        return text
+    return response.reason_phrase or "Request failed"
 
 
-def _add_task_update_args(parser):
-    parser.add_argument("plan_id")
-    parser.add_argument("task_id")
-    parser.add_argument("--title")
-    parser.add_argument("--description")
-    parser.add_argument("--status")
-    parser.add_argument("--owner")
-    parser.add_argument("--notes")
-    parser.add_argument("--linear-issue-id")
-    parser.set_defaults(func=cmd_edit_task)
+def _print_http_error(exc: httpx.HTTPStatusError) -> None:
+    response = exc.response
+    detail = _extract_error_detail(response)
+    status = response.status_code
+    payload = {
+        "status": "error",
+        "code": status,
+        "detail": detail,
+        "path": response.request.url.path,
+    }
+    if _state.json:
+        print_output(payload, True)
+        return
+    print(f"Keshro API error ({status}): {detail}", file=sys.stderr)
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="keshro")
-    parser.add_argument("--version", action="version", version=__version__)
-    parser.add_argument(
-        "--api-url", default=load_auth().get("api_url", DEFAULT_API_URL)
-    )
-    parser.add_argument("--token")
-    parser.add_argument("--json", action="store_true")
-    sub = parser.add_subparsers(dest="command", required=True)
+def _print_request_error(exc: httpx.RequestError) -> None:
+    url = str(exc.request.url) if exc.request else _state.api_url
+    detail = f"Could not reach Keshro at {url}. Check that the API is running and your --api-url is correct."
+    payload = {"status": "error", "detail": detail}
+    if _state.json:
+        print_output(payload, True)
+        return
+    print(detail, file=sys.stderr)
 
-    auth = sub.add_parser("auth")
-    auth_sub = auth.add_subparsers(dest="auth_command", required=True)
 
-    login = auth_sub.add_parser("login")
-    login.add_argument("--email")
-    login.add_argument("--password")
-    login.add_argument("--token")
-    login.set_defaults(func=cmd_auth_login)
-
-    logout = auth_sub.add_parser("logout")
-    logout.set_defaults(func=cmd_auth_logout)
-
-    login_alias = sub.add_parser("login")
-    login_alias.add_argument("--email")
-    login_alias.add_argument("--password")
-    login_alias.add_argument("--token")
-    login_alias.set_defaults(func=cmd_auth_login)
-
-    logout_alias = sub.add_parser("logout")
-    logout_alias.set_defaults(func=cmd_auth_logout)
-
-    config_cmd = sub.add_parser("config")
-    config_cmd.set_defaults(func=cmd_config)
-
-    templates_alias = sub.add_parser("templates")
-    templates_alias.add_argument("template_name", nargs="?")
-    templates_alias.add_argument("-n", "--name")
-    templates_alias.add_argument("-v", "--verbose", action="store_true")
-    templates_alias.set_defaults(func=cmd_plan_templates)
-
-    plan = sub.add_parser("plan")
-    plan_sub = plan.add_subparsers(dest="plan_command", required=True)
-
-    templates = plan_sub.add_parser("templates")
-    templates.add_argument("template_name", nargs="?")
-    templates.add_argument("-n", "--name")
-    templates.add_argument("-v", "--verbose", action="store_true")
-    templates.set_defaults(func=cmd_plan_templates)
-
-    create = plan_sub.add_parser("create")
-    _add_create_args(create)
-    create.set_defaults(
-        func=cmd_plan_create,
-        import_mode="file",
-    )
-
-    listing = plan_sub.add_parser("list")
-    listing.add_argument("--org-id")
-    listing.set_defaults(func=cmd_plan_list)
-
-    view = plan_sub.add_parser("view")
-    view.add_argument("plan_id")
-    view.set_defaults(func=cmd_plan_view)
-
-    update = plan_sub.add_parser("update")
-    update.add_argument("plan_id")
-    update.add_argument("--title")
-    update.add_argument("--source-type")
-    update.add_argument("--target-type")
-    update.add_argument("--summary")
-    update.add_argument("--status")
-    update.add_argument("--migration-id")
-    update.add_argument("--steps-file")
-    update.add_argument("--link", action="append")
-    update.set_defaults(func=cmd_plan_update)
-
-    task_add = plan_sub.add_parser("task-add")
-    _add_task_create_args(task_add)
-
-    task_update = plan_sub.add_parser("task-update")
-    _add_task_update_args(task_update)
-
-    legacy_task_add = sub.add_parser("plan_task")
-    _add_task_create_args(legacy_task_add)
-
-    legacy_task_update = sub.add_parser("edit_task")
-    _add_task_update_args(legacy_task_update)
-
-    outcome = sub.add_parser("outcome")
-    outcome_sub = outcome.add_subparsers(dest="outcome_command", required=True)
-
-    outcome_view = outcome_sub.add_parser("view")
-    outcome_view.add_argument("plan_id")
-    outcome_view.set_defaults(func=cmd_outcome_view)
-
-    outcome_save = outcome_sub.add_parser("save")
-    outcome_save.add_argument("plan_id")
-    outcome_save.add_argument("--status", required=True)
-    outcome_save.add_argument("--summary")
-    outcome_save.add_argument("--notes")
-    outcome_save.add_argument("--actual-hours", type=int)
-    outcome_save.add_argument("--actual-cost", type=int)
-    outcome_save.set_defaults(func=cmd_outcome_save)
-
-    return parser
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
 
 
 def main(argv: list[str] | None = None):
     argv = sys.argv[1:] if argv is None else argv
     if not argv:
         print(__version__)
-        return
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    if getattr(args, "from_path", None):
-        args.import_mode = "claude" if "--from-claude" in argv else "file"
-    args.func(args)
+        return 0
+    # Allow --json anywhere in the command line by hoisting it to the front
+    if "--json" in argv[1:]:
+        argv = [arg for arg in argv if arg != "--json"]
+        argv = ["--json", *argv]
+    try:
+        app(argv, standalone_mode=False)
+        return 0
+    except SystemExit as exc:
+        if isinstance(exc.code, str):
+            print(exc.code, file=sys.stderr)
+            return 1
+        return exc.code if isinstance(exc.code, int) and exc.code != 0 else 0
+    except click.exceptions.UsageError as exc:
+        print(f"Error: {exc.format_message()}", file=sys.stderr)
+        return 2
+    except httpx.HTTPStatusError as exc:
+        _print_http_error(exc)
+        return 1
+    except httpx.RequestError as exc:
+        _print_request_error(exc)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

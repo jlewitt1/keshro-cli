@@ -38,15 +38,20 @@ def _browser_login(base_url: str) -> dict:
     raise SystemExit("CLI browser login timed out. Start again.")
 
 
-def cmd_auth_login(args):
-    if args.token:
-        token = args.token.strip()
-    elif not args.email and not args.password:
-        body = _browser_login(get_api_url(args))
-        save_auth(
-            {"token": body["token"], "user": body["user"], "api_url": get_api_url(args)}
-        )
-        if args.json:
+def cmd_auth_login(
+    api_url: str | None = None,
+    token: str | None = None,
+    email: str | None = None,
+    password: str | None = None,
+    json_output: bool = False,
+):
+    base_url = get_api_url(api_url)
+    if token:
+        token = token.strip()
+    elif not email and not password:
+        body = _browser_login(base_url)
+        save_auth({"token": body["token"], "user": body["user"], "api_url": base_url})
+        if json_output:
             print_output({"status": "ok", "user": body["user"]["email"]}, True)
         else:
             print(f"Successfully logged in to Keshro as {body['user']['email']}.")
@@ -54,12 +59,12 @@ def cmd_auth_login(args):
     else:
         token = ""
 
-    if not token and args.email and not args.password:
-        args.password = getpass("Keshro password: ")
-    if not token and bool(args.email) != bool(args.password):
+    if not token and email and not password:
+        password = getpass("Keshro password: ")
+    if not token and bool(email) != bool(password):
         raise SystemExit("Provide both --email and --password, or use --token.")
 
-    with httpx.Client(base_url=get_api_url(args), timeout=30) as client:
+    with httpx.Client(base_url=base_url, timeout=30) as client:
         if token:
             res = client.get(
                 "/api/auth/me",
@@ -70,23 +75,21 @@ def cmd_auth_login(args):
         else:
             res = client.post(
                 "/api/auth/login",
-                json={"email": args.email, "password": args.password},
+                json={"email": email, "password": password},
             )
             res.raise_for_status()
             body = res.json()
         res.raise_for_status()
-        save_auth(
-            {"token": body["token"], "user": body["user"], "api_url": get_api_url(args)}
-        )
-        if args.json:
+        save_auth({"token": body["token"], "user": body["user"], "api_url": base_url})
+        if json_output:
             print_output({"status": "ok", "user": body["user"]["email"]}, True)
         else:
             print(f"Successfully logged in to Keshro as {body['user']['email']}.")
 
 
-def cmd_auth_logout(args):
+def cmd_auth_logout(json_output: bool = False):
     clear_auth()
-    if args.json:
+    if json_output:
         print_output({"status": "ok", "detail": "Local auth cleared."}, True)
     else:
         print("Logged out of Keshro.")
