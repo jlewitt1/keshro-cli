@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+.python-version
+.DS_Store
+dist/
+build/
+*.egg-info/
+.idea/
+.qodo/

@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "keshro"
+version = "0.1.0"
+description = "Keshro CLI"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.28",
+]
+
+[project.scripts]
+keshro = "keshro_cli.cli:main"
+kr = "keshro_cli.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/keshro_cli"]
