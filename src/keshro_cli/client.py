@@ -6,15 +6,13 @@ from .config import DEFAULT_API_URL, load_auth
 
 
 def get_token(args) -> str:
-    return (
-        getattr(args, "token", None)
-        or load_auth().get("token")
-        or ""
-    )
+    return getattr(args, "token", None) or load_auth().get("token") or ""
 
 
 def get_api_url(args) -> str:
-    return getattr(args, "api_url", None) or load_auth().get("api_url") or DEFAULT_API_URL
+    return (
+        getattr(args, "api_url", None) or load_auth().get("api_url") or DEFAULT_API_URL
+    )
 
 
 def make_client(args) -> httpx.Client:

@@ -16,5 +16,10 @@ dependencies = [
 keshro = "keshro_cli.cli:main"
 kr = "keshro_cli.cli:main"
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/keshro_cli"]

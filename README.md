@@ -2,12 +2,27 @@
 
 Thin CLI for Keshro's hosted API.
 
+## Alpha access
+
+To use the private alpha CLI, a user needs:
+
+1. A Keshro account
+2. CLI access enabled on the Keshro backend
+3. Read access to this private GitHub repo
+4. `uv` installed locally
+
 ## Install
 
-Private repo install with `uv`:
+Private repo install with `uv` over SSH:
 
 ```bash
 uv tool install git+ssh://git@github.com/jlewitt1/keshro-cli.git
+```
+
+Update an existing install:
+
+```bash
+uv tool install --force git+ssh://git@github.com/jlewitt1/keshro-cli.git
 ```
 
 Local development install:
@@ -29,11 +44,15 @@ export KESHRO_API_URL="https://app.keshro.com"
 ## Auth
 
 ```bash
-keshro auth login --email you@example.com --password '...'
-keshro auth whoami
+keshro
+kr
+keshro login --token ksh_pat_...
+keshro logout
 ```
 
 Auth state is stored in `~/.keshro/auth.json`.
+
+Create API tokens from the Keshro Account -> API page. If CLI access is not enabled for the account, authenticated plan and outcome commands will return `403`.
 
 ## Commands
 
