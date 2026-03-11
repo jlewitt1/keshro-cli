@@ -133,6 +133,10 @@ class _FakeClient:
         self.calls.append(("PATCH", path, json))
         return _FakeResponse({"path": path, "payload": json})
 
+    def delete(self, path):
+        self.calls.append(("DELETE", path, None))
+        return _FakeResponse({"success": True, "path": path})
+
 
 @pytest.fixture
 def fake_client(monkeypatch):
@@ -199,6 +203,8 @@ def test_plan_create_from_template_hits_template_endpoint(fake_client, capsys):
             "--json",
             "plan",
             "create",
+            "--migration-id",
+            "migration-123",
             "--from-template",
             "aws-batch-to-airflow",
         ]
@@ -206,6 +212,7 @@ def test_plan_create_from_template_hits_template_endpoint(fake_client, capsys):
     out = json.loads(capsys.readouterr().out)
     assert out["path"] == "/api/plans/from-template"
     assert out["payload"]["template_key"] == "aws-batch-to-airflow"
+    assert out["payload"]["migration_id"] == "migration-123"
 
 
 def test_plan_list_is_concise_by_default(fake_client, capsys, monkeypatch):
@@ -269,6 +276,13 @@ def test_plan_view_is_human_readable_by_default(fake_client, capsys, monkeypatch
     assert "for org" not in out
 
 
+def test_plan_delete_calls_delete_endpoint(fake_client, capsys):
+    cli.main(["--json", "plan", "delete", "plan-123"])
+    out = json.loads(capsys.readouterr().out)
+    assert out["success"] is True
+    assert out["path"] == "/api/plans/plan-123"
+
+
 def test_json_flag_can_appear_after_subcommand(fake_client, capsys):
     cli.main(["plan", "list", "--json"])
     out = json.loads(capsys.readouterr().out)
@@ -324,6 +338,8 @@ def test_plan_create_from_claude_markdown_parses_steps(
             "--json",
             "plan",
             "create",
+            "--migration-id",
+            "migration-123",
             "--from-claude",
             str(source),
         ]
@@ -332,17 +348,17 @@ def test_plan_create_from_claude_markdown_parses_steps(
     payload = out["payload"]
     assert out["path"] == "/api/plans"
     assert payload["title"] == "AWS Batch to Airflow"
-    assert payload["source_type"] == "AWS Batch"
-    assert payload["target_type"] == "Airflow"
+    assert payload["migration_id"] == "migration-123"
     assert payload["import_source"] == "claude"
     assert len(payload["plan_steps"]) == 2
 
 
-def test_plan_task_alias_posts_task_update(fake_client, capsys):
+def test_task_plan_posts_task_update(fake_client, capsys):
     cli.main(
         [
             "--json",
-            "plan_task",
+            "task",
+            "plan",
             "plan-123",
             "--title",
             "Validate pilot DAG",
@@ -363,11 +379,12 @@ def test_plan_task_alias_posts_task_update(fake_client, capsys):
     ]
 
 
-def test_edit_task_alias_patches_existing_task(fake_client, capsys):
+def test_task_edit_patches_existing_task(fake_client, capsys):
     cli.main(
         [
             "--json",
-            "edit_task",
+            "task",
+            "edit",
             "plan-123",
             "task-456",
             "--status",
@@ -386,10 +403,11 @@ def test_edit_task_alias_patches_existing_task(fake_client, capsys):
     ]
 
 
-def test_plan_task_human_output_shows_owner(fake_client, capsys):
+def test_task_plan_human_output_shows_owner(fake_client, capsys):
     cli.main(
         [
-            "plan_task",
+            "task",
+            "plan",
             "plan-123",
             "--title",
             "Validate pilot DAG",
@@ -561,11 +579,27 @@ def test_http_404_errors_render_cleanly(monkeypatch, capsys):
         cli, "make_client", lambda api_url=None, token=None: _ErrorClient()
     )
 
-    code = cli.main(["plan", "create", "--from-template", "missing-template"])
+    code = cli.main(
+        [
+            "plan",
+            "create",
+            "--migration-id",
+            "migration-123",
+            "--from-template",
+            "missing-template",
+        ]
+    )
     captured = capsys.readouterr()
     assert code == 1
     assert captured.out == ""
     assert captured.err.strip() == "Keshro API error (404): Template not found"
+
+
+def test_plan_create_requires_migration_id(fake_client, capsys):
+    code = cli.main(["plan", "create", "--title", "Manual plan"])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "Missing required plan fields: migration_id" in captured.err
 
 
 def test_request_errors_render_connection_help(monkeypatch, capsys):

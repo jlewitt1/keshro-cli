@@ -44,11 +44,13 @@ _state = _State()
 app = typer.Typer(add_completion=False, no_args_is_help=False)
 auth_app = typer.Typer(help="Authentication")
 plan_app = typer.Typer(help="Plan management")
+task_app = typer.Typer(help="Task management")
 outcome_app = typer.Typer(help="Outcome tracking")
 config_app = typer.Typer(help="Configuration", invoke_without_command=True)
 
 app.add_typer(auth_app, name="auth")
 app.add_typer(plan_app, name="plan")
+app.add_typer(task_app, name="task")
 app.add_typer(outcome_app, name="outcome")
 app.add_typer(config_app, name="config")
 
@@ -262,8 +264,6 @@ def _plan_payload_from_file(
     from_path: str,
     import_source: str,
     title: str | None = None,
-    source_type: str | None = None,
-    target_type: str | None = None,
     summary: str | None = None,
     status: str | None = None,
     migration_id: str | None = None,
@@ -273,52 +273,34 @@ def _plan_payload_from_file(
     parsed = json.loads(body) if from_path.endswith(".json") else None
     if isinstance(parsed, dict):
         chosen_title = title or parsed.get("title") or ""
-        chosen_source = source_type or parsed.get("source_type") or ""
-        chosen_target = target_type or parsed.get("target_type") or ""
-        inferred_source, inferred_target = _infer_types_from_title(chosen_title)
         return {
             "title": chosen_title,
-            "source_type": chosen_source or inferred_source or "",
-            "target_type": chosen_target or inferred_target or "",
             "summary": summary or parsed.get("summary"),
             "status": status,
             "template_key": parsed.get("template_key"),
             "import_source": import_source,
-            "org_id": _current_org_id(),
             "migration_id": migration_id,
             "plan_steps": parsed.get("plan_steps") or parsed.get("steps") or [],
             "external_links": parsed.get("external_links") or link or [],
         }
     if isinstance(parsed, list):
         chosen_title = title or "Imported plan"
-        chosen_source = source_type or ""
-        chosen_target = target_type or ""
-        inferred_source, inferred_target = _infer_types_from_title(chosen_title)
         return {
             "title": chosen_title,
-            "source_type": chosen_source or inferred_source or "",
-            "target_type": chosen_target or inferred_target or "",
             "summary": summary,
             "status": status,
             "import_source": import_source,
-            "org_id": _current_org_id(),
             "migration_id": migration_id,
             "plan_steps": parsed,
             "external_links": link or [],
         }
     file_title, steps = _parse_text_steps(body)
     chosen_title = title or file_title or "Imported plan"
-    chosen_source = source_type or ""
-    chosen_target = target_type or ""
-    inferred_source, inferred_target = _infer_types_from_title(chosen_title)
     return {
         "title": chosen_title,
-        "source_type": chosen_source or inferred_source or "",
-        "target_type": chosen_target or inferred_target or "",
         "summary": summary,
         "status": status,
         "import_source": import_source,
-        "org_id": _current_org_id(),
         "migration_id": migration_id,
         "plan_steps": steps,
         "external_links": link or [],
@@ -328,13 +310,13 @@ def _plan_payload_from_file(
 def _validate_plan_payload(payload: dict) -> None:
     missing = [
         key
-        for key in ["title", "source_type", "target_type"]
+        for key in ["title", "migration_id"]
         if not str(payload.get(key) or "").strip()
     ]
     if missing:
         raise SystemExit(
             f"Missing required plan fields: {', '.join(missing)}. "
-            "Provide them directly or include them in the imported file."
+            "Create the plan from a migration context and provide them directly or include them in the imported file."
         )
 
 
@@ -580,17 +562,10 @@ def _plan_templates(
 @plan_app.command("create")
 def _plan_create(
     title: Annotated[Optional[str], typer.Option(help="Plan title.")] = None,
-    source_type: Annotated[
-        Optional[str], typer.Option("--source-type", help="Source type.")
-    ] = None,
-    target_type: Annotated[
-        Optional[str], typer.Option("--target-type", help="Target type.")
-    ] = None,
     summary: Annotated[Optional[str], typer.Option(help="Plan summary.")] = None,
     status: Annotated[str, typer.Option(help="Plan status.")] = "draft",
-    org_id: Annotated[Optional[str], typer.Option("--org-id", help="Org ID.")] = None,
     migration_id: Annotated[
-        Optional[str], typer.Option("--migration-id", help="Migration ID.")
+        str, typer.Option("--migration-id", help="Migration ID.")
     ] = None,
     steps_file: Annotated[
         Optional[str], typer.Option("--steps-file", help="JSON file with plan steps.")
@@ -617,7 +592,6 @@ def _plan_create(
             "template_key": from_template,
             "title": title,
             "summary": summary,
-            "org_id": _current_org_id(org_id),
             "migration_id": migration_id,
             "import_source": "template",
         }
@@ -634,8 +608,6 @@ def _plan_create(
             from_path,
             import_mode,
             title=title,
-            source_type=source_type,
-            target_type=target_type,
             summary=summary,
             status=status,
             migration_id=migration_id,
@@ -644,12 +616,9 @@ def _plan_create(
     else:
         payload = {
             "title": title,
-            "source_type": source_type,
-            "target_type": target_type,
             "summary": summary,
             "status": status,
             "import_source": "manual",
-            "org_id": _current_org_id(org_id),
             "migration_id": migration_id,
             "plan_steps": _read_json_file(steps_file),
             "external_links": link or [],
@@ -713,17 +682,8 @@ def _plan_view(
 def _plan_update(
     plan_id: Annotated[str, typer.Argument(help="Plan ID.")],
     title: Annotated[Optional[str], typer.Option(help="Plan title.")] = None,
-    source_type: Annotated[
-        Optional[str], typer.Option("--source-type", help="Source type.")
-    ] = None,
-    target_type: Annotated[
-        Optional[str], typer.Option("--target-type", help="Target type.")
-    ] = None,
     summary: Annotated[Optional[str], typer.Option(help="Plan summary.")] = None,
     status: Annotated[Optional[str], typer.Option(help="Plan status.")] = None,
-    migration_id: Annotated[
-        Optional[str], typer.Option("--migration-id", help="Migration ID.")
-    ] = None,
     steps_file: Annotated[
         Optional[str], typer.Option("--steps-file", help="JSON file with plan steps.")
     ] = None,
@@ -735,11 +695,8 @@ def _plan_update(
     payload: dict = {}
     for key, value in [
         ("title", title),
-        ("source_type", source_type),
-        ("target_type", target_type),
         ("summary", summary),
         ("status", status),
-        ("migration_id", migration_id),
     ]:
         if value is not None:
             payload[key] = value
@@ -751,6 +708,20 @@ def _plan_update(
         res = client.patch(f"/api/plans/{plan_id}", json=payload)
         res.raise_for_status()
         print_output(res.json(), _state.json)
+
+
+@plan_app.command("delete")
+def _plan_delete(
+    plan_id: Annotated[str, typer.Argument(help="Plan ID.")],
+):
+    """Delete a plan and its saved plan outcome."""
+    with make_client(_state.api_url, _state.token) as client:
+        res = client.delete(f"/api/plans/{plan_id}")
+        res.raise_for_status()
+        if _state.json:
+            print_output(res.json(), True)
+            return
+        print(f"Deleted plan {plan_id}.")
 
 
 # ---------------------------------------------------------------------------
@@ -841,7 +812,41 @@ _task_add_options = dict(
 )
 
 
-@plan_app.command("task-add")
+@task_app.command("plan")
+def _task_plan(
+    plan_id: Annotated[str, typer.Argument(help="Plan ID.")],
+    title: Annotated[str, typer.Option("--title", help="Task title.")],
+    description: Annotated[
+        str, typer.Option("--description", help="Task description.")
+    ],
+    status: Annotated[str, typer.Option(help="Task status.")] = "todo",
+    owner: Annotated[Optional[str], typer.Option(help="Task owner.")] = None,
+    notes: Annotated[Optional[str], typer.Option(help="Task notes.")] = None,
+    linear_issue_id: Annotated[
+        Optional[str], typer.Option("--linear-issue-id", help="Linear issue ID.")
+    ] = None,
+    blocked_reason: Annotated[
+        Optional[str], typer.Option("--blocked-reason", help="Blocked reason.")
+    ] = None,
+    link: Annotated[
+        Optional[list[str]], typer.Option("--link", help="Artifact link.")
+    ] = None,
+):
+    """Add a new task to a plan."""
+    _do_task_add(
+        plan_id,
+        title,
+        description,
+        status,
+        owner,
+        notes,
+        linear_issue_id,
+        blocked_reason,
+        link,
+    )
+
+
+@plan_app.command("task")
 def _plan_task_add(
     plan_id: Annotated[str, typer.Argument(help="Plan ID.")],
     title: Annotated[str, typer.Option("--title", help="Task title.")],
@@ -875,8 +880,8 @@ def _plan_task_add(
     )
 
 
-@plan_app.command("task-update")
-def _plan_task_update(
+@task_app.command("edit")
+def _task_edit(
     plan_id: Annotated[str, typer.Argument(help="Plan ID.")],
     task_id: Annotated[str, typer.Argument(help="Task ID.")],
     title: Annotated[Optional[str], typer.Option("--title", help="Task title.")] = None,
