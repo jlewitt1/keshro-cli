@@ -18,7 +18,7 @@ def get_default_org_id(org_id: str | None = None) -> str:
 
 
 def make_client(api_url: str | None = None, token: str | None = None) -> httpx.Client:
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json", "X-Keshro-Client": "cli"}
     resolved_token = get_token(token)
     if resolved_token:
         headers["Authorization"] = f"Bearer {resolved_token}"

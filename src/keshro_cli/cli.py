@@ -47,12 +47,14 @@ plan_app = typer.Typer(help="Plan management")
 task_app = typer.Typer(help="Task management")
 outcome_app = typer.Typer(help="Outcome tracking")
 config_app = typer.Typer(help="Configuration", invoke_without_command=True)
+plan_task_app = typer.Typer(help="Plan task management")
 
 app.add_typer(auth_app, name="auth")
 app.add_typer(plan_app, name="plan")
 app.add_typer(task_app, name="task")
 app.add_typer(outcome_app, name="outcome")
 app.add_typer(config_app, name="config")
+plan_app.add_typer(plan_task_app, name="task")
 
 
 # ---------------------------------------------------------------------------
@@ -69,9 +71,54 @@ def _current_org_id(org_id: str | None = None) -> str | None:
     return resolved or None
 
 
+def _current_plan_id(plan_id: str | None = None) -> str | None:
+    auth = load_auth()
+    resolved = _clean(plan_id or auth.get("default_plan_id"))
+    return resolved or None
+
+
 def _current_context_label() -> str | None:
     auth = load_auth()
     return _clean(auth.get("default_org_name") or auth.get("default_org_id")) or None
+
+
+def _current_plan_label() -> str | None:
+    auth = load_auth()
+    return _clean(auth.get("default_plan_title") or auth.get("default_plan_id")) or None
+
+
+def _require_plan_context(plan_id: str | None = None) -> str:
+    resolved = _current_plan_id(plan_id)
+    if resolved:
+        return resolved
+    raise SystemExit(
+        "Plan ID required. Pass <plan-id> or save one with `keshro config set --plan-id <plan-id>`."
+    )
+
+
+def _set_default_plan_after_create(plan: dict) -> None:
+    if _state.json:
+        return
+    plan_id = _clean(plan.get("id"))
+    if not plan_id:
+        return
+    plan_title = _clean(plan.get("title")) or plan_id
+    current_plan_id = _current_plan_id()
+    if current_plan_id == plan_id:
+        return
+    update_auth({"default_plan_id": plan_id, "default_plan_title": plan_title})
+    print(f"Saved default plan: {plan_title}")
+
+
+def _resolve_plan_context(plan_id: str | None) -> tuple[str | None, str | None]:
+    explicit_id = _clean(plan_id)
+    if not explicit_id:
+        return None, None
+    with make_client(_state.api_url, _state.token) as client:
+        res = client.get(f"/api/plans/{explicit_id}")
+        res.raise_for_status()
+        plan = res.json()
+    return explicit_id, _clean(plan.get("title")) or explicit_id
 
 
 def _resolve_org_context(
@@ -152,7 +199,7 @@ def _print_plan_detail(plan: dict, context_label: str | None = None) -> None:
             step_id = _clean(step.get("id"))
             line = f"  {step.get('order', '?')}. {title} [{status}]"
             if step_id:
-                line = f"{line} {DIM}({step_id}){RESET}"
+                line = f"{line} {DIM}(task-id: {step_id}){RESET}"
             print(line)
             print(f"     Owner: {owner}")
             if step.get("description"):
@@ -194,7 +241,12 @@ def _print_task_detail(
         print("Task updated, but no task details were returned.")
         return
     print(f"{DIM}Plan:{RESET} {plan.get('title') or plan.get('id') or 'Untitled plan'}")
+    if plan.get("id"):
+        print(f"{DIM}Plan ID:{RESET} {plan['id']}")
     print(f"{DIM}Task:{RESET} {task.get('title') or 'Untitled task'}")
+    task_id_value = _clean(task.get("id"))
+    if task_id_value:
+        print(f"{DIM}Task ID:{RESET} {task_id_value}")
     print(f"{DIM}Status:{RESET} {_clean(task.get('status') or 'todo') or 'todo'}")
     print(f"{DIM}Owner:{RESET} {_clean(task.get('owner')) or 'Unassigned'}")
     if task.get("blocked_reason"):
@@ -204,6 +256,30 @@ def _print_task_detail(
         print(f"{DIM}Artifacts:{RESET}")
         for link in links:
             print(f"  - {link}")
+
+
+def _view_task(plan_id: str | None, task_id: str) -> None:
+    resolved_plan_id = _require_plan_context(plan_id)
+    with make_client(_state.api_url, _state.token) as client:
+        res = client.get(f"/api/plans/{resolved_plan_id}")
+        res.raise_for_status()
+        plan = res.json()
+        if _state.json:
+            print_output(plan, True)
+            return
+        _print_task_detail(plan, task_id=task_id)
+
+
+def _delete_task(plan_id: str | None, task_id: str) -> None:
+    resolved_plan_id = _require_plan_context(plan_id)
+    with make_client(_state.api_url, _state.token) as client:
+        res = client.delete(f"/api/plans/{resolved_plan_id}/tasks/{task_id}")
+        res.raise_for_status()
+        plan = res.json()
+        if _state.json:
+            print_output(plan, True)
+            return
+        print(f"Deleted task {task_id} from plan {resolved_plan_id}.")
 
 
 def _read_json_file(path: str | None):
@@ -417,6 +493,8 @@ def _config_show():
         "authenticated": bool(auth.get("token")),
         "default_org_id": auth.get("default_org_id"),
         "default_org_name": auth.get("default_org_name"),
+        "default_plan_id": auth.get("default_plan_id"),
+        "default_plan_title": auth.get("default_plan_title"),
         "user": auth.get("user") or {},
     }
     if _state.json:
@@ -432,6 +510,9 @@ def _config_show():
         payload["default_org_name"] or payload["default_org_id"] or "personal"
     )
     print(f"{DIM}Default context:{RESET} " f"{YELLOW}{default_context}{RESET}")
+    default_plan = payload["default_plan_title"] or payload["default_plan_id"]
+    if default_plan:
+        print(f"{DIM}Default plan:{RESET} " f"{YELLOW}{default_plan}{RESET}")
     if user.get("email"):
         print(f"{DIM}User:{RESET} {CYAN}{user['email']}{RESET}")
     if user.get("name"):
@@ -446,10 +527,18 @@ def _config_callback(ctx: typer.Context):
 
 @config_app.command("set")
 def _config_set(
-    org_id: Annotated[Optional[str], typer.Option("--org-id", help="Org ID.")] = None,
-    org: Annotated[Optional[str], typer.Option("--org", help="Org name.")] = None,
+    org_id: Annotated[
+        Optional[str], typer.Option("--org-id", "-i", help="Org ID.")
+    ] = None,
+    org: Annotated[Optional[str], typer.Option("--org", "-o", help="Org name.")] = None,
+    plan_id: Annotated[
+        Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
+    ] = None,
     personal: Annotated[
         bool, typer.Option("--personal", help="Use personal context.")
+    ] = False,
+    clear_plan: Annotated[
+        bool, typer.Option("--clear-plan", help="Clear saved plan context.")
     ] = False,
 ):
     """Set default workspace context."""
@@ -461,17 +550,31 @@ def _config_set(
         resolved_id, resolved_name = _resolve_org_context(org_id, org)
         updates["default_org_id"] = resolved_id
         updates["default_org_name"] = resolved_name
+    if clear_plan:
+        updates["default_plan_id"] = None
+        updates["default_plan_title"] = None
+    elif plan_id is not None:
+        resolved_plan_id, resolved_plan_title = _resolve_plan_context(plan_id)
+        updates["default_plan_id"] = resolved_plan_id
+        updates["default_plan_title"] = resolved_plan_title
     auth = update_auth(updates)
     payload = {
         "api_url": auth.get("api_url") or DEFAULT_API_URL,
         "default_org_id": auth.get("default_org_id"),
         "default_org_name": auth.get("default_org_name"),
+        "default_plan_id": auth.get("default_plan_id"),
+        "default_plan_title": auth.get("default_plan_title"),
     }
     if _state.json:
         print_output(payload, True)
         return
     org_label = auth.get("default_org_name") or auth.get("default_org_id") or "personal"
     print(f"Saved default context: {org_label}")
+    plan_label = auth.get("default_plan_title") or auth.get("default_plan_id")
+    if plan_label:
+        print(f"Saved default plan: {plan_label}")
+    elif clear_plan:
+        print("Cleared default plan context.")
 
 
 # ---------------------------------------------------------------------------
@@ -567,29 +670,42 @@ def _plan_templates(
 
 @plan_app.command("create")
 def _plan_create(
-    title: Annotated[Optional[str], typer.Option(help="Plan title.")] = None,
-    summary: Annotated[Optional[str], typer.Option(help="Plan summary.")] = None,
-    status: Annotated[str, typer.Option(help="Plan status.")] = "draft",
+    migration_id_arg: Annotated[
+        Optional[str], typer.Argument(help="Migration ID.")
+    ] = None,
+    title: Annotated[
+        Optional[str], typer.Option("--title", "-t", help="Plan title.")
+    ] = None,
+    summary: Annotated[
+        Optional[str], typer.Option("--summary", "-u", help="Plan summary.")
+    ] = None,
+    status: Annotated[
+        str, typer.Option("--status", "-s", help="Plan status.")
+    ] = "draft",
     migration_id: Annotated[
-        str, typer.Option("--migration-id", help="Migration ID.")
+        Optional[str], typer.Option("--migration-id", "-m", help="Migration ID.")
     ] = None,
     steps_file: Annotated[
-        Optional[str], typer.Option("--steps-file", help="JSON file with plan steps.")
+        Optional[str],
+        typer.Option("--steps-file", "-f", help="JSON file with plan steps."),
     ] = None,
     link: Annotated[
-        Optional[list[str]], typer.Option("--link", help="External link.")
+        Optional[list[str]], typer.Option("--link", "-l", help="External link.")
     ] = None,
     from_template: Annotated[
-        Optional[str], typer.Option("--from-template", help="Create from template.")
+        Optional[str],
+        typer.Option("--from-template", "-T", help="Create from template."),
     ] = None,
     from_file: Annotated[
-        Optional[str], typer.Option("--from-file", help="Import from file.")
+        Optional[str], typer.Option("--from-file", "-F", help="Import from file.")
     ] = None,
     from_claude: Annotated[
-        Optional[str], typer.Option("--from-claude", help="Import from Claude output.")
+        Optional[str],
+        typer.Option("--from-claude", "-c", help="Import from Claude output."),
     ] = None,
 ):
     """Create a new migration plan from scratch, a template, or a file."""
+    resolved_migration_id = migration_id or migration_id_arg
     if from_file and from_claude:
         raise typer.BadParameter("Cannot use both --from-file and --from-claude.")
 
@@ -598,13 +714,15 @@ def _plan_create(
             "template_key": from_template,
             "title": title,
             "summary": summary,
-            "migration_id": migration_id,
+            "migration_id": resolved_migration_id,
             "import_source": "template",
         }
         with make_client(_state.api_url, _state.token) as client:
             res = client.post("/api/plans/from-template", json=payload)
             res.raise_for_status()
-            print_output(res.json(), _state.json)
+            created = res.json()
+            print_output(created, _state.json)
+            _set_default_plan_after_create(created)
         return
 
     from_path = from_file or from_claude
@@ -616,7 +734,7 @@ def _plan_create(
             title=title,
             summary=summary,
             status=status,
-            migration_id=migration_id,
+            migration_id=resolved_migration_id,
             link=link,
         )
     else:
@@ -625,7 +743,7 @@ def _plan_create(
             "summary": summary,
             "status": status,
             "import_source": "analysis",
-            "migration_id": migration_id,
+            "migration_id": resolved_migration_id,
             "plan_steps": _read_json_file(steps_file),
             "external_links": link or [],
         }
@@ -633,13 +751,15 @@ def _plan_create(
     with make_client(_state.api_url, _state.token) as client:
         res = client.post("/api/plans", json=payload)
         res.raise_for_status()
-        print_output(res.json(), _state.json)
+        created = res.json()
+        print_output(created, _state.json)
+        _set_default_plan_after_create(created)
 
 
 @plan_app.command("list")
 def _plan_list(
     org_id: Annotated[
-        Optional[str], typer.Option("--org-id", help="Filter by org.")
+        Optional[str], typer.Option("--org-id", "-o", help="Filter by org.")
     ] = None,
     verbose: Annotated[
         bool, typer.Option("-v", "--verbose", help="Verbose output.")
@@ -687,14 +807,21 @@ def _plan_view(
 @plan_app.command("update")
 def _plan_update(
     plan_id: Annotated[str, typer.Argument(help="Plan ID.")],
-    title: Annotated[Optional[str], typer.Option(help="Plan title.")] = None,
-    summary: Annotated[Optional[str], typer.Option(help="Plan summary.")] = None,
-    status: Annotated[Optional[str], typer.Option(help="Plan status.")] = None,
+    title: Annotated[
+        Optional[str], typer.Option("--title", "-t", help="Plan title.")
+    ] = None,
+    summary: Annotated[
+        Optional[str], typer.Option("--summary", "-u", help="Plan summary.")
+    ] = None,
+    status: Annotated[
+        Optional[str], typer.Option("--status", "-s", help="Plan status.")
+    ] = None,
     steps_file: Annotated[
-        Optional[str], typer.Option("--steps-file", help="JSON file with plan steps.")
+        Optional[str],
+        typer.Option("--steps-file", "-f", help="JSON file with plan steps."),
     ] = None,
     link: Annotated[
-        Optional[list[str]], typer.Option("--link", help="External link.")
+        Optional[list[str]], typer.Option("--link", "-l", help="External link.")
     ] = None,
 ):
     """Update an existing plan's metadata or steps."""
@@ -724,6 +851,9 @@ def _plan_delete(
     with make_client(_state.api_url, _state.token) as client:
         res = client.delete(f"/api/plans/{plan_id}")
         res.raise_for_status()
+        saved_plan_id = _current_plan_id()
+        if saved_plan_id == plan_id:
+            update_auth({"default_plan_id": None, "default_plan_title": None})
         if _state.json:
             print_output(res.json(), True)
             return
@@ -736,7 +866,7 @@ def _plan_delete(
 
 
 def _do_task_add(
-    plan_id: str,
+    plan_id: str | None,
     title: str,
     description: str,
     status: str = "todo",
@@ -746,6 +876,7 @@ def _do_task_add(
     blocked_reason: str | None = None,
     link: list[str] | None = None,
 ):
+    plan_id = _require_plan_context(plan_id)
     payload = {
         "title": title,
         "description": description,
@@ -767,7 +898,7 @@ def _do_task_add(
 
 
 def _do_task_update(
-    plan_id: str,
+    plan_id: str | None,
     task_id: str,
     title: str | None = None,
     description: str | None = None,
@@ -778,6 +909,7 @@ def _do_task_update(
     blocked_reason: str | None = None,
     link: list[str] | None = None,
 ):
+    plan_id = _require_plan_context(plan_id)
     payload: dict = {}
     for key, value in [
         ("title", title),
@@ -807,40 +939,57 @@ def _do_task_update(
 
 # Shared option definitions for task commands
 _task_add_options = dict(
-    title=typer.Option(..., "--title", help="Task title."),
-    description=typer.Option(..., "--description", help="Task description."),
-    status=typer.Option("todo", help="Task status."),
-    owner=typer.Option(None, help="Task owner."),
-    notes=typer.Option(None, help="Task notes."),
-    linear_issue_id=typer.Option(None, "--linear-issue-id", help="Linear issue ID."),
-    blocked_reason=typer.Option(None, "--blocked-reason", help="Blocked reason."),
-    link=typer.Option(None, "--link", help="Artifact link."),
+    title=typer.Option(..., "--title", "-t", help="Task title."),
+    description=typer.Option(..., "--description", "-d", help="Task description."),
+    status=typer.Option("todo", "--status", "-s", help="Task status."),
+    owner=typer.Option(None, "--owner", "-o", help="Task owner."),
+    notes=typer.Option(None, "--notes", "-n", help="Task notes."),
+    linear_issue_id=typer.Option(
+        None, "--linear-issue-id", "-i", help="Linear issue ID."
+    ),
+    blocked_reason=typer.Option(
+        None, "--blocked-reason", "-b", "-r", help="Blocked reason."
+    ),
+    link=typer.Option(None, "--link", "-l", help="Artifact link."),
 )
 
 
 @task_app.command("plan")
 def _task_plan(
-    plan_id: Annotated[str, typer.Argument(help="Plan ID.")],
-    title: Annotated[str, typer.Option("--title", help="Task title.")],
+    plan_id: Annotated[
+        Optional[str],
+        typer.Argument(help="Plan ID. Uses saved plan context if omitted."),
+    ] = None,
+    plan_id_option: Annotated[
+        Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
+    ] = None,
+    title: Annotated[str, typer.Option("--title", "-t", help="Task title.")] = ...,
     description: Annotated[
-        str, typer.Option("--description", help="Task description.")
-    ],
-    status: Annotated[str, typer.Option(help="Task status.")] = "todo",
-    owner: Annotated[Optional[str], typer.Option(help="Task owner.")] = None,
-    notes: Annotated[Optional[str], typer.Option(help="Task notes.")] = None,
+        str, typer.Option("--description", "-d", help="Task description.")
+    ] = ...,
+    status: Annotated[
+        str, typer.Option("--status", "-s", help="Task status.")
+    ] = "todo",
+    owner: Annotated[
+        Optional[str], typer.Option("--owner", "-o", help="Task owner.")
+    ] = None,
+    notes: Annotated[
+        Optional[str], typer.Option("--notes", "-n", help="Task notes.")
+    ] = None,
     linear_issue_id: Annotated[
-        Optional[str], typer.Option("--linear-issue-id", help="Linear issue ID.")
+        Optional[str], typer.Option("--linear-issue-id", "-i", help="Linear issue ID.")
     ] = None,
     blocked_reason: Annotated[
-        Optional[str], typer.Option("--blocked-reason", help="Blocked reason.")
+        Optional[str],
+        typer.Option("--blocked-reason", "-b", "-r", help="Blocked reason."),
     ] = None,
     link: Annotated[
-        Optional[list[str]], typer.Option("--link", help="Artifact link.")
+        Optional[list[str]], typer.Option("--link", "-l", help="Artifact link.")
     ] = None,
 ):
     """Add a new task to a plan."""
     _do_task_add(
-        plan_id,
+        plan_id_option or plan_id,
         title,
         description,
         status,
@@ -852,29 +1001,42 @@ def _task_plan(
     )
 
 
-@plan_app.command("task")
+@plan_task_app.command("add")
 def _plan_task_add(
-    plan_id: Annotated[str, typer.Argument(help="Plan ID.")],
-    title: Annotated[str, typer.Option("--title", help="Task title.")],
+    plan_id: Annotated[
+        Optional[str],
+        typer.Argument(help="Plan ID. Uses saved plan context if omitted."),
+    ] = None,
+    plan_id_option: Annotated[
+        Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
+    ] = None,
+    title: Annotated[str, typer.Option("--title", "-t", help="Task title.")] = ...,
     description: Annotated[
-        str, typer.Option("--description", help="Task description.")
-    ],
-    status: Annotated[str, typer.Option(help="Task status.")] = "todo",
-    owner: Annotated[Optional[str], typer.Option(help="Task owner.")] = None,
-    notes: Annotated[Optional[str], typer.Option(help="Task notes.")] = None,
+        str, typer.Option("--description", "-d", help="Task description.")
+    ] = ...,
+    status: Annotated[
+        str, typer.Option("--status", "-s", help="Task status.")
+    ] = "todo",
+    owner: Annotated[
+        Optional[str], typer.Option("--owner", "-o", help="Task owner.")
+    ] = None,
+    notes: Annotated[
+        Optional[str], typer.Option("--notes", "-n", help="Task notes.")
+    ] = None,
     linear_issue_id: Annotated[
-        Optional[str], typer.Option("--linear-issue-id", help="Linear issue ID.")
+        Optional[str], typer.Option("--linear-issue-id", "-i", help="Linear issue ID.")
     ] = None,
     blocked_reason: Annotated[
-        Optional[str], typer.Option("--blocked-reason", help="Blocked reason.")
+        Optional[str],
+        typer.Option("--blocked-reason", "-b", "-r", help="Blocked reason."),
     ] = None,
     link: Annotated[
-        Optional[list[str]], typer.Option("--link", help="Artifact link.")
+        Optional[list[str]], typer.Option("--link", "-l", help="Artifact link.")
     ] = None,
 ):
     """Add a new task to a plan."""
     _do_task_add(
-        plan_id,
+        plan_id_option or plan_id,
         title,
         description,
         status,
@@ -884,33 +1046,153 @@ def _plan_task_add(
         blocked_reason,
         link,
     )
+
+
+@task_app.command("view")
+def _task_view(
+    plan_id_or_task_id: Annotated[
+        str, typer.Argument(help="Plan ID, or Task ID if a default plan is saved.")
+    ],
+    task_id: Annotated[
+        Optional[str],
+        typer.Argument(help="Task ID. Optional when a default plan is saved."),
+    ] = None,
+    plan_id_option: Annotated[
+        Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
+    ] = None,
+):
+    """Show task details for a plan task."""
+    if plan_id_option:
+        _view_task(plan_id_option, task_id or plan_id_or_task_id)
+        return
+    if task_id is None:
+        _view_task(None, plan_id_or_task_id)
+        return
+    _view_task(plan_id_or_task_id, task_id)
+
+
+@plan_task_app.command("view")
+def _plan_task_view(
+    plan_id_or_task_id: Annotated[
+        str, typer.Argument(help="Plan ID, or Task ID if a default plan is saved.")
+    ],
+    task_id: Annotated[
+        Optional[str],
+        typer.Argument(help="Task ID. Optional when a default plan is saved."),
+    ] = None,
+    plan_id_option: Annotated[
+        Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
+    ] = None,
+):
+    """Show task details for a plan task."""
+    if plan_id_option:
+        _view_task(plan_id_option, task_id or plan_id_or_task_id)
+        return
+    if task_id is None:
+        _view_task(None, plan_id_or_task_id)
+        return
+    _view_task(plan_id_or_task_id, task_id)
+
+
+@task_app.command("delete")
+def _task_delete(
+    plan_id_or_task_id: Annotated[
+        str, typer.Argument(help="Plan ID, or Task ID if a default plan is saved.")
+    ],
+    task_id: Annotated[
+        Optional[str],
+        typer.Argument(help="Task ID. Optional when a default plan is saved."),
+    ] = None,
+    plan_id_option: Annotated[
+        Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
+    ] = None,
+):
+    """Delete a task from a plan."""
+    if plan_id_option:
+        _delete_task(plan_id_option, task_id or plan_id_or_task_id)
+        return
+    if task_id is None:
+        _delete_task(None, plan_id_or_task_id)
+        return
+    _delete_task(plan_id_or_task_id, task_id)
+
+
+@plan_task_app.command("delete")
+def _plan_task_delete(
+    plan_id_or_task_id: Annotated[
+        str, typer.Argument(help="Plan ID, or Task ID if a default plan is saved.")
+    ],
+    task_id: Annotated[
+        Optional[str],
+        typer.Argument(help="Task ID. Optional when a default plan is saved."),
+    ] = None,
+    plan_id_option: Annotated[
+        Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
+    ] = None,
+):
+    """Delete a task from a plan."""
+    if plan_id_option:
+        _delete_task(plan_id_option, task_id or plan_id_or_task_id)
+        return
+    if task_id is None:
+        _delete_task(None, plan_id_or_task_id)
+        return
+    _delete_task(plan_id_or_task_id, task_id)
 
 
 @task_app.command("edit")
 def _task_edit(
-    plan_id: Annotated[str, typer.Argument(help="Plan ID.")],
-    task_id: Annotated[str, typer.Argument(help="Task ID.")],
-    title: Annotated[Optional[str], typer.Option("--title", help="Task title.")] = None,
-    description: Annotated[
-        Optional[str], typer.Option("--description", help="Task description.")
+    plan_id_or_task_id: Annotated[
+        str, typer.Argument(help="Plan ID, or Task ID if a default plan is saved.")
+    ],
+    task_id: Annotated[
+        Optional[str],
+        typer.Argument(help="Task ID. Optional when a default plan is saved."),
     ] = None,
-    status: Annotated[Optional[str], typer.Option(help="Task status.")] = None,
-    owner: Annotated[Optional[str], typer.Option(help="Task owner.")] = None,
-    notes: Annotated[Optional[str], typer.Option(help="Task notes.")] = None,
+    plan_id_option: Annotated[
+        Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
+    ] = None,
+    title: Annotated[
+        Optional[str], typer.Option("--title", "-t", help="Task title.")
+    ] = None,
+    description: Annotated[
+        Optional[str], typer.Option("--description", "-d", help="Task description.")
+    ] = None,
+    status: Annotated[
+        Optional[str], typer.Option("--status", "-s", help="Task status.")
+    ] = None,
+    owner: Annotated[
+        Optional[str], typer.Option("--owner", "-o", help="Task owner.")
+    ] = None,
+    notes: Annotated[
+        Optional[str], typer.Option("--notes", "-n", help="Task notes.")
+    ] = None,
     linear_issue_id: Annotated[
-        Optional[str], typer.Option("--linear-issue-id", help="Linear issue ID.")
+        Optional[str], typer.Option("--linear-issue-id", "-i", help="Linear issue ID.")
     ] = None,
     blocked_reason: Annotated[
-        Optional[str], typer.Option("--blocked-reason", help="Blocked reason.")
+        Optional[str],
+        typer.Option("--blocked-reason", "-b", "-r", help="Blocked reason."),
     ] = None,
     link: Annotated[
-        Optional[list[str]], typer.Option("--link", help="Artifact link.")
+        Optional[list[str]], typer.Option("--link", "-l", help="Artifact link.")
     ] = None,
 ):
     """Update an existing task's status, owner, or details."""
+    resolved_plan_id: str | None
+    resolved_task_id: str
+    if plan_id_option:
+        resolved_plan_id = plan_id_option
+        resolved_task_id = task_id or plan_id_or_task_id
+    elif task_id is None:
+        resolved_plan_id = _require_plan_context(None)
+        resolved_task_id = plan_id_or_task_id
+    else:
+        resolved_plan_id = plan_id_or_task_id
+        resolved_task_id = task_id
     _do_task_update(
-        plan_id,
-        task_id,
+        resolved_plan_id,
+        resolved_task_id,
         title,
         description,
         status,
@@ -927,26 +1209,39 @@ def _task_edit(
 
 @app.command("plan_task", hidden=True)
 def _plan_task_alias(
-    plan_id: Annotated[str, typer.Argument(help="Plan ID.")],
-    title: Annotated[str, typer.Option("--title", help="Task title.")],
+    plan_id: Annotated[
+        Optional[str],
+        typer.Argument(help="Plan ID. Uses saved plan context if omitted."),
+    ] = None,
+    plan_id_option: Annotated[
+        Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
+    ] = None,
+    title: Annotated[str, typer.Option("--title", "-t", help="Task title.")] = ...,
     description: Annotated[
-        str, typer.Option("--description", help="Task description.")
-    ],
-    status: Annotated[str, typer.Option(help="Task status.")] = "todo",
-    owner: Annotated[Optional[str], typer.Option(help="Task owner.")] = None,
-    notes: Annotated[Optional[str], typer.Option(help="Task notes.")] = None,
+        str, typer.Option("--description", "-d", help="Task description.")
+    ] = ...,
+    status: Annotated[
+        str, typer.Option("--status", "-s", help="Task status.")
+    ] = "todo",
+    owner: Annotated[
+        Optional[str], typer.Option("--owner", "-o", help="Task owner.")
+    ] = None,
+    notes: Annotated[
+        Optional[str], typer.Option("--notes", "-n", help="Task notes.")
+    ] = None,
     linear_issue_id: Annotated[
-        Optional[str], typer.Option("--linear-issue-id", help="Linear issue ID.")
+        Optional[str], typer.Option("--linear-issue-id", "-i", help="Linear issue ID.")
     ] = None,
     blocked_reason: Annotated[
-        Optional[str], typer.Option("--blocked-reason", help="Blocked reason.")
+        Optional[str],
+        typer.Option("--blocked-reason", "-b", "-r", help="Blocked reason."),
     ] = None,
     link: Annotated[
-        Optional[list[str]], typer.Option("--link", help="Artifact link.")
+        Optional[list[str]], typer.Option("--link", "-l", help="Artifact link.")
     ] = None,
 ):
     _do_task_add(
-        plan_id,
+        plan_id_option or plan_id,
         title,
         description,
         status,
@@ -960,28 +1255,56 @@ def _plan_task_alias(
 
 @app.command("edit_task", hidden=True)
 def _edit_task_alias(
-    plan_id: Annotated[str, typer.Argument(help="Plan ID.")],
-    task_id: Annotated[str, typer.Argument(help="Task ID.")],
-    title: Annotated[Optional[str], typer.Option("--title", help="Task title.")] = None,
-    description: Annotated[
-        Optional[str], typer.Option("--description", help="Task description.")
+    plan_id_or_task_id: Annotated[
+        str, typer.Argument(help="Plan ID, or Task ID if a default plan is saved.")
+    ],
+    task_id: Annotated[
+        Optional[str],
+        typer.Argument(help="Task ID. Optional when a default plan is saved."),
     ] = None,
-    status: Annotated[Optional[str], typer.Option(help="Task status.")] = None,
-    owner: Annotated[Optional[str], typer.Option(help="Task owner.")] = None,
-    notes: Annotated[Optional[str], typer.Option(help="Task notes.")] = None,
+    plan_id_option: Annotated[
+        Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
+    ] = None,
+    title: Annotated[
+        Optional[str], typer.Option("--title", "-t", help="Task title.")
+    ] = None,
+    description: Annotated[
+        Optional[str], typer.Option("--description", "-d", help="Task description.")
+    ] = None,
+    status: Annotated[
+        Optional[str], typer.Option("--status", "-s", help="Task status.")
+    ] = None,
+    owner: Annotated[
+        Optional[str], typer.Option("--owner", "-o", help="Task owner.")
+    ] = None,
+    notes: Annotated[
+        Optional[str], typer.Option("--notes", "-n", help="Task notes.")
+    ] = None,
     linear_issue_id: Annotated[
-        Optional[str], typer.Option("--linear-issue-id", help="Linear issue ID.")
+        Optional[str], typer.Option("--linear-issue-id", "-i", help="Linear issue ID.")
     ] = None,
     blocked_reason: Annotated[
-        Optional[str], typer.Option("--blocked-reason", help="Blocked reason.")
+        Optional[str],
+        typer.Option("--blocked-reason", "-b", "-r", help="Blocked reason."),
     ] = None,
     link: Annotated[
-        Optional[list[str]], typer.Option("--link", help="Artifact link.")
+        Optional[list[str]], typer.Option("--link", "-l", help="Artifact link.")
     ] = None,
 ):
+    resolved_plan_id: str | None
+    resolved_task_id: str
+    if plan_id_option:
+        resolved_plan_id = plan_id_option
+        resolved_task_id = task_id or plan_id_or_task_id
+    elif task_id is None:
+        resolved_plan_id = _require_plan_context(None)
+        resolved_task_id = plan_id_or_task_id
+    else:
+        resolved_plan_id = plan_id_or_task_id
+        resolved_task_id = task_id
     _do_task_update(
-        plan_id,
-        task_id,
+        resolved_plan_id,
+        resolved_task_id,
         title,
         description,
         status,
@@ -1000,9 +1323,16 @@ def _edit_task_alias(
 
 @outcome_app.command("view")
 def _outcome_view(
-    plan_id: Annotated[str, typer.Argument(help="Plan ID.")],
+    plan_id: Annotated[
+        Optional[str],
+        typer.Argument(help="Plan ID. Uses saved plan context if omitted."),
+    ] = None,
+    plan_id_option: Annotated[
+        Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
+    ] = None,
 ):
     """View the outcome record for a plan."""
+    plan_id = _require_plan_context(plan_id_option or plan_id)
     with make_client(_state.api_url, _state.token) as client:
         res = client.get(f"/api/plans/{plan_id}/outcome")
         res.raise_for_status()
@@ -1011,18 +1341,31 @@ def _outcome_view(
 
 @outcome_app.command("save")
 def _outcome_save(
-    plan_id: Annotated[str, typer.Argument(help="Plan ID.")],
-    status: Annotated[str, typer.Option(help="Outcome status.")],
-    summary: Annotated[Optional[str], typer.Option(help="Outcome summary.")] = None,
-    notes: Annotated[Optional[str], typer.Option(help="Outcome notes.")] = None,
+    plan_id: Annotated[
+        Optional[str],
+        typer.Argument(help="Plan ID. Uses saved plan context if omitted."),
+    ] = None,
+    plan_id_option: Annotated[
+        Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
+    ] = None,
+    status: Annotated[
+        str, typer.Option("--status", "-s", help="Outcome status.")
+    ] = ...,
+    summary: Annotated[
+        Optional[str], typer.Option("--summary", "-m", help="Outcome summary.")
+    ] = None,
+    notes: Annotated[
+        Optional[str], typer.Option("--notes", "-n", help="Outcome notes.")
+    ] = None,
     actual_hours: Annotated[
-        Optional[int], typer.Option("--actual-hours", help="Actual hours.")
+        Optional[int], typer.Option("--actual-hours", "-H", help="Actual hours.")
     ] = None,
     actual_cost: Annotated[
-        Optional[int], typer.Option("--actual-cost", help="Actual cost.")
+        Optional[int], typer.Option("--actual-cost", "-c", help="Actual cost.")
     ] = None,
 ):
     """Save the outcome of a completed migration plan."""
+    plan_id = _require_plan_context(plan_id_option or plan_id)
     payload = {
         "status": status,
         "summary": summary,

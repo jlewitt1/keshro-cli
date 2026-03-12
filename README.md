@@ -22,7 +22,7 @@ uv tool install git+ssh://git@github.com/jlewitt1/keshro-cli.git
 Update an existing install:
 
 ```bash
-uv tool install --force git+ssh://git@github.com/jlewitt1/keshro-cli.git
+uv tool install --force git+https://github.com/jlewitt1/keshro-cli.git
 ```
 
 Local development install:
