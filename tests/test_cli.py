@@ -66,6 +66,49 @@ class _FakeClient:
                     {"id": "org-456", "name": "Demo Inc"},
                 ]
             )
+        if path == "/api/migrations":
+            return _FakeResponse(
+                [
+                    {
+                        "id": "migration-123",
+                        "status": "completed",
+                        "source_type": "AWS Batch",
+                        "target_type": "Airflow",
+                        "migration_mode": "software",
+                        "input_method": "context",
+                        "created_at": "2026-03-11T15:30:00Z",
+                        "confidence_score": 72,
+                        "outcome_status": "partial",
+                        "org_id": "org-123",
+                    }
+                ]
+            )
+        if path == "/api/migrations/migration-123":
+            return _FakeResponse(
+                {
+                    "id": "migration-123",
+                    "status": "completed",
+                    "source_type": "AWS Batch",
+                    "target_type": "Airflow",
+                    "migration_mode": "software",
+                    "input_method": "context",
+                    "created_at": "2026-03-11T15:30:00Z",
+                    "confidence_score": 72,
+                    "confidence_explanation": "Good source coverage and prior migration matches.",
+                    "effort_estimate": {"total_hours": 36},
+                    "cost_estimate": {"total_cost_low": 5000, "total_cost_high": 9000},
+                    "notes": "Pilot DAG first, then full cutover.",
+                    "migration_steps": [
+                        {
+                            "order": 1,
+                            "title": "Inventory Batch jobs",
+                            "description": "Review queues and job definitions",
+                        }
+                    ],
+                    "outcome_status": "partial",
+                    "org_id": "org-123",
+                }
+            )
         if path == "/api/plans":
             return _FakeResponse(
                 [
@@ -164,11 +207,14 @@ class _FakeClient:
         self.calls.append(("PATCH", path, json))
         return _FakeResponse({"path": path, "payload": json})
 
+    def request(self, method, path, json=None):
+        self.calls.append((method, path, json))
+        if method == "DELETE" and path.endswith("/tasks/task-456"):
+            return _FakeResponse({"id": "plan-123", "plan_steps": [], "payload": json})
+        return _FakeResponse({"success": True, "path": path, "payload": json})
+
     def delete(self, path):
-        self.calls.append(("DELETE", path, None))
-        if path.endswith("/tasks/task-456"):
-            return _FakeResponse({"id": "plan-123", "plan_steps": []})
-        return _FakeResponse({"success": True, "path": path})
+        return self.request("DELETE", path, json=None)
 
 
 @pytest.fixture
@@ -236,7 +282,6 @@ def test_plan_create_from_template_hits_template_endpoint(fake_client, capsys):
             "--json",
             "plan",
             "create",
-            "-m",
             "migration-123",
             "-T",
             "aws-batch-to-airflow",
@@ -260,7 +305,6 @@ def test_plan_create_saves_default_plan_automatically(fake_client, monkeypatch, 
         [
             "plan",
             "create",
-            "-m",
             "migration-123",
             "-T",
             "aws-batch-to-airflow",
@@ -285,7 +329,6 @@ def test_plan_create_does_not_save_default_plan_in_json_mode(
             "--json",
             "plan",
             "create",
-            "-m",
             "migration-123",
             "-T",
             "aws-batch-to-airflow",
@@ -296,14 +339,75 @@ def test_plan_create_does_not_save_default_plan_in_json_mode(
     assert saved == {}
 
 
+def test_migration_list_is_concise_by_default(fake_client, capsys, monkeypatch):
+    monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: {})
+    monkeypatch.setattr("keshro_cli.client.load_auth", lambda: {})
+    cli.main(["migration", "list"])
+    out = capsys.readouterr().out
+    assert "ID" in out
+    assert "PATH" in out
+    assert "STATUS" in out
+    assert "CREATED" in out
+    assert "migration-123" in out
+    assert "AWS Batch -> Airflow" in out
+    assert "2026-03-11T15:30:00Z" in out
+    assert "partial" not in out
+
+
+def test_migration_list_verbose_includes_metadata(fake_client, capsys):
+    cli.main(["migration", "list", "--verbose"])
+    out = capsys.readouterr().out
+    assert "Outcome:" in out
+    assert "partial" in out
+    assert "Confidence:" in out
+
+
+def test_migration_list_latest_limits_rows(fake_client, capsys):
+    cli.main(["migration", "list", "--latest", "1"])
+    out = capsys.readouterr().out.strip().splitlines()
+    assert len(out) == 3
+    assert "migration-123" in out[-1]
+
+
+def test_migration_view_shows_detail(fake_client, capsys, monkeypatch):
+    monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_org)
+    monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_org)
+    cli.main(["migration", "view", "migration-123"])
+    out = capsys.readouterr().out
+    assert "migration-123" in out
+    assert "Confidence explanation:" in out
+    assert "Effort:" in out
+    assert "Cost:" in out
+    assert "Steps:" in out
+
+
+def test_migration_delete_hits_endpoint(fake_client, capsys):
+    cli.main(["migration", "delete", "migration-123"])
+    out = capsys.readouterr().out.strip()
+    assert out == "Deleted migration migration-123."
+    assert ("DELETE", "/api/migrations/migration-123", None) in fake_client.calls
+
+
+def test_migration_list_json_outputs_machine_readable_rows(fake_client, capsys):
+    cli.main(["--json", "migration", "list"])
+    out = json.loads(capsys.readouterr().out)
+    assert out[0]["id"] == "migration-123"
+    assert out[0]["source_type"] == "AWS Batch"
+
+
 def test_plan_list_is_concise_by_default(fake_client, capsys, monkeypatch):
     monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: {})
     monkeypatch.setattr("keshro_cli.client.load_auth", lambda: {})
     cli.main(["plan", "list"])
     out = capsys.readouterr().out
+    assert "ID" in out
+    assert "TITLE" in out
+    assert "STATUS" in out
+    assert "UPDATED" in out
     assert "plan-123" in out
     assert "AWS Batch to Airflow pilot" in out
     assert "AWS Batch -> Airflow" in out
+    assert "2026-03-11T15:30:00Z" in out
     assert "Pilot plan for the first DAG migration." not in out
     assert "for org" not in out
 
@@ -314,6 +418,13 @@ def test_plan_list_verbose_includes_summary_and_timestamp(fake_client, capsys):
     assert "Pilot plan for the first DAG migration." in out
     assert "Updated:" in out
     assert "2026-03-11T15:30:00Z" in out
+
+
+def test_plan_list_latest_limits_rows(fake_client, capsys):
+    cli.main(["plan", "list", "--latest", "1"])
+    out = capsys.readouterr().out.strip().splitlines()
+    assert len(out) == 3
+    assert "plan-123" in out[-1]
 
 
 def test_plan_list_empty_state_shows_org_context(fake_client, capsys, monkeypatch):
@@ -451,6 +562,29 @@ def test_config_set_can_save_default_plan(fake_client, monkeypatch, capsys):
     assert "Saved default plan: AWS Batch to Airflow pilot" in out
 
 
+def test_config_set_can_save_api_url(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "keshro_cli.cli.update_auth",
+        lambda payload: {"default_org_id": None, "default_org_name": None, **payload},
+    )
+    code = cli.main(["config", "set", "--api-url", "https://api.keshro.test"])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "Saved default context: personal" in out
+    assert "Saved API URL: https://api.keshro.test" in out
+
+
+def test_config_set_short_alias_can_save_api_url(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "keshro_cli.cli.update_auth",
+        lambda payload: {"default_org_id": None, "default_org_name": None, **payload},
+    )
+    code = cli.main(["config", "set", "-u", "https://api.keshro.test"])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "Saved API URL: https://api.keshro.test" in out
+
+
 def test_plan_create_from_claude_markdown_parses_steps(
     fake_client, tmp_path: Path, capsys
 ):
@@ -465,7 +599,6 @@ def test_plan_create_from_claude_markdown_parses_steps(
             "--json",
             "plan",
             "create",
-            "-m",
             "migration-123",
             "-c",
             str(source),
@@ -565,6 +698,25 @@ def test_task_edit_accepts_blocked_reason_short_alias_r(fake_client, capsys):
     assert out["payload"]["blocked_reason"] == "Waiting on Airflow access"
 
 
+def test_task_edit_accepts_feedback_reason(fake_client, capsys):
+    cli.main(
+        [
+            "--json",
+            "task",
+            "edit",
+            "plan-123",
+            "task-456",
+            "--reason",
+            "Needed a more implementation-specific task",
+        ]
+    )
+    out = json.loads(capsys.readouterr().out)
+    assert (
+        out["payload"]["feedback_reason"]
+        == "Needed a more implementation-specific task"
+    )
+
+
 def test_task_edit_uses_saved_plan_context(fake_client, capsys, monkeypatch):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
@@ -598,6 +750,22 @@ def test_task_edit_accepts_plan_id_option(fake_client, capsys):
     )
     out = json.loads(capsys.readouterr().out)
     assert out["path"] == "/api/plans/plan-123/tasks/task-456"
+
+
+def test_task_delete_accepts_feedback_reason(fake_client, capsys):
+    cli.main(
+        [
+            "--json",
+            "task",
+            "delete",
+            "plan-123",
+            "task-456",
+            "--reason",
+            "not_relevant",
+        ]
+    )
+    out = json.loads(capsys.readouterr().out)
+    assert out["payload"]["feedback_reason"] == "not_relevant"
 
 
 def test_task_plan_human_output_shows_owner(fake_client, capsys):
@@ -677,6 +845,23 @@ def test_config_prints_saved_auth_metadata(monkeypatch, capsys):
     assert "cli@example.com" in out
 
 
+def test_config_prints_org_memberships(fake_client, monkeypatch, capsys):
+    monkeypatch.setattr(
+        "keshro_cli.cli.load_auth",
+        lambda: {
+            "api_url": "https://app.keshro.test",
+            "token": "jwt-123",
+            "user": {"email": "cli@example.com", "name": "CLI User"},
+        },
+    )
+
+    cli.main(["config"])
+    out = capsys.readouterr().out
+    assert "Organizations:" in out
+    assert "Acme" in out
+    assert "Demo Inc" in out
+
+
 def test_auth_login_with_token_prints_human_text_by_default(monkeypatch, capsys):
     saved = {}
 
@@ -729,7 +914,9 @@ def test_auth_login_with_token_validates_with_auth_me(monkeypatch, capsys):
     assert saved["token"] == "ksh_pat_test"
 
 
-def test_config_json_outputs_machine_readable_metadata(monkeypatch, capsys):
+def test_config_json_outputs_machine_readable_metadata(
+    fake_client, monkeypatch, capsys
+):
     monkeypatch.setattr(
         "keshro_cli.cli.load_auth",
         lambda: {
@@ -744,6 +931,7 @@ def test_config_json_outputs_machine_readable_metadata(monkeypatch, capsys):
     assert out["api_url"] == "https://app.keshro.test"
     assert out["authenticated"] is True
     assert out["user"]["email"] == "cli@example.com"
+    assert len(out["orgs"]) == 2
 
 
 def test_auth_login_without_args_uses_browser_flow(monkeypatch, capsys):
@@ -818,7 +1006,6 @@ def test_http_404_errors_render_cleanly(monkeypatch, capsys):
         [
             "plan",
             "create",
-            "--migration-id",
             "migration-123",
             "--from-template",
             "missing-template",
@@ -833,8 +1020,53 @@ def test_http_404_errors_render_cleanly(monkeypatch, capsys):
 def test_plan_create_requires_migration_id(fake_client, capsys):
     code = cli.main(["plan", "create", "--title", "Manual plan"])
     captured = capsys.readouterr()
-    assert code == 1
-    assert "Missing required plan fields: migration_id" in captured.err
+    assert code == 2
+    assert (
+        "Migration ID is required. Run `keshro plan create <migration-id>`."
+        in captured.err
+    )
+
+
+def test_plan_create_allows_migration_seed_without_title(monkeypatch, capsys):
+    seen = {}
+
+    class _CreatePlanClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, path, json=None):
+            seen["path"] = path
+            seen["json"] = json
+            return _FakeResponse(
+                {
+                    "id": "plan-123",
+                    "title": "Heroku to AWS",
+                    "status": "draft",
+                    "source_type": "Heroku",
+                    "target_type": "AWS",
+                    "summary": "Execution plan derived from the migration analysis.",
+                    "migration_id": "migration-123",
+                    "plan_steps": [],
+                    "external_links": [],
+                    "updated_at": "2026-03-12T00:00:00",
+                }
+            )
+
+    monkeypatch.setattr(
+        cli, "make_client", lambda api_url=None, token=None: _CreatePlanClient()
+    )
+    monkeypatch.setattr(cli, "_set_default_plan_after_create", lambda created: None)
+
+    cli.main(["plan", "create", "migration-123"])
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert seen["path"] == "/api/plans"
+    assert seen["json"]["migration_id"] == "migration-123"
+    assert seen["json"]["title"] is None
+    assert seen["json"]["import_source"] == "analysis"
 
 
 def test_request_errors_render_connection_help(monkeypatch, capsys):

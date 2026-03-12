@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 
 
-DEFAULT_API_URL = os.getenv("KESHRO_API_URL", "http://localhost:8000")
+DEFAULT_API_URL = os.getenv("KESHRO_API_URL", "https://api.keshro.com")
 AUTH_PATH = Path.home() / ".keshro" / "auth.json"
 
 

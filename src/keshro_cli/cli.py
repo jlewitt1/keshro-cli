@@ -46,13 +46,14 @@ auth_app = typer.Typer(help="Authentication")
 plan_app = typer.Typer(help="Plan management")
 task_app = typer.Typer(help="Task management")
 outcome_app = typer.Typer(help="Outcome tracking")
+migration_app = typer.Typer(help="Migration project management")
 config_app = typer.Typer(help="Configuration", invoke_without_command=True)
 plan_task_app = typer.Typer(help="Plan task management")
 
-app.add_typer(auth_app, name="auth")
 app.add_typer(plan_app, name="plan")
 app.add_typer(task_app, name="task")
 app.add_typer(outcome_app, name="outcome")
+app.add_typer(migration_app, name="migration")
 app.add_typer(config_app, name="config")
 plan_app.add_typer(plan_task_app, name="task")
 
@@ -158,6 +159,80 @@ def _resolve_org_context(
         )
     match = partial_matches[0]
     return _clean(match.get("id")) or None, _clean(match.get("name")) or explicit_name
+
+
+def _print_table(headers: list[str], rows: list[list[str]]) -> None:
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    def _fmt(row: list[str]) -> str:
+        return "  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row))
+
+    print(_fmt(headers))
+    print("  ".join("-" * width for width in widths))
+    for row in rows:
+        print(_fmt(row))
+
+
+def _print_migration_summary(
+    migration: dict, verbose: bool = False, context_label: str | None = None
+) -> None:
+    migration_id = migration.get("id", "")
+    status = _clean(migration.get("status") or "pending") or "pending"
+    source = migration.get("source_type") or "Unknown source"
+    target = migration.get("target_type") or "Unknown target"
+    created_at = _clean(migration.get("created_at"))
+    date_part = f"  {DIM}{created_at}{RESET}" if created_at else ""
+    suffix = f"  {DIM}for org {context_label}{RESET}" if context_label else ""
+    print(
+        f"{CYAN}{migration_id}{RESET}  {source} -> {target}  {DIM}[{status}]{RESET}{date_part}{suffix}"
+    )
+    if verbose:
+        if migration.get("outcome_status"):
+            print(f"  {DIM}Outcome:{RESET} {migration['outcome_status']}")
+        if migration.get("confidence_score") is not None:
+            print(f"  {DIM}Confidence:{RESET} {migration['confidence_score']}")
+
+
+def _print_migration_detail(migration: dict, context_label: str | None = None) -> None:
+    _print_migration_summary(migration, verbose=True, context_label=context_label)
+    if migration.get("migration_mode"):
+        print(f"{DIM}Mode:{RESET} {migration['migration_mode']}")
+    if migration.get("input_method"):
+        print(f"{DIM}Input method:{RESET} {migration['input_method']}")
+    if migration.get("org_id"):
+        print(f"{DIM}Org:{RESET} {migration['org_id']}")
+    if migration.get("github_url"):
+        print(f"{DIM}GitHub URL:{RESET} {migration['github_url']}")
+    if migration.get("resource_url"):
+        print(f"{DIM}Resource URL:{RESET} {migration['resource_url']}")
+    if migration.get("confidence_explanation"):
+        print(
+            f"{DIM}Confidence explanation:{RESET} {migration['confidence_explanation']}"
+        )
+    if migration.get("error_message"):
+        print(f"{DIM}Error:{RESET} {migration['error_message']}")
+    effort = migration.get("effort_estimate") or {}
+    if effort.get("total_hours") is not None:
+        print(f"{DIM}Effort:{RESET} {effort.get('total_hours')}h")
+    cost = migration.get("cost_estimate") or {}
+    low = cost.get("total_cost_low")
+    high = cost.get("total_cost_high")
+    if low is not None or high is not None:
+        print(f"{DIM}Cost:{RESET} {low} - {high}")
+    if migration.get("notes"):
+        print(f"{DIM}Notes:{RESET} {migration['notes']}")
+    steps = migration.get("migration_steps") or []
+    if steps:
+        print(f"{DIM}Steps:{RESET}")
+        for step in steps:
+            title = step.get("title") or "Untitled step"
+            order = step.get("order", "?")
+            print(f"  {order}. {title}")
+            if step.get("description"):
+                print(f"     {step['description']}")
 
 
 def _print_plan_summary(
@@ -270,10 +345,19 @@ def _view_task(plan_id: str | None, task_id: str) -> None:
         _print_task_detail(plan, task_id=task_id)
 
 
-def _delete_task(plan_id: str | None, task_id: str) -> None:
+def _delete_task(
+    plan_id: str | None, task_id: str, feedback_reason: str | None = None
+) -> None:
     resolved_plan_id = _require_plan_context(plan_id)
+    payload = (
+        {"feedback_reason": feedback_reason} if feedback_reason is not None else None
+    )
     with make_client(_state.api_url, _state.token) as client:
-        res = client.delete(f"/api/plans/{resolved_plan_id}/tasks/{task_id}")
+        res = client.request(
+            "DELETE",
+            f"/api/plans/{resolved_plan_id}/tasks/{task_id}",
+            json=payload,
+        )
         res.raise_for_status()
         plan = res.json()
         if _state.json:
@@ -385,14 +469,12 @@ def _plan_payload_from_file(
 
 def _validate_plan_payload(payload: dict) -> None:
     missing = [
-        key
-        for key in ["title", "migration_id"]
-        if not str(payload.get(key) or "").strip()
+        key for key in ["migration_id"] if not str(payload.get(key) or "").strip()
     ]
     if missing:
         raise SystemExit(
             f"Missing required plan fields: {', '.join(missing)}. "
-            "Create the plan from a migration context and provide them directly or include them in the imported file."
+            "Create the plan from a migration context or pass the migration ID directly."
         )
 
 
@@ -452,7 +534,7 @@ def _auth_login(
     password: Annotated[Optional[str], typer.Option(help="Password.")] = None,
     token: Annotated[Optional[str], typer.Option(help="Personal access token.")] = None,
 ):
-    """Authenticate with Keshro."""
+    """Authenticate with Keshro"""
     _do_login(email=email, password=password, token=token or token_value)
 
 
@@ -471,14 +553,109 @@ def _login_alias(
     password: Annotated[Optional[str], typer.Option(help="Password.")] = None,
     token: Annotated[Optional[str], typer.Option(help="Personal access token.")] = None,
 ):
-    """Authenticate with Keshro."""
+    """Authenticate with Keshro"""
     _do_login(email=email, password=password, token=token or token_value)
 
 
 @app.command("logout")
 def _logout_alias():
-    """Clear local credentials."""
+    """Clear local credentials"""
     _do_logout()
+
+
+# ---------------------------------------------------------------------------
+# Migration commands
+# ---------------------------------------------------------------------------
+
+
+@migration_app.command("list")
+def _migration_list(
+    org_id: Annotated[
+        Optional[str], typer.Option("--org-id", "-o", help="Filter by org.")
+    ] = None,
+    status: Annotated[
+        Optional[str],
+        typer.Option("--status", "-s", help="Filter by migration status."),
+    ] = None,
+    latest_count: Annotated[
+        Optional[int],
+        typer.Option("--latest", "-n", min=1, help="Show only the N latest results."),
+    ] = None,
+    verbose: Annotated[
+        bool, typer.Option("-v", "--verbose", help="Verbose output.")
+    ] = False,
+):
+    """List migration projects, optionally filtered by workspace or status."""
+    params: dict = {}
+    resolved_org = _current_org_id(org_id)
+    context_label = _current_context_label() if resolved_org else None
+    if resolved_org:
+        params["org_id"] = resolved_org
+    if status:
+        params["status"] = status
+    with make_client(_state.api_url, _state.token) as client:
+        res = client.get("/api/migrations", params=params)
+        res.raise_for_status()
+        migrations = sorted(
+            res.json(), key=lambda m: _clean(m.get("created_at")), reverse=True
+        )
+        if latest_count is not None:
+            migrations = migrations[:latest_count]
+        if _state.json:
+            print_output(migrations, True)
+            return
+        if not migrations:
+            if context_label:
+                print(f"No migrations found for org {context_label}.")
+            else:
+                print("No migrations found.")
+            return
+        if verbose:
+            for migration in migrations:
+                _print_migration_summary(
+                    migration, verbose=True, context_label=context_label
+                )
+            return
+        rows = [
+            [
+                _clean(migration.get("id")),
+                f"{migration.get('source_type') or 'Unknown source'} -> {migration.get('target_type') or 'Unknown target'}",
+                _clean(migration.get("status") or "pending") or "pending",
+                _clean(migration.get("created_at")),
+            ]
+            for migration in migrations
+        ]
+        _print_table(["ID", "PATH", "STATUS", "CREATED"], rows)
+
+
+@migration_app.command("view")
+def _migration_view(
+    migration_id: Annotated[str, typer.Argument(help="Migration ID.")],
+):
+    """Show full details for a migration project."""
+    with make_client(_state.api_url, _state.token) as client:
+        res = client.get(f"/api/migrations/{migration_id}")
+        res.raise_for_status()
+        migration = res.json()
+        if _state.json:
+            print_output(migration, True)
+            return
+        context_label = _current_context_label() if _current_org_id() else None
+        _print_migration_detail(migration, context_label=context_label)
+
+
+@migration_app.command("delete")
+def _migration_delete(
+    migration_id: Annotated[str, typer.Argument(help="Migration ID.")],
+):
+    """Delete a migration project."""
+    with make_client(_state.api_url, _state.token) as client:
+        res = client.delete(f"/api/migrations/{migration_id}")
+        res.raise_for_status()
+        if _state.json:
+            print_output(res.json(), True)
+            return
+        print(f"Deleted migration {migration_id}.")
 
 
 # ---------------------------------------------------------------------------
@@ -488,6 +665,17 @@ def _logout_alias():
 
 def _config_show():
     auth = load_auth()
+    orgs: list[dict] = []
+    if auth.get("token"):
+        try:
+            with make_client(
+                auth.get("api_url") or DEFAULT_API_URL, auth.get("token")
+            ) as client:
+                res = client.get("/api/orgs")
+                res.raise_for_status()
+                orgs = res.json() or []
+        except Exception:
+            orgs = []
     payload = {
         "api_url": auth.get("api_url") or DEFAULT_API_URL,
         "authenticated": bool(auth.get("token")),
@@ -496,6 +684,7 @@ def _config_show():
         "default_plan_id": auth.get("default_plan_id"),
         "default_plan_title": auth.get("default_plan_title"),
         "user": auth.get("user") or {},
+        "orgs": orgs,
     }
     if _state.json:
         print_output(payload, True)
@@ -517,6 +706,11 @@ def _config_show():
         print(f"{DIM}User:{RESET} {CYAN}{user['email']}{RESET}")
     if user.get("name"):
         print(f"{DIM}Name:{RESET} {user['name']}")
+    if payload["orgs"]:
+        org_names = ", ".join(
+            org.get("name") or org.get("id") or "Unknown org" for org in payload["orgs"]
+        )
+        print(f"{DIM}Organizations:{RESET} {org_names}")
 
 
 @config_app.callback(invoke_without_command=True)
@@ -534,6 +728,9 @@ def _config_set(
     plan_id: Annotated[
         Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
     ] = None,
+    api_url: Annotated[
+        Optional[str], typer.Option("--api-url", "-u", help="Keshro API URL.")
+    ] = None,
     personal: Annotated[
         bool, typer.Option("--personal", help="Use personal context.")
     ] = False,
@@ -543,6 +740,8 @@ def _config_set(
 ):
     """Set default workspace context."""
     updates: dict = {}
+    if api_url is not None:
+        updates["api_url"] = _clean(api_url) or DEFAULT_API_URL
     if personal:
         updates["default_org_id"] = None
         updates["default_org_name"] = None
@@ -570,6 +769,8 @@ def _config_set(
         return
     org_label = auth.get("default_org_name") or auth.get("default_org_id") or "personal"
     print(f"Saved default context: {org_label}")
+    if api_url is not None:
+        print(f"Saved API URL: {auth.get('api_url') or DEFAULT_API_URL}")
     plan_label = auth.get("default_plan_title") or auth.get("default_plan_id")
     if plan_label:
         print(f"Saved default plan: {plan_label}")
@@ -643,7 +844,7 @@ def _templates_alias(
         bool, typer.Option("-v", "--verbose", help="Verbose output.")
     ] = False,
 ):
-    """List available plan templates, or show details for one."""
+    """List available plan templates, or show details for one"""
     _cmd_plan_templates(template_name, name, verbose)
 
 
@@ -659,7 +860,7 @@ def _plan_templates(
         bool, typer.Option("-v", "--verbose", help="Verbose output.")
     ] = False,
 ):
-    """List available plan templates, or show details for one."""
+    """List available plan templates, or show details for one"""
     _cmd_plan_templates(template_name, name, verbose)
 
 
@@ -670,9 +871,7 @@ def _plan_templates(
 
 @plan_app.command("create")
 def _plan_create(
-    migration_id_arg: Annotated[
-        Optional[str], typer.Argument(help="Migration ID.")
-    ] = None,
+    migration_id: Annotated[Optional[str], typer.Argument(help="Migration ID.")] = None,
     title: Annotated[
         Optional[str], typer.Option("--title", "-t", help="Plan title.")
     ] = None,
@@ -682,9 +881,6 @@ def _plan_create(
     status: Annotated[
         str, typer.Option("--status", "-s", help="Plan status.")
     ] = "draft",
-    migration_id: Annotated[
-        Optional[str], typer.Option("--migration-id", "-m", help="Migration ID.")
-    ] = None,
     steps_file: Annotated[
         Optional[str],
         typer.Option("--steps-file", "-f", help="JSON file with plan steps."),
@@ -704,10 +900,14 @@ def _plan_create(
         typer.Option("--from-claude", "-c", help="Import from Claude output."),
     ] = None,
 ):
-    """Create a new migration plan from scratch, a template, or a file."""
-    resolved_migration_id = migration_id or migration_id_arg
+    """Create the execution plan attached to a migration."""
+    resolved_migration_id = migration_id
     if from_file and from_claude:
         raise typer.BadParameter("Cannot use both --from-file and --from-claude.")
+    if not resolved_migration_id:
+        raise typer.BadParameter(
+            "Migration ID is required. Run `keshro plan create <migration-id>`."
+        )
 
     if from_template:
         payload = {
@@ -761,6 +961,10 @@ def _plan_list(
     org_id: Annotated[
         Optional[str], typer.Option("--org-id", "-o", help="Filter by org.")
     ] = None,
+    latest_count: Annotated[
+        Optional[int],
+        typer.Option("--latest", "-n", min=1, help="Show only the N latest results."),
+    ] = None,
     verbose: Annotated[
         bool, typer.Option("-v", "--verbose", help="Verbose output.")
     ] = False,
@@ -775,6 +979,9 @@ def _plan_list(
         res = client.get("/api/plans", params=params)
         res.raise_for_status()
         plans = res.json()
+        plans = sorted(plans, key=lambda p: _clean(p.get("updated_at")), reverse=True)
+        if latest_count is not None:
+            plans = plans[:latest_count]
         if _state.json:
             print_output(plans, True)
             return
@@ -784,8 +991,21 @@ def _plan_list(
             else:
                 print("No plans found.")
             return
-        for plan in plans:
-            _print_plan_summary(plan, verbose=verbose, context_label=context_label)
+        if verbose:
+            for plan in plans:
+                _print_plan_summary(plan, verbose=True, context_label=context_label)
+            return
+        rows = [
+            [
+                _clean(plan.get("id")),
+                _clean(plan.get("title")) or "Untitled plan",
+                _clean(plan.get("status") or "draft") or "draft",
+                f"{plan.get('source_type') or 'Unknown source'} -> {plan.get('target_type') or 'Unknown target'}",
+                _clean(plan.get("updated_at")),
+            ]
+            for plan in plans
+        ]
+        _print_table(["ID", "TITLE", "STATUS", "PATH", "UPDATED"], rows)
 
 
 @plan_app.command("view")
@@ -907,6 +1127,7 @@ def _do_task_update(
     notes: str | None = None,
     linear_issue_id: str | None = None,
     blocked_reason: str | None = None,
+    feedback_reason: str | None = None,
     link: list[str] | None = None,
 ):
     plan_id = _require_plan_context(plan_id)
@@ -919,6 +1140,7 @@ def _do_task_update(
         ("notes", notes),
         ("linear_issue_id", linear_issue_id),
         ("blocked_reason", blocked_reason),
+        ("feedback_reason", feedback_reason),
     ]:
         if value is not None:
             payload[key] = value
@@ -1106,15 +1328,18 @@ def _task_delete(
     plan_id_option: Annotated[
         Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
     ] = None,
+    feedback_reason: Annotated[
+        Optional[str], typer.Option("--reason", help="Why this task was removed.")
+    ] = None,
 ):
     """Delete a task from a plan."""
     if plan_id_option:
-        _delete_task(plan_id_option, task_id or plan_id_or_task_id)
+        _delete_task(plan_id_option, task_id or plan_id_or_task_id, feedback_reason)
         return
     if task_id is None:
-        _delete_task(None, plan_id_or_task_id)
+        _delete_task(None, plan_id_or_task_id, feedback_reason)
         return
-    _delete_task(plan_id_or_task_id, task_id)
+    _delete_task(plan_id_or_task_id, task_id, feedback_reason)
 
 
 @plan_task_app.command("delete")
@@ -1129,15 +1354,18 @@ def _plan_task_delete(
     plan_id_option: Annotated[
         Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
     ] = None,
+    feedback_reason: Annotated[
+        Optional[str], typer.Option("--reason", help="Why this task was removed.")
+    ] = None,
 ):
     """Delete a task from a plan."""
     if plan_id_option:
-        _delete_task(plan_id_option, task_id or plan_id_or_task_id)
+        _delete_task(plan_id_option, task_id or plan_id_or_task_id, feedback_reason)
         return
     if task_id is None:
-        _delete_task(None, plan_id_or_task_id)
+        _delete_task(None, plan_id_or_task_id, feedback_reason)
         return
-    _delete_task(plan_id_or_task_id, task_id)
+    _delete_task(plan_id_or_task_id, task_id, feedback_reason)
 
 
 @task_app.command("edit")
@@ -1174,6 +1402,9 @@ def _task_edit(
         Optional[str],
         typer.Option("--blocked-reason", "-b", "-r", help="Blocked reason."),
     ] = None,
+    feedback_reason: Annotated[
+        Optional[str], typer.Option("--reason", help="Why this task changed.")
+    ] = None,
     link: Annotated[
         Optional[list[str]], typer.Option("--link", "-l", help="Artifact link.")
     ] = None,
@@ -1200,6 +1431,7 @@ def _task_edit(
         notes,
         linear_issue_id,
         blocked_reason,
+        feedback_reason,
         link,
     )
 
@@ -1312,6 +1544,7 @@ def _edit_task_alias(
         notes,
         linear_issue_id,
         blocked_reason,
+        feedback_reason,
         link,
     )
 
