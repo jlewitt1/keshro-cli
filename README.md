@@ -46,7 +46,7 @@ export KESHRO_API_URL="https://app.keshro.com"
 ```bash
 keshro
 kr
-keshro login --token ksh_pat_...
+keshro login ksh_pat_...
 keshro logout
 ```
 

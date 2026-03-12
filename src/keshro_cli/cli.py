@@ -369,12 +369,15 @@ def _do_logout():
 
 @auth_app.command("login")
 def _auth_login(
+    token_value: Annotated[
+        Optional[str], typer.Argument(help="Personal access token.")
+    ] = None,
     email: Annotated[Optional[str], typer.Option(help="Email address.")] = None,
     password: Annotated[Optional[str], typer.Option(help="Password.")] = None,
     token: Annotated[Optional[str], typer.Option(help="Personal access token.")] = None,
 ):
     """Authenticate with Keshro."""
-    _do_login(email=email, password=password, token=token)
+    _do_login(email=email, password=password, token=token or token_value)
 
 
 @auth_app.command("logout")
@@ -385,12 +388,15 @@ def _auth_logout():
 
 @app.command("login")
 def _login_alias(
+    token_value: Annotated[
+        Optional[str], typer.Argument(help="Personal access token.")
+    ] = None,
     email: Annotated[Optional[str], typer.Option(help="Email address.")] = None,
     password: Annotated[Optional[str], typer.Option(help="Password.")] = None,
     token: Annotated[Optional[str], typer.Option(help="Personal access token.")] = None,
 ):
     """Authenticate with Keshro."""
-    _do_login(email=email, password=password, token=token)
+    _do_login(email=email, password=password, token=token or token_value)
 
 
 @app.command("logout")
@@ -618,7 +624,7 @@ def _plan_create(
             "title": title,
             "summary": summary,
             "status": status,
-            "import_source": "manual",
+            "import_source": "analysis",
             "migration_id": migration_id,
             "plan_steps": _read_json_file(steps_file),
             "external_links": link or [],

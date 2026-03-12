@@ -462,7 +462,7 @@ def test_auth_login_with_token_prints_human_text_by_default(monkeypatch, capsys)
         "keshro_cli.auth.save_auth", lambda payload: saved.update(payload)
     )
 
-    cli.main(["login", "--token", "ksh_pat_test"])
+    cli.main(["login", "ksh_pat_test"])
     out = capsys.readouterr().out.strip()
     assert out == "Successfully logged in to Keshro as cli@example.com."
     assert saved["token"] == "ksh_pat_test"
@@ -488,7 +488,7 @@ def test_auth_login_with_token_validates_with_auth_me(monkeypatch, capsys):
         "keshro_cli.auth.save_auth", lambda payload: saved.update(payload)
     )
 
-    cli.main(["--json", "login", "--token", "ksh_pat_test"])
+    cli.main(["--json", "login", "ksh_pat_test"])
     out = json.loads(capsys.readouterr().out)
     assert out["status"] == "ok"
     assert saved["token"] == "ksh_pat_test"
