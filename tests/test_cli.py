@@ -153,6 +153,23 @@ class _FakeClient:
                                 "https://github.com/acme/migrations/pull/19",
                             ],
                         }
+                        ,
+                        {
+                            "id": "task-456",
+                            "order": 2,
+                            "title": "Translate pilot DAG",
+                            "description": "Move the first batch workflow into Airflow",
+                            "status": "todo",
+                            "owner": None,
+                            "notes": None,
+                            "linear_issue_id": "KES-42",
+                            "external_issue_provider": "linear",
+                            "external_issue_id": "lin_123",
+                            "external_issue_key": "KES-42",
+                            "external_issue_url": "https://linear.app/keshro/issue/KES-42",
+                            "blocked_reason": None,
+                            "artifact_links": [],
+                        },
                     ],
                 }
             )
@@ -488,6 +505,7 @@ def test_task_delete_accepts_plan_id_option(fake_client, capsys):
 def test_plan_task_delete_uses_saved_plan_context(fake_client, capsys, monkeypatch):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
+    monkeypatch.setattr("typer.confirm", lambda *args, **kwargs: True)
     cli.main(["plan", "task", "delete", "task-456"])
     out = capsys.readouterr().out
     assert "Deleted task task-456 from plan plan-123." in out
@@ -766,6 +784,34 @@ def test_task_delete_accepts_feedback_reason(fake_client, capsys):
     )
     out = json.loads(capsys.readouterr().out)
     assert out["payload"]["feedback_reason"] == "not_relevant"
+
+
+def test_task_delete_prompts_before_removing_linked_issue(
+    fake_client, capsys, monkeypatch
+):
+    seen = {}
+
+    def fake_confirm(message, abort=False):
+        seen["message"] = message
+        seen["abort"] = abort
+        return True
+
+    monkeypatch.setattr("typer.confirm", fake_confirm)
+    cli.main(["task", "delete", "plan-123", "task-456"])
+    out = capsys.readouterr().out
+    assert "Deleted task task-456 from plan plan-123." in out
+    assert "linked Linear issue KES-42" in seen["message"]
+    assert seen["abort"] is True
+
+
+def test_task_delete_yes_skips_confirmation(fake_client, capsys, monkeypatch):
+    def fail_confirm(*args, **kwargs):
+        raise AssertionError("confirm should not be called")
+
+    monkeypatch.setattr("typer.confirm", fail_confirm)
+    cli.main(["task", "delete", "plan-123", "task-456", "--yes"])
+    out = capsys.readouterr().out
+    assert "Deleted task task-456 from plan plan-123." in out
 
 
 def test_task_plan_human_output_shows_owner(fake_client, capsys):

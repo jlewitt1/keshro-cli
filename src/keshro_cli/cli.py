@@ -346,13 +346,39 @@ def _view_task(plan_id: str | None, task_id: str) -> None:
 
 
 def _delete_task(
-    plan_id: str | None, task_id: str, feedback_reason: str | None = None
+    plan_id: str | None,
+    task_id: str,
+    feedback_reason: str | None = None,
+    assume_yes: bool = False,
 ) -> None:
     resolved_plan_id = _require_plan_context(plan_id)
-    payload = (
-        {"feedback_reason": feedback_reason} if feedback_reason is not None else None
-    )
     with make_client(_state.api_url, _state.token) as client:
+        plan_res = client.get(f"/api/plans/{resolved_plan_id}")
+        plan_res.raise_for_status()
+        plan = plan_res.json()
+        task = next(
+            (
+                step
+                for step in (plan.get("plan_steps") or [])
+                if _clean(step.get("id")) == task_id
+            ),
+            None,
+        )
+        if task and not _state.json:
+            provider = _clean(task.get("external_issue_provider"))
+            issue_ref = _clean(task.get("external_issue_key")) or _clean(
+                task.get("linear_issue_id")
+            )
+            if provider and issue_ref and not assume_yes:
+                typer.confirm(
+                    f"Delete task {task_id} and linked {provider.title()} issue {issue_ref}?",
+                    abort=True,
+                )
+        payload = (
+            {"feedback_reason": feedback_reason}
+            if feedback_reason is not None
+            else None
+        )
         res = client.request(
             "DELETE",
             f"/api/plans/{resolved_plan_id}/tasks/{task_id}",
@@ -1331,15 +1357,23 @@ def _task_delete(
     feedback_reason: Annotated[
         Optional[str], typer.Option("--reason", help="Why this task was removed.")
     ] = None,
+    assume_yes: Annotated[
+        bool, typer.Option("--yes", "-y", help="Delete without confirmation.")
+    ] = False,
 ):
     """Delete a task from a plan."""
     if plan_id_option:
-        _delete_task(plan_id_option, task_id or plan_id_or_task_id, feedback_reason)
+        _delete_task(
+            plan_id_option,
+            task_id or plan_id_or_task_id,
+            feedback_reason,
+            assume_yes,
+        )
         return
     if task_id is None:
-        _delete_task(None, plan_id_or_task_id, feedback_reason)
+        _delete_task(None, plan_id_or_task_id, feedback_reason, assume_yes)
         return
-    _delete_task(plan_id_or_task_id, task_id, feedback_reason)
+    _delete_task(plan_id_or_task_id, task_id, feedback_reason, assume_yes)
 
 
 @plan_task_app.command("delete")
@@ -1357,15 +1391,23 @@ def _plan_task_delete(
     feedback_reason: Annotated[
         Optional[str], typer.Option("--reason", help="Why this task was removed.")
     ] = None,
+    assume_yes: Annotated[
+        bool, typer.Option("--yes", "-y", help="Delete without confirmation.")
+    ] = False,
 ):
     """Delete a task from a plan."""
     if plan_id_option:
-        _delete_task(plan_id_option, task_id or plan_id_or_task_id, feedback_reason)
+        _delete_task(
+            plan_id_option,
+            task_id or plan_id_or_task_id,
+            feedback_reason,
+            assume_yes,
+        )
         return
     if task_id is None:
-        _delete_task(None, plan_id_or_task_id, feedback_reason)
+        _delete_task(None, plan_id_or_task_id, feedback_reason, assume_yes)
         return
-    _delete_task(plan_id_or_task_id, task_id, feedback_reason)
+    _delete_task(plan_id_or_task_id, task_id, feedback_reason, assume_yes)
 
 
 @task_app.command("edit")
