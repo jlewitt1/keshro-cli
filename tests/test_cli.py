@@ -109,6 +109,25 @@ class _FakeClient:
                     "org_id": "org-123",
                 }
             )
+        if path == "/api/migrations/migration-123/plan":
+            return _FakeResponse(
+                {
+                    "id": "plan-123",
+                    "title": "AWS Batch to Airflow pilot",
+                    "migration_id": "migration-123",
+                    "task_feedback_events": [
+                        {
+                            "event_type": "task_updated",
+                            "task_id": "task-456",
+                            "task_title": "Translate pilot DAG",
+                            "source": "cli",
+                            "feedback_reason": "Pilot scope changed after DAG review",
+                            "changed_fields": ["status", "notes"],
+                            "created_at": "2026-03-15T16:00:00Z",
+                        }
+                    ],
+                }
+            )
         if path == "/api/plans":
             return _FakeResponse(
                 [
@@ -770,6 +789,167 @@ def test_task_edit_accepts_plan_id_option(fake_client, capsys):
     assert out["path"] == "/api/plans/plan-123/tasks/task-456"
 
 
+def test_plan_next_returns_first_actionable_task(fake_client, capsys):
+    cli.main(["--json", "plan", "next", "plan-123"])
+    out = json.loads(capsys.readouterr().out)
+    assert out["plan_id"] == "plan-123"
+    assert out["task"]["id"] == "review-schedules"
+
+
+def test_task_start_marks_task_in_progress(fake_client, capsys):
+    cli.main(
+        [
+            "--json",
+            "task",
+            "start",
+            "plan-123",
+            "task-456",
+            "--notes",
+            "Starting the pilot implementation",
+            "--reason",
+            "Top priority after plan review",
+        ]
+    )
+    out = json.loads(capsys.readouterr().out)
+    assert out["path"] == "/api/plans/plan-123/tasks/task-456"
+    assert out["payload"]["status"] == "in_progress"
+    assert out["payload"]["notes"] == "Starting the pilot implementation"
+    assert out["payload"]["feedback_reason"] == "Top priority after plan review"
+
+
+def test_task_next_returns_next_actionable_task(fake_client, capsys):
+    cli.main(
+        [
+            "--json",
+            "task",
+            "next",
+            "--plan-id",
+            "plan-123",
+        ]
+    )
+    out = json.loads(capsys.readouterr().out)
+    assert out["plan_id"] == "plan-123"
+    assert out["task"]["id"] == "review-schedules"
+
+
+def test_task_done_marks_task_completed(fake_client, capsys):
+    cli.main(
+        [
+            "--json",
+            "task",
+            "done",
+            "plan-123",
+            "task-456",
+            "--notes",
+            "Pilot DAG merged and validated",
+            "--link",
+            "https://github.com/acme/migrations/pull/21",
+        ]
+    )
+    out = json.loads(capsys.readouterr().out)
+    assert out["path"] == "/api/plans/plan-123/tasks/task-456"
+    assert out["payload"]["status"] == "completed"
+    assert out["payload"]["notes"] == "Pilot DAG merged and validated"
+    assert out["payload"]["artifact_links"] == [
+        "https://github.com/acme/migrations/pull/21"
+    ]
+    assert out["payload"]["blocked_reason"] == ""
+
+
+def test_task_block_marks_task_blocked(fake_client, capsys):
+    cli.main(
+        [
+            "--json",
+            "task",
+            "block",
+            "plan-123",
+            "task-456",
+            "--reason",
+            "Waiting on Terraform IAM role changes",
+            "--feedback-reason",
+            "Access blocker discovered during pilot setup",
+        ]
+    )
+    out = json.loads(capsys.readouterr().out)
+    assert out["path"] == "/api/plans/plan-123/tasks/task-456"
+    assert out["payload"]["status"] == "blocked"
+    assert out["payload"]["blocked_reason"] == "Waiting on Terraform IAM role changes"
+    assert out["payload"]["feedback_reason"] == "Access blocker discovered during pilot setup"
+
+
+def test_task_unblock_clears_blocked_reason(fake_client, capsys):
+    cli.main(
+        [
+            "--json",
+            "task",
+            "unblock",
+            "plan-123",
+            "task-456",
+            "--notes",
+            "Terraform role applied; resuming pilot",
+        ]
+    )
+    out = json.loads(capsys.readouterr().out)
+    assert out["path"] == "/api/plans/plan-123/tasks/task-456"
+    assert out["payload"]["status"] == "in_progress"
+    assert out["payload"]["blocked_reason"] == ""
+    assert out["payload"]["notes"] == "Terraform role applied; resuming pilot"
+
+
+def test_task_note_appends_timestamped_note(fake_client, capsys):
+    cli.main(
+        [
+            "--json",
+            "task",
+            "note",
+            "plan-123",
+            "task-456",
+            "--note",
+            "Airflow will orchestrate Batch during the pilot",
+        ]
+    )
+    out = json.loads(capsys.readouterr().out)
+    assert out["path"] == "/api/plans/plan-123/tasks/task-456"
+    assert "Airflow will orchestrate Batch during the pilot" in out["payload"]["notes"]
+    assert "[20" in out["payload"]["notes"]
+
+
+def test_task_artifact_appends_link_without_overwriting(fake_client, capsys):
+    cli.main(
+        [
+            "--json",
+            "task",
+            "artifact",
+            "plan-123",
+            "task-456",
+            "--link",
+            "https://github.com/acme/migrations/pull/99",
+        ]
+    )
+    out = json.loads(capsys.readouterr().out)
+    assert out["path"] == "/api/plans/plan-123/tasks/task-456"
+    assert out["payload"]["artifact_links"] == [
+        "https://github.com/acme/migrations/pull/99"
+    ]
+
+
+def test_plan_replan_notes_appends_summary(fake_client, capsys):
+    cli.main(
+        [
+            "--json",
+            "plan",
+            "replan-notes",
+            "Need to keep Batch as the runtime while Airflow takes over orchestration.",
+            "--plan-id",
+            "plan-123",
+        ]
+    )
+    out = json.loads(capsys.readouterr().out)
+    assert out["path"] == "/api/plans/plan-123"
+    assert "Pilot plan for the first DAG migration." in out["payload"]["summary"]
+    assert "Need to keep Batch as the runtime while Airflow takes over orchestration." in out["payload"]["summary"]
+
+
 def test_task_delete_accepts_feedback_reason(fake_client, capsys):
     cli.main(
         [
@@ -835,32 +1015,29 @@ def test_task_plan_human_output_shows_owner(fake_client, capsys):
     assert "Platform team" in out
 
 
-def test_outcome_view_uses_saved_plan_context(fake_client, capsys, monkeypatch):
+def test_task_next_uses_saved_plan_context(fake_client, capsys, monkeypatch):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
-    cli.main(["outcome", "view"])
+    cli.main(["task", "next"])
     method, path, _ = fake_client.calls[-1]
     assert method == "GET"
-    assert path == "/api/plans/plan-123/outcome"
+    assert path == "/api/plans/plan-123"
 
 
-def test_outcome_save_accepts_plan_id_option(fake_client, capsys):
+def test_plan_replan_notes_accepts_plan_id_option(fake_client, capsys):
     cli.main(
         [
             "--json",
-            "outcome",
-            "save",
+            "plan",
+            "replan-notes",
             "--plan-id",
             "plan-123",
-            "--status",
-            "partial",
-            "--summary",
             "Pilot DAG completed",
         ]
     )
     out = json.loads(capsys.readouterr().out)
-    assert out["path"] == "/api/plans/plan-123/outcome"
-    assert out["payload"]["status"] == "partial"
+    assert out["path"] == "/api/plans/plan-123"
+    assert "Pilot DAG completed" in out["payload"]["summary"]
 
 
 def test_task_edit_without_plan_context_fails(capsys, monkeypatch):
@@ -869,6 +1046,22 @@ def test_task_edit_without_plan_context_fails(capsys, monkeypatch):
     code = cli.main(["task", "edit", "task-456", "--status", "in_progress"])
     assert code == 1
     assert "Plan ID required" in capsys.readouterr().err
+
+
+def test_migration_history_uses_plan_audit_trail(fake_client, capsys):
+    cli.main(["migration", "history", "migration-123"])
+    out = capsys.readouterr().out
+    assert "Audit Trail:" in out
+    assert "Translate pilot DAG" in out
+    assert "Pilot scope changed after DAG review" in out
+
+
+def test_migration_history_json(fake_client, capsys):
+    cli.main(["--json", "migration", "history", "migration-123"])
+    out = json.loads(capsys.readouterr().out)
+    assert out["migration_id"] == "migration-123"
+    assert out["plan_id"] == "plan-123"
+    assert out["task_feedback_events"][0]["task_id"] == "task-456"
 
 
 def test_config_prints_saved_auth_metadata(monkeypatch, capsys):

@@ -2,6 +2,7 @@ import json
 import re
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Optional
 
@@ -45,14 +46,12 @@ app = typer.Typer(add_completion=False, no_args_is_help=False)
 auth_app = typer.Typer(help="Authentication")
 plan_app = typer.Typer(help="Plan management")
 task_app = typer.Typer(help="Task management")
-outcome_app = typer.Typer(help="Outcome tracking")
 migration_app = typer.Typer(help="Migration project management")
 config_app = typer.Typer(help="Configuration", invoke_without_command=True)
 plan_task_app = typer.Typer(help="Plan task management")
 
 app.add_typer(plan_app, name="plan")
 app.add_typer(task_app, name="task")
-app.add_typer(outcome_app, name="outcome")
 app.add_typer(migration_app, name="migration")
 app.add_typer(config_app, name="config")
 plan_app.add_typer(plan_task_app, name="task")
@@ -333,6 +332,38 @@ def _print_task_detail(
             print(f"  - {link}")
 
 
+def _print_task_feedback_events(plan: dict) -> None:
+    events = list(plan.get("task_feedback_events") or [])
+    if not events:
+        print("No execution history found for this migration yet.")
+        return
+    print(f"{DIM}Plan:{RESET} {plan.get('title') or plan.get('id') or 'Untitled plan'}")
+    if plan.get("id"):
+        print(f"{DIM}Plan ID:{RESET} {plan['id']}")
+    if plan.get("migration_id"):
+        print(f"{DIM}Migration ID:{RESET} {plan['migration_id']}")
+    print(f"{DIM}Audit Trail:{RESET}")
+    for event in reversed(events):
+        event_type = _clean(event.get("event_type")) or "updated"
+        task_title = _clean(event.get("task_title")) or "Untitled task"
+        task_id = _clean(event.get("task_id"))
+        created_at = _clean(event.get("created_at"))
+        source = _clean(event.get("source")) or "unknown"
+        header = f"  - {task_title} [{event_type}]"
+        if task_id:
+            header = f"{header} {DIM}(task-id: {task_id}){RESET}"
+        if created_at:
+            header = f"{header}  {DIM}{created_at}{RESET}"
+        print(header)
+        print(f"    Source: {source}")
+        feedback_reason = _clean(event.get("feedback_reason"))
+        if feedback_reason:
+            print(f"    Reason: {feedback_reason}")
+        changed_fields = event.get("changed_fields") or []
+        if changed_fields:
+            print(f"    Changed: {', '.join(str(field) for field in changed_fields)}")
+
+
 def _view_task(plan_id: str | None, task_id: str) -> None:
     resolved_plan_id = _require_plan_context(plan_id)
     with make_client(_state.api_url, _state.token) as client:
@@ -343,6 +374,53 @@ def _view_task(plan_id: str | None, task_id: str) -> None:
             print_output(plan, True)
             return
         _print_task_detail(plan, task_id=task_id)
+
+
+def _get_plan_or_exit(plan_id: str | None) -> dict:
+    resolved_plan_id = _require_plan_context(plan_id)
+    with make_client(_state.api_url, _state.token) as client:
+        res = client.get(f"/api/plans/{resolved_plan_id}")
+        res.raise_for_status()
+        return res.json()
+
+
+def _find_task(plan: dict, task_id: str) -> dict | None:
+    return next(
+        (
+            step
+            for step in (plan.get("plan_steps") or [])
+            if _clean(step.get("id")) == _clean(task_id)
+        ),
+        None,
+    )
+
+
+def _next_actionable_task(plan: dict) -> dict | None:
+    steps = sorted(plan.get("plan_steps") or [], key=lambda step: step.get("order", 0))
+    for desired_status in ("in_progress", "todo"):
+        match = next(
+            (
+                step
+                for step in steps
+                if _clean(step.get("status") or "todo").lower() == desired_status
+            ),
+            None,
+        )
+        if match:
+            return match
+    return None
+
+
+def _append_replan_summary(existing_summary: str | None, note: str) -> str:
+    base = _clean(existing_summary)
+    lines = [
+        f"Replan notes ({datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}):",
+        note.strip(),
+    ]
+    addition = "\n".join(lines)
+    if not base:
+        return addition
+    return f"{base}\n\n{addition}"
 
 
 def _delete_task(
@@ -668,6 +746,33 @@ def _migration_view(
             return
         context_label = _current_context_label() if _current_org_id() else None
         _print_migration_detail(migration, context_label=context_label)
+
+
+@migration_app.command("history")
+def _migration_history(
+    migration_id: Annotated[str, typer.Argument(help="Migration ID.")],
+):
+    """Show the execution history / audit trail for a migration."""
+    with make_client(_state.api_url, _state.token) as client:
+        migration_res = client.get(f"/api/migrations/{migration_id}")
+        migration_res.raise_for_status()
+        migration = migration_res.json()
+        plan_res = client.get(f"/api/migrations/{migration_id}/plan")
+        plan_res.raise_for_status()
+        plan = plan_res.json()
+        if _state.json:
+            print_output(
+                {
+                    "migration_id": migration.get("id"),
+                    "plan_id": plan.get("id"),
+                    "task_feedback_events": plan.get("task_feedback_events") or [],
+                },
+                True,
+            )
+            return
+        context_label = _current_context_label() if _current_org_id() else None
+        _print_migration_summary(migration, context_label=context_label)
+        _print_task_feedback_events(plan)
 
 
 @migration_app.command("delete")
@@ -1050,6 +1155,58 @@ def _plan_view(
         _print_plan_detail(plan, context_label=context_label)
 
 
+@plan_app.command("next")
+def _plan_next(
+    plan_id: Annotated[
+        Optional[str],
+        typer.Argument(help="Plan ID. Uses saved plan context if omitted."),
+    ] = None,
+):
+    """Show the next actionable task in a plan."""
+    resolved_plan_id = _require_plan_context(plan_id)
+    plan = _get_plan_or_exit(resolved_plan_id)
+    task = _next_actionable_task(plan)
+    if _state.json:
+        print_output(
+            {
+                "plan_id": resolved_plan_id,
+                "task": task,
+            },
+            True,
+        )
+        return
+    if not task:
+        print(f"No actionable tasks found for plan {resolved_plan_id}.")
+        return
+    _print_task_detail(plan, task_id=_clean(task.get("id")))
+
+
+@task_app.command("next")
+def _task_next(
+    plan_id: Annotated[
+        Optional[str],
+        typer.Option("--plan-id", "-p", help="Plan ID. Uses saved plan context if omitted."),
+    ] = None,
+):
+    """Show the next actionable task in the current migration plan."""
+    resolved_plan_id = _require_plan_context(plan_id)
+    plan = _get_plan_or_exit(resolved_plan_id)
+    task = _next_actionable_task(plan)
+    if _state.json:
+        print_output(
+            {
+                "plan_id": resolved_plan_id,
+                "task": task,
+            },
+            True,
+        )
+        return
+    if not task:
+        print(f"No actionable tasks found for plan {resolved_plan_id}.")
+        return
+    _print_task_detail(plan, task_id=_clean(task.get("id")))
+
+
 @plan_app.command("update")
 def _plan_update(
     plan_id: Annotated[str, typer.Argument(help="Plan ID.")],
@@ -1089,11 +1246,35 @@ def _plan_update(
         print_output(res.json(), _state.json)
 
 
+@plan_app.command("replan-notes")
+def _plan_replan_notes(
+    note: Annotated[str, typer.Argument(help="Replan note to append to the plan summary.")],
+    plan_id: Annotated[
+        Optional[str],
+        typer.Option("--plan-id", "-p", help="Plan ID. Uses saved plan context if omitted."),
+    ] = None,
+):
+    """Append a replan note to the current plan summary."""
+    resolved_plan_id = _require_plan_context(plan_id)
+    plan = _get_plan_or_exit(resolved_plan_id)
+    payload = {
+        "summary": _append_replan_summary(plan.get("summary"), note),
+    }
+    with make_client(_state.api_url, _state.token) as client:
+        res = client.patch(f"/api/plans/{resolved_plan_id}", json=payload)
+        res.raise_for_status()
+        updated = res.json()
+        if _state.json:
+            print_output(updated, True)
+            return
+        print(f"Saved replan notes on plan {resolved_plan_id}.")
+
+
 @plan_app.command("delete")
 def _plan_delete(
     plan_id: Annotated[str, typer.Argument(help="Plan ID.")],
 ):
-    """Delete a plan and its saved plan outcome."""
+    """Delete a plan."""
     with make_client(_state.api_url, _state.token) as client:
         res = client.delete(f"/api/plans/{plan_id}")
         res.raise_for_status()
@@ -1183,6 +1364,127 @@ def _do_task_update(
             print_output(plan, True)
             return
         _print_task_detail(plan, task_id=task_id)
+
+
+def _do_task_start(
+    plan_id: str | None,
+    task_id: str,
+    owner: str | None = None,
+    notes: str | None = None,
+    feedback_reason: str | None = None,
+    link: list[str] | None = None,
+):
+    _do_task_update(
+        plan_id,
+        task_id,
+        status="in_progress",
+        owner=owner,
+        notes=notes,
+        feedback_reason=feedback_reason,
+        link=link,
+    )
+
+
+def _do_task_done(
+    plan_id: str | None,
+    task_id: str,
+    notes: str | None = None,
+    feedback_reason: str | None = None,
+    link: list[str] | None = None,
+):
+    _do_task_update(
+        plan_id,
+        task_id,
+        status="completed",
+        notes=notes,
+        feedback_reason=feedback_reason,
+        link=link,
+        blocked_reason="",
+    )
+
+
+def _append_task_note(
+    plan_id: str | None,
+    task_id: str,
+    note: str,
+    feedback_reason: str | None = None,
+):
+    resolved_plan_id = _require_plan_context(plan_id)
+    plan = _get_plan_or_exit(resolved_plan_id)
+    task = _find_task(plan, task_id)
+    if not task:
+        raise SystemExit(f"Task not found: {task_id}")
+    existing_notes = _clean(task.get("notes"))
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    next_notes = (
+        f"{existing_notes}\n\n[{timestamp}] {note.strip()}".strip()
+        if existing_notes
+        else f"[{timestamp}] {note.strip()}"
+    )
+    _do_task_update(
+        resolved_plan_id,
+        task_id,
+        notes=next_notes,
+        feedback_reason=feedback_reason,
+    )
+
+
+def _add_task_artifact(
+    plan_id: str | None,
+    task_id: str,
+    artifact_link: str,
+    feedback_reason: str | None = None,
+):
+    resolved_plan_id = _require_plan_context(plan_id)
+    plan = _get_plan_or_exit(resolved_plan_id)
+    task = _find_task(plan, task_id)
+    if not task:
+        raise SystemExit(f"Task not found: {task_id}")
+    existing_links = [
+        _clean(link)
+        for link in (task.get("artifact_links") or [])
+        if _clean(str(link))
+    ]
+    next_link = artifact_link.strip()
+    next_links = existing_links if next_link in existing_links else [*existing_links, next_link]
+    _do_task_update(
+        resolved_plan_id,
+        task_id,
+        link=next_links,
+        feedback_reason=feedback_reason,
+    )
+
+
+def _do_task_block(
+    plan_id: str | None,
+    task_id: str,
+    blocked_reason: str,
+    feedback_reason: str | None = None,
+):
+    _do_task_update(
+        plan_id,
+        task_id,
+        status="blocked",
+        blocked_reason=blocked_reason,
+        feedback_reason=feedback_reason,
+    )
+
+
+def _do_task_unblock(
+    plan_id: str | None,
+    task_id: str,
+    notes: str | None = None,
+    feedback_reason: str | None = None,
+    status: str = "in_progress",
+):
+    _do_task_update(
+        plan_id,
+        task_id,
+        status=status,
+        notes=notes,
+        blocked_reason="",
+        feedback_reason=feedback_reason,
+    )
 
 
 # Shared option definitions for task commands
@@ -1478,6 +1780,256 @@ def _task_edit(
     )
 
 
+@task_app.command("start")
+def _task_start(
+    plan_id_or_task_id: Annotated[
+        str, typer.Argument(help="Plan ID, or Task ID if a default plan is saved.")
+    ],
+    task_id: Annotated[
+        Optional[str],
+        typer.Argument(help="Task ID. Optional when a default plan is saved."),
+    ] = None,
+    plan_id_option: Annotated[
+        Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
+    ] = None,
+    owner: Annotated[
+        Optional[str], typer.Option("--owner", "-o", help="Task owner.")
+    ] = None,
+    notes: Annotated[
+        Optional[str], typer.Option("--notes", "-n", help="Start note.")
+    ] = None,
+    feedback_reason: Annotated[
+        Optional[str], typer.Option("--reason", help="Why this task is starting now.")
+    ] = None,
+    link: Annotated[
+        Optional[list[str]], typer.Option("--link", "-l", help="Artifact link.")
+    ] = None,
+):
+    """Mark a task as in progress."""
+    resolved_plan_id: str | None
+    resolved_task_id: str
+    if plan_id_option:
+        resolved_plan_id = plan_id_option
+        resolved_task_id = task_id or plan_id_or_task_id
+    elif task_id is None:
+        resolved_plan_id = _require_plan_context(None)
+        resolved_task_id = plan_id_or_task_id
+    else:
+        resolved_plan_id = plan_id_or_task_id
+        resolved_task_id = task_id
+    _do_task_start(
+        resolved_plan_id,
+        resolved_task_id,
+        owner=owner,
+        notes=notes,
+        feedback_reason=feedback_reason,
+        link=link,
+    )
+
+
+@task_app.command("done")
+def _task_done(
+    plan_id_or_task_id: Annotated[
+        str, typer.Argument(help="Plan ID, or Task ID if a default plan is saved.")
+    ],
+    task_id: Annotated[
+        Optional[str],
+        typer.Argument(help="Task ID. Optional when a default plan is saved."),
+    ] = None,
+    plan_id_option: Annotated[
+        Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
+    ] = None,
+    notes: Annotated[
+        Optional[str], typer.Option("--notes", "-n", help="Completion note.")
+    ] = None,
+    feedback_reason: Annotated[
+        Optional[str], typer.Option("--reason", help="Why this task is considered done.")
+    ] = None,
+    link: Annotated[
+        Optional[list[str]], typer.Option("--link", "-l", help="Artifact link.")
+    ] = None,
+):
+    """Mark a task as completed."""
+    resolved_plan_id: str | None
+    resolved_task_id: str
+    if plan_id_option:
+        resolved_plan_id = plan_id_option
+        resolved_task_id = task_id or plan_id_or_task_id
+    elif task_id is None:
+        resolved_plan_id = _require_plan_context(None)
+        resolved_task_id = plan_id_or_task_id
+    else:
+        resolved_plan_id = plan_id_or_task_id
+        resolved_task_id = task_id
+    _do_task_done(
+        resolved_plan_id,
+        resolved_task_id,
+        notes=notes,
+        feedback_reason=feedback_reason,
+        link=link,
+    )
+
+
+@task_app.command("block")
+def _task_block(
+    plan_id_or_task_id: Annotated[
+        str, typer.Argument(help="Plan ID, or Task ID if a default plan is saved.")
+    ],
+    task_id: Annotated[
+        Optional[str],
+        typer.Argument(help="Task ID. Optional when a default plan is saved."),
+    ] = None,
+    plan_id_option: Annotated[
+        Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
+    ] = None,
+    blocked_reason: Annotated[
+        str, typer.Option("--reason", "-r", help="Why the task is blocked.")
+    ] = ...,
+    feedback_reason: Annotated[
+        Optional[str], typer.Option("--feedback-reason", help="Extra context for the audit trail.")
+    ] = None,
+):
+    """Mark a task as blocked."""
+    resolved_plan_id: str | None
+    resolved_task_id: str
+    if plan_id_option:
+        resolved_plan_id = plan_id_option
+        resolved_task_id = task_id or plan_id_or_task_id
+    elif task_id is None:
+        resolved_plan_id = _require_plan_context(None)
+        resolved_task_id = plan_id_or_task_id
+    else:
+        resolved_plan_id = plan_id_or_task_id
+        resolved_task_id = task_id
+    _do_task_block(
+        resolved_plan_id,
+        resolved_task_id,
+        blocked_reason=blocked_reason,
+        feedback_reason=feedback_reason,
+    )
+
+
+@task_app.command("unblock")
+def _task_unblock(
+    plan_id_or_task_id: Annotated[
+        str, typer.Argument(help="Plan ID, or Task ID if a default plan is saved.")
+    ],
+    task_id: Annotated[
+        Optional[str],
+        typer.Argument(help="Task ID. Optional when a default plan is saved."),
+    ] = None,
+    plan_id_option: Annotated[
+        Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
+    ] = None,
+    notes: Annotated[
+        Optional[str], typer.Option("--notes", "-n", help="Short note about how the blocker was resolved.")
+    ] = None,
+    status: Annotated[
+        str, typer.Option("--status", "-s", help="Status to use after unblocking.")
+    ] = "in_progress",
+    feedback_reason: Annotated[
+        Optional[str], typer.Option("--reason", help="Why the task is being unblocked now.")
+    ] = None,
+):
+    """Clear a task blocker and resume work."""
+    resolved_plan_id: str | None
+    resolved_task_id: str
+    if plan_id_option:
+        resolved_plan_id = plan_id_option
+        resolved_task_id = task_id or plan_id_or_task_id
+    elif task_id is None:
+        resolved_plan_id = _require_plan_context(None)
+        resolved_task_id = plan_id_or_task_id
+    else:
+        resolved_plan_id = plan_id_or_task_id
+        resolved_task_id = task_id
+    _do_task_unblock(
+        resolved_plan_id,
+        resolved_task_id,
+        notes=notes,
+        feedback_reason=feedback_reason,
+        status=status,
+    )
+
+
+@task_app.command("note")
+def _task_note(
+    plan_id_or_task_id: Annotated[
+        str, typer.Argument(help="Plan ID, or Task ID if a default plan is saved.")
+    ],
+    task_id: Annotated[
+        Optional[str],
+        typer.Argument(help="Task ID. Optional when a default plan is saved."),
+    ] = None,
+    plan_id_option: Annotated[
+        Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
+    ] = None,
+    note: Annotated[
+        str, typer.Option("--note", "-n", help="Note to append to the task.")
+    ] = ...,
+    feedback_reason: Annotated[
+        Optional[str], typer.Option("--reason", help="Why this note matters.")
+    ] = None,
+):
+    """Append a timestamped note to a task."""
+    resolved_plan_id: str | None
+    resolved_task_id: str
+    if plan_id_option:
+        resolved_plan_id = plan_id_option
+        resolved_task_id = task_id or plan_id_or_task_id
+    elif task_id is None:
+        resolved_plan_id = _require_plan_context(None)
+        resolved_task_id = plan_id_or_task_id
+    else:
+        resolved_plan_id = plan_id_or_task_id
+        resolved_task_id = task_id
+    _append_task_note(
+        resolved_plan_id,
+        resolved_task_id,
+        note=note,
+        feedback_reason=feedback_reason,
+    )
+
+
+@task_app.command("artifact")
+def _task_artifact(
+    plan_id_or_task_id: Annotated[
+        str, typer.Argument(help="Plan ID, or Task ID if a default plan is saved.")
+    ],
+    task_id: Annotated[
+        Optional[str],
+        typer.Argument(help="Task ID. Optional when a default plan is saved."),
+    ] = None,
+    plan_id_option: Annotated[
+        Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
+    ] = None,
+    link: Annotated[
+        str, typer.Option("--link", "-l", help="Artifact URL to attach to the task.")
+    ] = ...,
+    feedback_reason: Annotated[
+        Optional[str], typer.Option("--reason", help="Why this artifact matters.")
+    ] = None,
+):
+    """Attach an artifact link to a task without overwriting existing links."""
+    resolved_plan_id: str | None
+    resolved_task_id: str
+    if plan_id_option:
+        resolved_plan_id = plan_id_option
+        resolved_task_id = task_id or plan_id_or_task_id
+    elif task_id is None:
+        resolved_plan_id = _require_plan_context(None)
+        resolved_task_id = plan_id_or_task_id
+    else:
+        resolved_plan_id = plan_id_or_task_id
+        resolved_task_id = task_id
+    _add_task_artifact(
+        resolved_plan_id,
+        resolved_task_id,
+        artifact_link=link,
+        feedback_reason=feedback_reason,
+    )
+
+
 # Legacy aliases
 
 
@@ -1589,69 +2141,6 @@ def _edit_task_alias(
         feedback_reason,
         link,
     )
-
-
-# ---------------------------------------------------------------------------
-# Outcome commands
-# ---------------------------------------------------------------------------
-
-
-@outcome_app.command("view")
-def _outcome_view(
-    plan_id: Annotated[
-        Optional[str],
-        typer.Argument(help="Plan ID. Uses saved plan context if omitted."),
-    ] = None,
-    plan_id_option: Annotated[
-        Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
-    ] = None,
-):
-    """View the outcome record for a plan."""
-    plan_id = _require_plan_context(plan_id_option or plan_id)
-    with make_client(_state.api_url, _state.token) as client:
-        res = client.get(f"/api/plans/{plan_id}/outcome")
-        res.raise_for_status()
-        print_output(res.json(), _state.json)
-
-
-@outcome_app.command("save")
-def _outcome_save(
-    plan_id: Annotated[
-        Optional[str],
-        typer.Argument(help="Plan ID. Uses saved plan context if omitted."),
-    ] = None,
-    plan_id_option: Annotated[
-        Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
-    ] = None,
-    status: Annotated[
-        str, typer.Option("--status", "-s", help="Outcome status.")
-    ] = ...,
-    summary: Annotated[
-        Optional[str], typer.Option("--summary", "-m", help="Outcome summary.")
-    ] = None,
-    notes: Annotated[
-        Optional[str], typer.Option("--notes", "-n", help="Outcome notes.")
-    ] = None,
-    actual_hours: Annotated[
-        Optional[int], typer.Option("--actual-hours", "-H", help="Actual hours.")
-    ] = None,
-    actual_cost: Annotated[
-        Optional[int], typer.Option("--actual-cost", "-c", help="Actual cost.")
-    ] = None,
-):
-    """Save the outcome of a completed migration plan."""
-    plan_id = _require_plan_context(plan_id_option or plan_id)
-    payload = {
-        "status": status,
-        "summary": summary,
-        "notes": notes,
-        "actual_hours": actual_hours,
-        "actual_cost": actual_cost,
-    }
-    with make_client(_state.api_url, _state.token) as client:
-        res = client.post(f"/api/plans/{plan_id}/outcome", json=payload)
-        res.raise_for_status()
-        print_output(res.json(), _state.json)
 
 
 # ---------------------------------------------------------------------------
