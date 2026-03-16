@@ -21,6 +21,7 @@ DIM = "\033[2m"
 CYAN = "\033[36m"
 GREEN = "\033[32m"
 YELLOW = "\033[33m"
+RED = "\033[31m"
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +333,36 @@ def _print_task_detail(
             print(f"  - {link}")
 
 
+def _print_task_update_summary(plan: dict, task_id: str, payload: dict) -> None:
+    steps = plan.get("plan_steps") or []
+    task = next(
+        (step for step in steps if _clean(step.get("id")) == _clean(task_id)),
+        None,
+    )
+    if task is None:
+        task_title = task_id or "task"
+        status = _clean(payload.get("status")) or "updated"
+    else:
+        task_title = task.get("title") or task_id or "Untitled task"
+        status = _clean(task.get("status") or payload.get("status") or "todo") or "todo"
+    print(f"Updated task {task_title} [{status}].")
+    changed_bits: list[str] = []
+    if "owner" in payload:
+        changed_bits.append(f"Owner: {_clean(task.get('owner')) or 'Unassigned'}")
+    if "blocked_reason" in payload:
+        blocked_reason = _clean(task.get("blocked_reason"))
+        changed_bits.append(
+            f"Blocked: {blocked_reason}" if blocked_reason else "Blocked cleared"
+        )
+    if "artifact_links" in payload:
+        links = task.get("artifact_links") or []
+        changed_bits.append(f"Artifacts: {len(links)}")
+    if "notes" in payload:
+        changed_bits.append("Notes updated")
+    if changed_bits:
+        print("  " + " | ".join(changed_bits))
+
+
 def _print_task_feedback_events(plan: dict) -> None:
     events = list(plan.get("task_feedback_events") or [])
     if not events:
@@ -612,15 +643,11 @@ def _app_callback(
 
 
 def _do_login(
-    email: str | None = None,
-    password: str | None = None,
     token: str | None = None,
 ):
     cmd_auth_login(
         api_url=_state.api_url,
         token=token,
-        email=email,
-        password=password,
         json_output=_state.json,
     )
 
@@ -634,12 +661,9 @@ def _auth_login(
     token_value: Annotated[
         Optional[str], typer.Argument(help="Personal access token.")
     ] = None,
-    email: Annotated[Optional[str], typer.Option(help="Email address.")] = None,
-    password: Annotated[Optional[str], typer.Option(help="Password.")] = None,
-    token: Annotated[Optional[str], typer.Option(help="Personal access token.")] = None,
 ):
     """Authenticate with Keshro"""
-    _do_login(email=email, password=password, token=token or token_value)
+    _do_login(token=token_value)
 
 
 @auth_app.command("logout")
@@ -653,12 +677,9 @@ def _login_alias(
     token_value: Annotated[
         Optional[str], typer.Argument(help="Personal access token.")
     ] = None,
-    email: Annotated[Optional[str], typer.Option(help="Email address.")] = None,
-    password: Annotated[Optional[str], typer.Option(help="Password.")] = None,
-    token: Annotated[Optional[str], typer.Option(help="Personal access token.")] = None,
 ):
     """Authenticate with Keshro"""
-    _do_login(email=email, password=password, token=token or token_value)
+    _do_login(token=token_value)
 
 
 @app.command("logout")
@@ -797,11 +818,15 @@ def _migration_delete(
 def _config_show():
     auth = load_auth()
     orgs: list[dict] = []
+    authenticated = False
     if auth.get("token"):
         try:
             with make_client(
                 auth.get("api_url") or DEFAULT_API_URL, auth.get("token")
             ) as client:
+                me_res = client.get("/api/auth/me")
+                me_res.raise_for_status()
+                authenticated = True
                 res = client.get("/api/orgs")
                 res.raise_for_status()
                 orgs = res.json() or []
@@ -809,7 +834,7 @@ def _config_show():
             orgs = []
     payload = {
         "api_url": auth.get("api_url") or DEFAULT_API_URL,
-        "authenticated": bool(auth.get("token")),
+        "authenticated": authenticated,
         "default_org_id": auth.get("default_org_id"),
         "default_org_name": auth.get("default_org_name"),
         "default_plan_id": auth.get("default_plan_id"),
@@ -1185,7 +1210,9 @@ def _plan_next(
 def _task_next(
     plan_id: Annotated[
         Optional[str],
-        typer.Option("--plan-id", "-p", help="Plan ID. Uses saved plan context if omitted."),
+        typer.Option(
+            "--plan-id", "-p", help="Plan ID. Uses saved plan context if omitted."
+        ),
     ] = None,
 ):
     """Show the next actionable task in the current migration plan."""
@@ -1248,10 +1275,14 @@ def _plan_update(
 
 @plan_app.command("replan-notes")
 def _plan_replan_notes(
-    note: Annotated[str, typer.Argument(help="Replan note to append to the plan summary.")],
+    note: Annotated[
+        str, typer.Argument(help="Replan note to append to the plan summary.")
+    ],
     plan_id: Annotated[
         Optional[str],
-        typer.Option("--plan-id", "-p", help="Plan ID. Uses saved plan context if omitted."),
+        typer.Option(
+            "--plan-id", "-p", help="Plan ID. Uses saved plan context if omitted."
+        ),
     ] = None,
 ):
     """Append a replan note to the current plan summary."""
@@ -1363,7 +1394,29 @@ def _do_task_update(
         if _state.json:
             print_output(plan, True)
             return
-        _print_task_detail(plan, task_id=task_id)
+        _print_task_update_summary(plan, task_id=task_id, payload=payload)
+
+
+def _build_appended_task_notes(
+    plan_id: str | None,
+    task_id: str,
+    note: str | None,
+) -> str | None:
+    cleaned_note = _clean(note)
+    if not cleaned_note:
+        return None
+    resolved_plan_id = _require_plan_context(plan_id)
+    plan = _get_plan_or_exit(resolved_plan_id)
+    task = _find_task(plan, task_id)
+    if not task:
+        raise SystemExit(f"Task not found: {task_id}")
+    existing_notes = _clean(task.get("notes"))
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return (
+        f"{existing_notes}\n\n[{timestamp}] {cleaned_note}".strip()
+        if existing_notes
+        else f"[{timestamp}] {cleaned_note}"
+    )
 
 
 def _do_task_start(
@@ -1379,7 +1432,7 @@ def _do_task_start(
         task_id,
         status="in_progress",
         owner=owner,
-        notes=notes,
+        notes=_build_appended_task_notes(plan_id, task_id, notes),
         feedback_reason=feedback_reason,
         link=link,
     )
@@ -1396,7 +1449,7 @@ def _do_task_done(
         plan_id,
         task_id,
         status="completed",
-        notes=notes,
+        notes=_build_appended_task_notes(plan_id, task_id, notes),
         feedback_reason=feedback_reason,
         link=link,
         blocked_reason="",
@@ -1410,21 +1463,10 @@ def _append_task_note(
     feedback_reason: str | None = None,
 ):
     resolved_plan_id = _require_plan_context(plan_id)
-    plan = _get_plan_or_exit(resolved_plan_id)
-    task = _find_task(plan, task_id)
-    if not task:
-        raise SystemExit(f"Task not found: {task_id}")
-    existing_notes = _clean(task.get("notes"))
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    next_notes = (
-        f"{existing_notes}\n\n[{timestamp}] {note.strip()}".strip()
-        if existing_notes
-        else f"[{timestamp}] {note.strip()}"
-    )
     _do_task_update(
         resolved_plan_id,
         task_id,
-        notes=next_notes,
+        notes=_build_appended_task_notes(resolved_plan_id, task_id, note),
         feedback_reason=feedback_reason,
     )
 
@@ -1441,12 +1483,12 @@ def _add_task_artifact(
     if not task:
         raise SystemExit(f"Task not found: {task_id}")
     existing_links = [
-        _clean(link)
-        for link in (task.get("artifact_links") or [])
-        if _clean(str(link))
+        _clean(link) for link in (task.get("artifact_links") or []) if _clean(str(link))
     ]
     next_link = artifact_link.strip()
-    next_links = existing_links if next_link in existing_links else [*existing_links, next_link]
+    next_links = (
+        existing_links if next_link in existing_links else [*existing_links, next_link]
+    )
     _do_task_update(
         resolved_plan_id,
         task_id,
@@ -1481,7 +1523,7 @@ def _do_task_unblock(
         plan_id,
         task_id,
         status=status,
-        notes=notes,
+        notes=_build_appended_task_notes(plan_id, task_id, notes),
         blocked_reason="",
         feedback_reason=feedback_reason,
     )
@@ -1843,7 +1885,8 @@ def _task_done(
         Optional[str], typer.Option("--notes", "-n", help="Completion note.")
     ] = None,
     feedback_reason: Annotated[
-        Optional[str], typer.Option("--reason", help="Why this task is considered done.")
+        Optional[str],
+        typer.Option("--reason", help="Why this task is considered done."),
     ] = None,
     link: Annotated[
         Optional[list[str]], typer.Option("--link", "-l", help="Artifact link.")
@@ -1886,7 +1929,8 @@ def _task_block(
         str, typer.Option("--reason", "-r", help="Why the task is blocked.")
     ] = ...,
     feedback_reason: Annotated[
-        Optional[str], typer.Option("--feedback-reason", help="Extra context for the audit trail.")
+        Optional[str],
+        typer.Option("--feedback-reason", help="Extra context for the audit trail."),
     ] = None,
 ):
     """Mark a task as blocked."""
@@ -1922,13 +1966,17 @@ def _task_unblock(
         Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
     ] = None,
     notes: Annotated[
-        Optional[str], typer.Option("--notes", "-n", help="Short note about how the blocker was resolved.")
+        Optional[str],
+        typer.Option(
+            "--notes", "-n", help="Short note about how the blocker was resolved."
+        ),
     ] = None,
     status: Annotated[
         str, typer.Option("--status", "-s", help="Status to use after unblocking.")
     ] = "in_progress",
     feedback_reason: Annotated[
-        Optional[str], typer.Option("--reason", help="Why the task is being unblocked now.")
+        Optional[str],
+        typer.Option("--reason", help="Why the task is being unblocked now."),
     ] = None,
 ):
     """Clear a task blocker and resume work."""
@@ -2182,7 +2230,7 @@ def _print_http_error(exc: httpx.HTTPStatusError) -> None:
     if _state.json:
         print_output(payload, True)
         return
-    print(f"Keshro API error ({status}): {detail}", file=sys.stderr)
+    print(f"{RED}Keshro API error ({status}): {detail}{RESET}", file=sys.stderr)
 
 
 def _print_request_error(exc: httpx.RequestError) -> None:
@@ -2192,7 +2240,7 @@ def _print_request_error(exc: httpx.RequestError) -> None:
     if _state.json:
         print_output(payload, True)
         return
-    print(detail, file=sys.stderr)
+    print(f"{RED}{detail}{RESET}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -2214,11 +2262,11 @@ def main(argv: list[str] | None = None):
         return 0
     except SystemExit as exc:
         if isinstance(exc.code, str):
-            print(exc.code, file=sys.stderr)
+            print(f"{RED}{exc.code}{RESET}", file=sys.stderr)
             return 1
         return exc.code if isinstance(exc.code, int) and exc.code != 0 else 0
     except click.exceptions.UsageError as exc:
-        print(f"Error: {exc.format_message()}", file=sys.stderr)
+        print(f"{RED}Error: {exc.format_message()}{RESET}", file=sys.stderr)
         return 2
     except httpx.HTTPStatusError as exc:
         _print_http_error(exc)

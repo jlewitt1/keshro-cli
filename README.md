@@ -46,13 +46,16 @@ export KESHRO_API_URL="https://app.keshro.com"
 ```bash
 keshro
 kr
+keshro login
 keshro login ksh_pat_...
 keshro logout
 ```
 
 Auth state is stored in `~/.keshro/auth.json`.
 
-Create API tokens from the Keshro Account -> API page. If CLI access is not enabled for the account, authenticated CLI commands will return `403`.
+`keshro login` reuses your saved session when the token in `~/.keshro/auth.json` is still valid, so you only need `keshro login <api-token>` for first-time sign-in or when refreshing an expired session.
+
+Create or reuse API tokens from the Keshro Account -> API page. If CLI access is not enabled for the account, authenticated CLI commands will return `403`.
 
 ## Commands
 
@@ -66,7 +69,6 @@ keshro task block <task-id> -p <plan-id> --reason "Waiting on Terraform IAM role
 keshro task unblock <task-id> -p <plan-id> --notes "IAM fix applied; resuming pilot"
 keshro task done <task-id> -p <plan-id> --notes "Pilot merged"
 keshro migration history <migration-id>
-keshro plan replan-notes "Need hybrid Airflow + Batch rollout" -p <plan-id>
 keshro plan view <plan-id>
 keshro plan list
 keshro plan update <plan-id> --status ready
@@ -88,7 +90,7 @@ Ask first before writing:
 
 - `keshro task done`
 - `keshro task delete`
-- `keshro plan replan-notes` when the change materially alters migration scope or sequencing
+- optional `keshro plan replan-notes` when the change materially alters migration scope or sequencing
 
 Concrete examples:
 
@@ -104,3 +106,5 @@ Concrete examples:
   - run `keshro task unblock <task-id> -p <plan-id> --notes "IAM fix applied; resuming pilot"`
 - Claude believes the task is done:
   - ask the user first, then run `keshro task done <task-id> -p <plan-id> --notes "<what landed>"`
+- The original plan is no longer accurate:
+  - optionally ask first, then run `keshro plan replan-notes "<what changed and why>" -p <plan-id>`

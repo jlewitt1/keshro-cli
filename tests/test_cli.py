@@ -1,10 +1,14 @@
 import json
+import re
 from pathlib import Path
 
 import httpx
 import pytest
 
 from keshro_cli import __version__, cli
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def _auth_with_org():
@@ -171,8 +175,7 @@ class _FakeClient:
                                 "https://linear.app/acme/issue/ENG-42",
                                 "https://github.com/acme/migrations/pull/19",
                             ],
-                        }
-                        ,
+                        },
                         {
                             "id": "task-456",
                             "order": 2,
@@ -813,7 +816,8 @@ def test_task_start_marks_task_in_progress(fake_client, capsys):
     out = json.loads(capsys.readouterr().out)
     assert out["path"] == "/api/plans/plan-123/tasks/task-456"
     assert out["payload"]["status"] == "in_progress"
-    assert out["payload"]["notes"] == "Starting the pilot implementation"
+    assert "Starting the pilot implementation" in out["payload"]["notes"]
+    assert "[20" in out["payload"]["notes"]
     assert out["payload"]["feedback_reason"] == "Top priority after plan review"
 
 
@@ -849,7 +853,8 @@ def test_task_done_marks_task_completed(fake_client, capsys):
     out = json.loads(capsys.readouterr().out)
     assert out["path"] == "/api/plans/plan-123/tasks/task-456"
     assert out["payload"]["status"] == "completed"
-    assert out["payload"]["notes"] == "Pilot DAG merged and validated"
+    assert "Pilot DAG merged and validated" in out["payload"]["notes"]
+    assert "[20" in out["payload"]["notes"]
     assert out["payload"]["artifact_links"] == [
         "https://github.com/acme/migrations/pull/21"
     ]
@@ -874,7 +879,10 @@ def test_task_block_marks_task_blocked(fake_client, capsys):
     assert out["path"] == "/api/plans/plan-123/tasks/task-456"
     assert out["payload"]["status"] == "blocked"
     assert out["payload"]["blocked_reason"] == "Waiting on Terraform IAM role changes"
-    assert out["payload"]["feedback_reason"] == "Access blocker discovered during pilot setup"
+    assert (
+        out["payload"]["feedback_reason"]
+        == "Access blocker discovered during pilot setup"
+    )
 
 
 def test_task_unblock_clears_blocked_reason(fake_client, capsys):
@@ -893,7 +901,55 @@ def test_task_unblock_clears_blocked_reason(fake_client, capsys):
     assert out["path"] == "/api/plans/plan-123/tasks/task-456"
     assert out["payload"]["status"] == "in_progress"
     assert out["payload"]["blocked_reason"] == ""
-    assert out["payload"]["notes"] == "Terraform role applied; resuming pilot"
+    assert "Terraform role applied; resuming pilot" in out["payload"]["notes"]
+    assert "[20" in out["payload"]["notes"]
+
+
+def test_task_done_appends_to_existing_notes(fake_client, monkeypatch, capsys):
+    original_get_plan = cli._get_plan_or_exit
+
+    def _plan_with_existing_notes(plan_id: str):
+        plan = original_get_plan(plan_id)
+        plan["plan_steps"][1][
+            "notes"
+        ] = "[2026-03-15 16:00 UTC] Existing execution note"
+        return plan
+
+    monkeypatch.setattr(cli, "_get_plan_or_exit", _plan_with_existing_notes)
+
+    cli.main(
+        [
+            "--json",
+            "task",
+            "done",
+            "plan-123",
+            "task-456",
+            "--notes",
+            "Pilot DAG merged and validated",
+        ]
+    )
+    out = json.loads(capsys.readouterr().out)
+    assert "Existing execution note" in out["payload"]["notes"]
+    assert "Pilot DAG merged and validated" in out["payload"]["notes"]
+
+
+def test_task_start_human_output_is_compact(fake_client, capsys):
+    cli.main(
+        [
+            "task",
+            "start",
+            "plan-123",
+            "task-456",
+            "--notes",
+            "Starting the pilot implementation",
+        ]
+    )
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+    assert "Updated task" in out
+    assert "[in_progress]." in out
+    assert "Notes updated" in out
+    assert "Plan ID:" not in out
+    assert "Task ID:" not in out
 
 
 def test_task_note_appends_timestamped_note(fake_client, capsys):
@@ -947,7 +1003,10 @@ def test_plan_replan_notes_appends_summary(fake_client, capsys):
     out = json.loads(capsys.readouterr().out)
     assert out["path"] == "/api/plans/plan-123"
     assert "Pilot plan for the first DAG migration." in out["payload"]["summary"]
-    assert "Need to keep Batch as the runtime while Airflow takes over orchestration." in out["payload"]["summary"]
+    assert (
+        "Need to keep Batch as the runtime while Airflow takes over orchestration."
+        in out["payload"]["summary"]
+    )
 
 
 def test_task_delete_accepts_feedback_reason(fake_client, capsys):
@@ -1065,6 +1124,20 @@ def test_migration_history_json(fake_client, capsys):
 
 
 def test_config_prints_saved_auth_metadata(monkeypatch, capsys):
+    class _ConfigClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, path, params=None):
+            if path == "/api/auth/me":
+                return _FakeResponse({"email": "cli@example.com", "id": "user-1"})
+            if path == "/api/orgs":
+                return _FakeResponse([])
+            raise AssertionError(path)
+
     monkeypatch.setattr(
         "keshro_cli.cli.load_auth",
         lambda: {
@@ -1072,6 +1145,9 @@ def test_config_prints_saved_auth_metadata(monkeypatch, capsys):
             "token": "jwt-123",
             "user": {"email": "cli@example.com", "name": "CLI User"},
         },
+    )
+    monkeypatch.setattr(
+        "keshro_cli.cli.make_client", lambda api_url=None, token=None: _ConfigClient()
     )
 
     cli.main(["config"])
@@ -1173,53 +1249,130 @@ def test_config_json_outputs_machine_readable_metadata(
     assert len(out["orgs"]) == 2
 
 
-def test_auth_login_without_args_uses_browser_flow(monkeypatch, capsys):
-    saved = {}
+def test_config_marks_stale_token_as_not_authenticated(monkeypatch, capsys):
+    class _UnauthorizedResponse:
+        def raise_for_status(self):
+            request = httpx.Request("GET", "https://app.keshro.test/api/auth/me")
+            response = httpx.Response(
+                401, request=request, json={"detail": "Authentication required"}
+            )
+            raise httpx.HTTPStatusError(
+                "Client error '401 Unauthorized' for url",
+                request=request,
+                response=response,
+            )
 
-    class _BrowserClient:
+        def json(self):
+            return {"detail": "Authentication required"}
+
+    class _StaleClient:
         def __enter__(self):
             return self
 
         def __exit__(self, exc_type, exc, tb):
             return False
 
-        def post(self, path, json=None):
-            assert path == "/api/auth/cli/start"
-            return _FakeResponse(
-                {
-                    "device_code": "device-123",
-                    "user_code": "ABCD1234",
-                    "verification_url": "http://localhost:3000/auth?cli_code=ABCD1234&mode=login",
-                    "expires_in": 60,
-                    "interval": 0,
-                }
-            )
+        def get(self, path, params=None):
+            assert path == "/api/auth/me"
+            return _UnauthorizedResponse()
 
-        def get(self, path, params=None, headers=None):
-            assert path == "/api/auth/cli/poll"
-            assert params == {"device_code": "device-123"}
-            return _FakeResponse(
-                {
-                    "status": "approved",
-                    "token": "jwt-123",
-                    "user": {"email": "cli@example.com"},
-                }
+    monkeypatch.setattr(
+        "keshro_cli.cli.load_auth",
+        lambda: {
+            "api_url": "https://app.keshro.test",
+            "token": "jwt-stale",
+            "user": {"email": "cli@example.com", "name": "CLI User"},
+        },
+    )
+    monkeypatch.setattr(
+        "keshro_cli.cli.make_client", lambda api_url=None, token=None: _StaleClient()
+    )
+
+    cli.main(["config"])
+    out = capsys.readouterr().out
+    assert "Authenticated:" in out
+    assert "no" in out
+
+
+def test_auth_login_requires_token_argument(monkeypatch, capsys):
+    monkeypatch.setattr("keshro_cli.auth.load_auth", lambda: {})
+    code = cli.main(["login"])
+    captured = capsys.readouterr()
+    assert code == 1
+    cleaned = ANSI_RE.sub("", captured.err)
+    assert "No saved Keshro session found." in cleaned
+    assert "Usage: keshro login <api-token>" in cleaned
+    assert "Account -> API" in cleaned
+
+
+def test_auth_login_without_token_reuses_saved_session(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "keshro_cli.auth.load_auth",
+        lambda: {
+            "api_url": "https://app.keshro.test",
+            "token": "jwt-123",
+            "user": {"email": "cli@example.com"},
+        },
+    )
+
+    class _AuthClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, path, headers=None):
+            assert path == "/api/auth/me"
+            assert headers == {"Authorization": "Bearer jwt-123"}
+            return _FakeResponse({"email": "cli@example.com", "id": "user-1"})
+
+    monkeypatch.setattr("keshro_cli.auth.httpx.Client", lambda **kwargs: _AuthClient())
+
+    cli.main(["login"])
+    out = capsys.readouterr().out.strip()
+    assert out == "Already logged in to Keshro as cli@example.com."
+
+
+def test_auth_login_without_token_reports_expired_saved_session(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "keshro_cli.auth.load_auth",
+        lambda: {
+            "api_url": "https://app.keshro.test",
+            "token": "jwt-stale",
+            "user": {"email": "cli@example.com"},
+        },
+    )
+
+    class _UnauthorizedClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, path, headers=None):
+            request = httpx.Request("GET", "https://app.keshro.test/api/auth/me")
+            response = httpx.Response(
+                401, request=request, json={"detail": "Authentication required"}
+            )
+            raise httpx.HTTPStatusError(
+                "Client error '401 Unauthorized' for url",
+                request=request,
+                response=response,
             )
 
     monkeypatch.setattr(
-        "keshro_cli.auth.httpx.Client", lambda **kwargs: _BrowserClient()
+        "keshro_cli.auth.httpx.Client", lambda **kwargs: _UnauthorizedClient()
     )
-    monkeypatch.setattr(
-        "keshro_cli.auth.save_auth", lambda payload: saved.update(payload)
-    )
-    monkeypatch.setattr("keshro_cli.auth.webbrowser.open", lambda url: True)
-    monkeypatch.setattr("keshro_cli.auth.time.sleep", lambda _: None)
 
-    cli.main(["--json", "login"])
-    out_text = capsys.readouterr().out
-    out = json.loads(out_text[out_text.index("{") :])
-    assert out["status"] == "ok"
-    assert saved["token"] == "jwt-123"
+    code = cli.main(["login"])
+    captured = capsys.readouterr()
+    assert code == 1
+    cleaned = ANSI_RE.sub("", captured.err)
+    assert "Your saved Keshro session has expired." in cleaned
+    assert "keshro login <api-token>" in cleaned
+    assert "Account -> API" in cleaned
 
 
 def test_http_404_errors_render_cleanly(monkeypatch, capsys):
@@ -1253,7 +1406,10 @@ def test_http_404_errors_render_cleanly(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert code == 1
     assert captured.out == ""
-    assert captured.err.strip() == "Keshro API error (404): Template not found"
+    assert (
+        ANSI_RE.sub("", captured.err).strip()
+        == "Keshro API error (404): Template not found"
+    )
 
 
 def test_plan_create_requires_migration_id(fake_client, capsys):

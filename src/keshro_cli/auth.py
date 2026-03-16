@@ -1,90 +1,61 @@
-import time
-import webbrowser
-from getpass import getpass
-
 import httpx
 
 from .client import get_api_url, print_output
-from .config import clear_auth, save_auth
+from .config import clear_auth, load_auth, save_auth
 
 
-def _browser_login(base_url: str) -> dict:
+def _fetch_user(base_url: str, token: str) -> dict:
     with httpx.Client(base_url=base_url, timeout=30) as client:
-        start = client.post("/api/auth/cli/start")
-        start.raise_for_status()
-        flow = start.json()
-        verification_url = flow["verification_url"]
-        user_code = flow["user_code"]
-        print(
-            f"Open this URL to sign in: {verification_url}\n" f"CLI code: {user_code}"
+        res = client.get(
+            "/api/auth/me",
+            headers={"Authorization": f"Bearer {token}"},
         )
-        try:
-            webbrowser.open(verification_url)
-        except Exception:
-            pass
-        deadline = time.time() + int(flow.get("expires_in", 600))
-        interval = int(flow.get("interval", 3))
-        while time.time() < deadline:
-            res = client.get(
-                "/api/auth/cli/poll", params={"device_code": flow["device_code"]}
-            )
-            res.raise_for_status()
-            body = res.json()
-            if body.get("status") == "approved" and body.get("token"):
-                return body
-            if body.get("status") == "expired":
-                raise SystemExit("CLI browser login expired. Start again.")
-            time.sleep(interval)
-    raise SystemExit("CLI browser login timed out. Start again.")
+        res.raise_for_status()
+        return res.json()
 
 
 def cmd_auth_login(
     api_url: str | None = None,
     token: str | None = None,
-    email: str | None = None,
-    password: str | None = None,
     json_output: bool = False,
 ):
     base_url = get_api_url(api_url)
-    if token:
-        token = token.strip()
-    elif not email and not password:
-        body = _browser_login(base_url)
-        save_auth({"token": body["token"], "user": body["user"], "api_url": base_url})
+    token = (token or "").strip()
+    if not token:
+        saved_auth = load_auth()
+        saved_token = (saved_auth.get("token") or "").strip()
+        if not saved_token:
+            raise SystemExit(
+                "No saved Keshro session found.\n"
+                "Usage: keshro login <api-token>\n"
+                "You can create or reuse a token from Account -> API in the Keshro app."
+            )
+        try:
+            user = _fetch_user(base_url, saved_token)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in {401, 403}:
+                raise SystemExit(
+                    "Your saved Keshro session has expired.\n"
+                    "Run: keshro login <api-token>\n"
+                    "You can create or reuse a token from Account -> API in the Keshro app."
+                ) from exc
+            raise
         if json_output:
-            print_output({"status": "ok", "user": body["user"]["email"]}, True)
+            print_output(
+                {"status": "ok", "user": user["email"], "detail": "already_logged_in"},
+                True,
+            )
         else:
-            print(f"Successfully logged in to Keshro as {body['user']['email']}.")
+            print(f"Already logged in to Keshro as {user['email']}.")
         return
+
+    user = _fetch_user(base_url, token)
+    body = {"token": token, "user": user}
+    save_auth({"token": body["token"], "user": body["user"], "api_url": base_url})
+    if json_output:
+        print_output({"status": "ok", "user": body["user"]["email"]}, True)
     else:
-        token = ""
-
-    if not token and email and not password:
-        password = getpass("Keshro password: ")
-    if not token and bool(email) != bool(password):
-        raise SystemExit("Provide both --email and --password, or use --token.")
-
-    with httpx.Client(base_url=base_url, timeout=30) as client:
-        if token:
-            res = client.get(
-                "/api/auth/me",
-                headers={"Authorization": f"Bearer {token}"},
-            )
-            res.raise_for_status()
-            body = {"token": token, "user": res.json()}
-        else:
-            res = client.post(
-                "/api/auth/login",
-                json={"email": email, "password": password},
-            )
-            res.raise_for_status()
-            body = res.json()
-        res.raise_for_status()
-        save_auth({"token": body["token"], "user": body["user"], "api_url": base_url})
-        if json_output:
-            print_output({"status": "ok", "user": body["user"]["email"]}, True)
-        else:
-            print(f"Successfully logged in to Keshro as {body['user']['email']}.")
+        print(f"Successfully logged in to Keshro as {body['user']['email']}.")
 
 
 def cmd_auth_logout(json_output: bool = False):
