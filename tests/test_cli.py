@@ -1,5 +1,6 @@
 import json
 import re
+import subprocess
 from pathlib import Path
 
 import httpx
@@ -113,6 +114,38 @@ class _FakeClient:
                     "org_id": "org-123",
                 }
             )
+        if path == "/api/migrations/path-template/lookup":
+            template_key = (params or {}).get("template_key")
+            if template_key == "aws-batch-to-airflow":
+                return _FakeResponse(
+                    {
+                        "template_key": "aws-batch-to-airflow",
+                        "source": "AWS Batch",
+                        "target": "Airflow",
+                        "title": "AWS Batch to Airflow",
+                        "description": "Move orchestration into Airflow.",
+                        "fields": [
+                            {
+                                "id": "batch_workloads",
+                                "label": "AWS Batch workloads",
+                                "type": "textarea",
+                                "required": True,
+                            },
+                            {
+                                "id": "target_airflow_deployment",
+                                "label": "Target Airflow deployment",
+                                "type": "select",
+                                "options": ["AWS MWAA", "Self-hosted"],
+                                "required": False,
+                            },
+                        ],
+                        "tips": [],
+                        "required_outputs": [],
+                        "status": "curated",
+                        "is_auto_generated": False,
+                    }
+                )
+            return _FakeResponse({"detail": "not found"})
         if path == "/api/migrations/migration-123/plan":
             return _FakeResponse(
                 {
@@ -199,6 +232,16 @@ class _FakeClient:
 
     def post(self, path, json=None):
         self.calls.append(("POST", path, json))
+        if path == "/api/migrations":
+            return _FakeResponse(
+                {
+                    "id": "migration-999",
+                    "status": "analyzing",
+                    "source_type": json.get("source_type"),
+                    "target_type": json.get("target_type"),
+                    "input_method": json.get("input_method"),
+                }
+            )
         if path == "/api/plans/from-template":
             return _FakeResponse(
                 {
@@ -330,6 +373,97 @@ def test_plan_create_from_template_hits_template_endpoint(fake_client, capsys):
     assert out["id"] == "plan-123"
     assert out["template_key"] == "aws-batch-to-airflow"
     assert out["migration_id"] == "migration-123"
+
+
+def test_create_migration_from_path_key_prompts_and_posts_payload(
+    fake_client, monkeypatch, capsys
+):
+    monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "1")
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: "/usr/local/bin/claude" if name == "claude" else None,
+    )
+
+    def _fake_run(cmd, capture_output, text, cwd, check):
+        assert cmd[0] == "/usr/local/bin/claude"
+        assert "--add-dir" in cmd
+        assert "--permission-mode" in cmd
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout="\n".join(
+                [
+                    "## Versions",
+                    "- Source version: 1.0",
+                    "- Target version: 2.9",
+                    "",
+                    "## AWS Batch to Airflow details",
+                    "- AWS Batch workloads: scheduled ETL jobs",
+                    "- Target Airflow deployment: AWS MWAA",
+                    "",
+                    "## Additional context",
+                    "- Anything else that materially affects risk, effort, validation, cutover, rollback, or delivery: none",
+                ]
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    cli.main(["create", "--path", "aws-batch-to-airflow"])
+
+    out = capsys.readouterr().out
+    assert "Created migration for AWS Batch -> Airflow." in out
+    method, path, payload = fake_client.calls[-1]
+    assert method == "POST"
+    assert path == "/api/migrations"
+    assert payload["input_method"] == "cli_agent"
+    assert payload["custom_fields"]["batch_workloads"] == "scheduled ETL jobs"
+    assert payload["custom_fields"]["__keshro_discovered_context"]
+    assert "Status: analyzing (analysis in progress)" in out
+    assert "Open in UI:" in out
+    assert "/migrations/migration-999" in out
+
+
+def test_create_migration_from_path_key_requires_claude_code(fake_client, monkeypatch):
+    monkeypatch.delenv("CLAUDE_CODE_ENTRYPOINT", raising=False)
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    exit_code = cli.main(["create", "--path", "aws-batch-to-airflow"])
+    assert exit_code == 1
+
+
+def test_agent_prompt_requires_plan_context(fake_client, monkeypatch):
+    monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: {})
+    monkeypatch.setattr("keshro_cli.client.load_auth", lambda: {})
+    exit_code = cli.main(["agent-prompt"])
+    assert exit_code == 1
+
+
+def test_agent_prompt_uses_saved_plan_context(fake_client, monkeypatch, capsys):
+    monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
+
+    cli.main(["agent-prompt"])
+
+    out = capsys.readouterr().out
+    assert (
+        "You are executing the AWS Batch -> Airflow migration tracked in Keshro." in out
+    )
+    assert "keshro plan view plan-123" in out
+    assert "keshro task next -p plan-123" in out
+    assert "linked Linear work" in out
+
+
+def test_agent_prompt_dry_run_marks_non_executing_mode(
+    fake_client, monkeypatch, capsys
+):
+    monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
+
+    cli.main(["agent-prompt", "--dry-run"])
+
+    out = capsys.readouterr().out
+    assert "Dry-run mode:" in out
+    assert "Do not write task updates back to Keshro." in out
 
 
 def test_plan_create_saves_default_plan_automatically(fake_client, monkeypatch, capsys):

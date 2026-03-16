@@ -1,5 +1,8 @@
 import json
+import os
 import re
+import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -395,6 +398,306 @@ def _print_task_feedback_events(plan: dict) -> None:
             print(f"    Changed: {', '.join(str(field) for field in changed_fields)}")
 
 
+def _parse_field_assignments(values: list[str] | None) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    for raw in values or []:
+        item = _clean(raw)
+        if not item:
+            continue
+        if "=" not in item:
+            raise SystemExit(
+                f"Invalid --field value '{item}'. Use --field field_id=value."
+            )
+        key, value = item.split("=", 1)
+        field_id = _clean(key)
+        field_value = value.strip()
+        if not field_id or not field_value:
+            raise SystemExit(
+                f"Invalid --field value '{item}'. Use --field field_id=value."
+            )
+        parsed[field_id] = field_value
+    return parsed
+
+
+def _normalize_prompt_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", _clean(value).lower()).strip()
+
+
+def _parse_discovery_key_values(raw: str) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    for line in raw.splitlines():
+        match = re.match(r"^\s*[-*]?\s*([^:]+):\s*(.*)$", line)
+        if not match:
+            continue
+        key = _normalize_prompt_key(match.group(1))
+        value = match.group(2).strip()
+        if key:
+            parsed[key] = value
+    return parsed
+
+
+def _match_select_option(field: dict, value: str) -> str:
+    options = [
+        str(option).strip()
+        for option in (field.get("options") or [])
+        if str(option).strip()
+    ]
+    if not options:
+        return value.strip()
+    needle = value.strip().lower()
+    for option in options:
+        if option.lower() == needle:
+            return option
+    for option in options:
+        if needle in option.lower() or option.lower() in needle:
+            return option
+    return value.strip()
+
+
+def _build_path_discovery_prompt(template: dict) -> str:
+    source = _clean(template.get("source")) or "Source"
+    target = _clean(template.get("target")) or "Target"
+    lines = [
+        f"You are the migration discovery analyst for a {source} -> {target} migration.",
+        "",
+        "Gather the highest-signal migration facts before planning begins.",
+        "Replace the blanks below with concrete answers. Use `Unknown` when you cannot verify a value.",
+        "",
+        "## Versions",
+        "- Source version:",
+        "- Target version:",
+        "",
+        f"## {source} to {target} details",
+    ]
+    for field in template.get("fields") or []:
+        label = _clean(field.get("label")) or _clean(field.get("id")) or "Detail"
+        hint = _clean(field.get("hint"))
+        option_text = ""
+        options = [
+            str(option).strip()
+            for option in (field.get("options") or [])
+            if str(option).strip()
+        ]
+        if options:
+            option_text = f" Options: {' | '.join(options)}"
+        suffix = f" Hint: {hint}" if hint else ""
+        lines.append(f"- {label}:{option_text}{suffix}")
+    lines.extend(
+        [
+            "",
+            "## Additional context",
+            "- Anything else that materially affects risk, effort, validation, cutover, rollback, or delivery:",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _build_agent_discovery_prompt(template: dict) -> str:
+    source = _clean(template.get("source")) or "Source"
+    target = _clean(template.get("target")) or "Target"
+    return "\n".join(
+        [
+            f"You are helping create a Keshro migration for {source} -> {target}.",
+            "Inspect the current workspace and gather the path-specific migration facts.",
+            "Return only the completed markdown template below with the same headings and field labels.",
+            "Do not wrap the answer in code fences. Do not add commentary before or after the template.",
+            "Use `Unknown` for values you cannot verify from the repository, configs, or local docs.",
+            "",
+            _build_path_discovery_prompt(template),
+        ]
+    )
+
+
+def _is_running_inside_claude_code() -> bool:
+    return any(key.startswith("CLAUDE_CODE_") for key in os.environ)
+
+
+def _collect_discovery_answer_from_claude(template: dict) -> str:
+    if not _is_running_inside_claude_code():
+        raise SystemExit(
+            "This command is only supported inside Claude Code right now. Run it from a Claude Code session, or use the prompt copy/paste path in Keshro instead."
+        )
+    claude_bin = shutil.which("claude")
+    if not claude_bin:
+        raise SystemExit(
+            "This command is only supported inside Claude Code right now. If Claude Code is not available here, use the prompt copy/paste path in Keshro instead."
+        )
+    prompt = _build_agent_discovery_prompt(template)
+    result = subprocess.run(
+        [
+            claude_bin,
+            "-p",
+            prompt,
+            "--output-format",
+            "text",
+            "--permission-mode",
+            "auto",
+            "--add-dir",
+            os.getcwd(),
+            "--no-session-persistence",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=os.getcwd(),
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = _clean(result.stderr) or _clean(result.stdout) or "Claude Code failed."
+        raise SystemExit(
+            f"This command is only supported inside Claude Code right now. Claude Code returned: {detail}"
+        )
+    answer = _clean(result.stdout)
+    if not answer:
+        raise SystemExit("Claude agent returned no discovery response.")
+    return answer
+
+
+def _extract_discovery_answers(template: dict, raw: str) -> dict[str, str]:
+    parsed = _parse_discovery_key_values(raw)
+    answers: dict[str, str] = {}
+    for key_name, field_id in (
+        ("source version", "source_version"),
+        ("target version", "target_version"),
+    ):
+        value = _clean(parsed.get(key_name))
+        if value and value.lower() != "unknown":
+            answers[field_id] = value
+    for field in template.get("fields") or []:
+        field_id = _clean(field.get("id"))
+        label = _clean(field.get("label"))
+        if not field_id:
+            continue
+        matched = parsed.get(_normalize_prompt_key(label)) or parsed.get(
+            _normalize_prompt_key(field_id)
+        )
+        value = _clean(matched)
+        if not value or value.lower() == "unknown":
+            continue
+        answers[field_id] = (
+            _match_select_option(field, value)
+            if str(field.get("type") or "").strip() == "select"
+            else value
+        )
+    return answers
+
+
+def _app_url_from_api_url(api_url: str) -> str:
+    resolved = _clean(api_url).rstrip("/")
+    if not resolved:
+        return "https://app.keshro.com"
+    if "localhost" in resolved or "127.0.0.1" in resolved:
+        return resolved.replace("://api.", "://").replace(":8000", ":3000")
+    if "api." in resolved:
+        return resolved.replace("://api.", "://", 1)
+    return resolved
+
+
+def _render_created_migration(created: dict, template: dict) -> None:
+    if _state.json:
+        print_output(created, True)
+        return
+    migration_id = _clean(created.get("id"))
+    status = _clean(created.get("status") or "analyzing") or "analyzing"
+    source = _clean(template.get("source")) or "Unknown source"
+    target = _clean(template.get("target")) or "Unknown target"
+    print(f"Created migration for {source} -> {target}.")
+    if migration_id:
+        print(f"Migration ID: {migration_id}")
+    if status in {"analyzing", "pending", "queued", "running"}:
+        print(f"Status: {status} (analysis in progress)")
+    else:
+        print(f"Status: {status}")
+    path_key = _clean(template.get("template_key"))
+    if path_key:
+        print(f"Path: {path_key}")
+    if migration_id:
+        print(
+            f"Open in UI: {_app_url_from_api_url(_state.api_url)}/migrations/{migration_id}"
+        )
+        print(f"Run `keshro migration view {migration_id}` to inspect it.")
+
+
+def _connected_delivery_label_from_plan(plan: dict) -> str | None:
+    providers: list[str] = []
+    for step in plan.get("plan_steps") or []:
+        provider = _clean(step.get("external_issue_provider")).lower()
+        if provider == "linear" or step.get("linear_issue_id"):
+            providers.append("Linear")
+        elif provider == "jira":
+            providers.append("Jira")
+        elif provider == "github":
+            providers.append("GitHub")
+    ordered: list[str] = []
+    for label in providers:
+        if label not in ordered:
+            ordered.append(label)
+    if not ordered:
+        return None
+    if len(ordered) == 1:
+        return f"linked {ordered[0]} work"
+    if len(ordered) == 2:
+        return f"linked {ordered[0]} or {ordered[1]} work"
+    return f"linked {', '.join(ordered[:-1])}, or {ordered[-1]} work"
+
+
+def _build_cli_agent_skill_text(
+    plan_id: str | None = None,
+    connected_delivery_label: str | None = None,
+    migration_label: str | None = None,
+    dry_run: bool = False,
+) -> str:
+    resolved_plan_id = plan_id or "<plan-id>"
+    resolved_migration_label = migration_label or "a migration"
+    dry_run_block = (
+        """
+
+Dry-run mode:
+- Do not make code changes.
+- Do not run destructive commands.
+- Do not write task updates back to Keshro.
+- Instead, inspect the plan, explain what you would do next, call out what you would record in Keshro, and surface any missing inputs or blockers before execution starts."""
+        if dry_run
+        else ""
+    )
+    return f"""You are executing {resolved_migration_label} tracked in Keshro.
+
+Keshro already contains the migration analysis and the execution plan. Start from that existing plan unless the user explicitly asks you to create or replace it.
+
+Before using Keshro CLI commands, make sure the CLI is authenticated.
+- If a valid saved session already exists, `keshro login` will reuse it.
+- If not, authenticate with `keshro login <api-token>`.
+- API tokens are available in Account -> API.
+
+Treat Keshro as the live execution record. When meaningful task progress happens, write it back while the work is happening rather than waiting until the end.
+{dry_run_block}
+
+Start by grounding yourself in the current plan and next task:
+- use `keshro plan view {resolved_plan_id}` to inspect the plan
+- use `keshro task next -p {resolved_plan_id}` to pull the next actionable task
+- use `keshro task view <task-id> -p {resolved_plan_id}` only when you need more task detail
+
+During execution:
+- run `keshro task start <task-id> -p {resolved_plan_id}` as soon as work begins
+- use `keshro task note` for meaningful discoveries, decisions, validation findings, or execution details
+- use `keshro task artifact` for PRs, commits, dashboards, issues, and runbooks
+- use `keshro task block` the moment a real blocker appears
+- use `keshro task unblock` when that blocker is cleared
+- use `keshro plan replan-notes "..."` only when the plan itself changed materially
+- after a task is confirmed done, run `keshro task done <task-id> -p {resolved_plan_id}`, then pull the next task with `keshro task next -p {resolved_plan_id}`
+
+Ask first before:
+- `keshro task done`
+- task deletion
+- major replans that change scope, sequencing, or {connected_delivery_label or "linked delivery work"}
+
+Rules:
+- Keep updates concise, factual, and specific.
+- Do not silently work around blockers or plan drift.
+- Do not assume Keshro is current unless you updated it.
+- Record meaningful execution changes, especially ones that affect delivery, risk, validation, or the plan."""
+
+
 def _view_task(plan_id: str | None, task_id: str) -> None:
     resolved_plan_id = _require_plan_context(plan_id)
     with make_client(_state.api_url, _state.token) as client:
@@ -691,6 +994,113 @@ def _logout_alias():
 # ---------------------------------------------------------------------------
 # Migration commands
 # ---------------------------------------------------------------------------
+
+
+@app.command("create")
+def _create_migration(
+    path: Annotated[
+        str,
+        typer.Option(
+            "--path",
+            help="Migration path key, for example aws-batch-to-airflow.",
+        ),
+    ],
+    field: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            "--field",
+            "-f",
+            help="Set a template field as field_id=value. Repeat for multiple fields.",
+        ),
+    ] = None,
+    context: Annotated[
+        Optional[str], typer.Option("--context", "-c", help="Additional context.")
+    ] = None,
+    github_url: Annotated[
+        Optional[str], typer.Option("--github-url", help="GitHub URL to attach.")
+    ] = None,
+    resource_url: Annotated[
+        Optional[str], typer.Option("--resource-url", help="Reference URL to attach.")
+    ] = None,
+    org_id: Annotated[
+        Optional[str], typer.Option("--org-id", "-o", help="Create under an org.")
+    ] = None,
+):
+    """Create a migration project from a stable path key inside Claude Code."""
+    if not _is_running_inside_claude_code():
+        raise SystemExit(
+            "This command is only supported inside Claude Code right now. Run it from a Claude Code session, or use the prompt copy/paste path in Keshro instead."
+        )
+    answers = _parse_field_assignments(field)
+    with make_client(_state.api_url, _state.token) as client:
+        template_res = client.get(
+            "/api/migrations/path-template/lookup", params={"template_key": path}
+        )
+        template_res.raise_for_status()
+        template = template_res.json()
+
+        discovered_answer = _collect_discovery_answer_from_claude(template)
+        answers.update(_extract_discovery_answers(template, discovered_answer))
+
+        required_fields = [
+            _clean(item.get("label")) or _clean(item.get("id"))
+            for item in (template.get("fields") or [])
+            if item.get("required") and not answers.get(_clean(item.get("id")))
+        ]
+        if required_fields:
+            raise SystemExit(
+                "Claude Code did not return all required discovery fields: "
+                + ", ".join(required_fields)
+            )
+
+        source = _clean(template.get("source"))
+        target = _clean(template.get("target"))
+        merged_context = f"CLI bootstrap for {source} -> {target}."
+        if _clean(context):
+            merged_context = (
+                f"{merged_context}\n\n{_clean(context)}"
+                if merged_context
+                else _clean(context)
+            )
+
+        custom_fields = dict(answers)
+        if discovered_answer:
+            custom_fields["__keshro_discovered_context"] = discovered_answer
+
+        payload = {
+            "source_type": source,
+            "target_type": target,
+            "input_method": "cli_agent",
+            "context": merged_context or f"CLI bootstrap for {source} -> {target}.",
+            "files": [],
+            "github_url": _clean(github_url) or None,
+            "resource_url": _clean(resource_url) or None,
+            "org_id": _clean(org_id) or None,
+            "input_fields": [
+                {
+                    "field_id": _clean(item.get("id")),
+                    "label": _clean(item.get("label")) or _clean(item.get("id")),
+                }
+                for item in (template.get("fields") or [])
+                if _clean(item.get("id")) in answers
+            ]
+            + (
+                [
+                    {
+                        "field_id": "__keshro_discovered_context",
+                        "label": "Discovered migration context",
+                    }
+                ]
+                if discovered_answer
+                else []
+            ),
+            "custom_fields": custom_fields or None,
+        }
+        res = client.post("/api/migrations", json=payload)
+        res.raise_for_status()
+        created = res.json()
+
+    _render_created_migration(created, template)
 
 
 @migration_app.command("list")
@@ -1018,6 +1428,83 @@ def _plan_templates(
 ):
     """List available plan templates, or show details for one"""
     _cmd_plan_templates(template_name, name, verbose)
+
+
+def _print_agent_prompt(plan_id: str | None, dry_run: bool = False) -> None:
+    resolved_plan_id = _current_plan_id(plan_id)
+    if not resolved_plan_id:
+        raise SystemExit(
+            "Plan context required. Pass --plan-id <plan-id> or save one with `keshro config set --plan-id <plan-id>`."
+        )
+    connected_delivery_label: str | None = None
+    migration_label: str | None = None
+    try:
+        plan = _get_plan_or_exit(resolved_plan_id)
+        connected_delivery_label = _connected_delivery_label_from_plan(plan)
+        source = _clean(plan.get("source_type"))
+        target = _clean(plan.get("target_type"))
+        if source and target:
+            migration_label = f"the {source} -> {target} migration"
+    except Exception:
+        connected_delivery_label = None
+    text = _build_cli_agent_skill_text(
+        plan_id=resolved_plan_id,
+        connected_delivery_label=connected_delivery_label,
+        migration_label=migration_label,
+        dry_run=dry_run,
+    )
+    if _state.json:
+        print_output(
+            {
+                "text": text,
+                "plan_id": resolved_plan_id,
+                "connected_delivery_label": connected_delivery_label,
+                "dry_run": dry_run,
+            },
+            True,
+        )
+        return
+    print(text)
+
+
+@app.command("agent-prompt")
+def _agent_prompt(
+    plan_id: Annotated[
+        Optional[str],
+        typer.Option(
+            "--plan-id", "-p", help="Plan ID. Uses saved plan context if omitted."
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Generate a non-executing prompt for planning/review only.",
+        ),
+    ] = False,
+):
+    """Print the Keshro execution prompt for your coding agent."""
+    _print_agent_prompt(plan_id, dry_run=dry_run)
+
+
+@app.command("agent-skill", hidden=True)
+def _agent_skill_alias(
+    plan_id: Annotated[
+        Optional[str],
+        typer.Option(
+            "--plan-id", "-p", help="Plan ID. Uses saved plan context if omitted."
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Generate a non-executing prompt for planning/review only.",
+        ),
+    ] = False,
+):
+    """Backward-compatible alias for agent-prompt."""
+    _print_agent_prompt(plan_id, dry_run=dry_run)
 
 
 # ---------------------------------------------------------------------------
