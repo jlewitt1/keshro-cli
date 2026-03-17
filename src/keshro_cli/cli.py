@@ -4,10 +4,12 @@ import re
 import shutil
 import subprocess
 import sys
+import base64
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Optional
+from urllib.parse import urlencode
 
 import click
 import httpx
@@ -514,16 +516,35 @@ def _is_running_inside_claude_code() -> bool:
 
 
 def _collect_discovery_answer_from_claude(template: dict) -> str:
-    if not _is_running_inside_claude_code():
-        raise SystemExit(
+    prompt = _build_agent_discovery_prompt(template)
+    return _run_prompt_in_claude(
+        prompt,
+        missing_env_message=(
             "This command is only supported inside Claude Code right now. Run it from a Claude Code session, or use the prompt copy/paste path in Keshro instead."
-        )
+        ),
+        missing_binary_message=(
+            "This command is only supported inside Claude Code right now. If Claude Code is not available here, use the prompt copy/paste path in Keshro instead."
+        ),
+        failure_message_prefix=(
+            "This command is only supported inside Claude Code right now. Claude Code returned: "
+        ),
+        empty_message="Claude agent returned no discovery response.",
+    )
+
+
+def _run_prompt_in_claude(
+    prompt: str,
+    *,
+    missing_env_message: str,
+    missing_binary_message: str,
+    failure_message_prefix: str,
+    empty_message: str,
+) -> str:
+    if not _is_running_inside_claude_code():
+        raise SystemExit(missing_env_message)
     claude_bin = shutil.which("claude")
     if not claude_bin:
-        raise SystemExit(
-            "This command is only supported inside Claude Code right now. If Claude Code is not available here, use the prompt copy/paste path in Keshro instead."
-        )
-    prompt = _build_agent_discovery_prompt(template)
+        raise SystemExit(missing_binary_message)
     result = subprocess.run(
         [
             claude_bin,
@@ -544,12 +565,10 @@ def _collect_discovery_answer_from_claude(template: dict) -> str:
     )
     if result.returncode != 0:
         detail = _clean(result.stderr) or _clean(result.stdout) or "Claude Code failed."
-        raise SystemExit(
-            f"This command is only supported inside Claude Code right now. Claude Code returned: {detail}"
-        )
+        raise SystemExit(f"{failure_message_prefix}{detail}")
     answer = _clean(result.stdout)
     if not answer:
-        raise SystemExit("Claude agent returned no discovery response.")
+        raise SystemExit(empty_message)
     return answer
 
 
@@ -582,6 +601,128 @@ def _extract_discovery_answers(template: dict, raw: str) -> dict[str, str]:
     return answers
 
 
+def _get_migration_clarifiers(client: httpx.Client, payload: dict) -> list[dict]:
+    response = client.post("/api/migrations/clarifiers", json=payload)
+    response.raise_for_status()
+    body = response.json() or {}
+    return list(body.get("questions") or [])
+
+
+def _build_clarifier_prompt(template: dict, payload: dict, questions: list[dict]) -> str:
+    source = _clean(template.get("source")) or _clean(payload.get("source_type")) or "Source"
+    target = _clean(template.get("target")) or _clean(payload.get("target_type")) or "Target"
+    existing_fields = dict(payload.get("custom_fields") or {})
+    existing_context = _clean(payload.get("context"))
+    lines = [
+        f"You are helping finalize a Keshro migration draft for {source} -> {target}.",
+        "Answer the follow-up questions below using the current workspace and the already-gathered migration context.",
+        "Prefer concrete answers grounded in the repository, configs, docs, and runtime clues available locally.",
+        "If something still cannot be verified, use the recommended option when one exists; otherwise write `Unknown`.",
+        "Return only bullet lines in the exact format `- <question id>: <answer>`.",
+        "",
+        "Known draft context:",
+    ]
+    if existing_fields:
+        for key, value in existing_fields.items():
+            if _clean(str(value)):
+                lines.append(f"- {key}: {_clean(str(value))}")
+    elif existing_context:
+        lines.append("- No structured fields yet.")
+    if existing_context:
+        lines.extend(["", "Draft context:", existing_context])
+    lines.extend(["", "Follow-up questions:"])
+    for question in questions:
+        prompt_id = _clean(question.get("id"))
+        prompt_text = _clean(question.get("question"))
+        why = _clean(question.get("why_this_matters"))
+        placeholder = _clean(question.get("placeholder"))
+        lines.append(f"- {prompt_id}: {prompt_text}")
+        if why:
+            lines.append(f"  Why it matters: {why}")
+        options = list(question.get("answers") or [])
+        if options:
+            lines.append("  Options:")
+            for option in options:
+                title = _clean(option.get("answer_title")) or _clean(option.get("value"))
+                value = _clean(option.get("value"))
+                suffix = " [recommended]" if option.get("recommended") else ""
+                lines.append(f"  - {title}{suffix}: {value}")
+        elif placeholder:
+            lines.append(f"  Hint: {placeholder}")
+    return "\n".join(lines)
+
+
+def _collect_clarifier_answers_from_claude(
+    template: dict, payload: dict, questions: list[dict]
+) -> dict[str, str]:
+    if not questions:
+        return {}
+    prompt = _build_clarifier_prompt(template, payload, questions)
+    raw = _run_prompt_in_claude(
+        prompt,
+        missing_env_message=(
+            "This command is only supported inside Claude Code right now. Run it from a Claude Code session, or use the prompt copy/paste path in Keshro instead."
+        ),
+        missing_binary_message=(
+            "This command is only supported inside Claude Code right now. If Claude Code is not available here, use the prompt copy/paste path in Keshro instead."
+        ),
+        failure_message_prefix=(
+            "This command is only supported inside Claude Code right now. Claude Code returned: "
+        ),
+        empty_message="Claude agent returned no clarifier answers.",
+    )
+    parsed = _parse_discovery_key_values(raw)
+    answers: dict[str, str] = {}
+    for question in questions:
+        question_id = _clean(question.get("id"))
+        value = _clean(parsed.get(_normalize_prompt_key(question_id)))
+        if value and value.lower() != "unknown":
+            answers[question_id] = value
+            continue
+        options = list(question.get("answers") or [])
+        recommended = next(
+            (option for option in options if option.get("recommended")),
+            None,
+        )
+        if recommended:
+            recommended_value = _clean(recommended.get("value"))
+            if recommended_value:
+                answers[question_id] = recommended_value
+    return answers
+
+
+def _merge_clarifier_answers(
+    payload: dict, questions: list[dict], answers: dict[str, str]
+) -> dict:
+    if not answers:
+        return payload
+    field_targets = {
+        _clean(question.get("id")): _clean(question.get("field_target"))
+        for question in questions
+        if _clean(question.get("field_target"))
+    }
+    custom_fields = dict(payload.get("custom_fields") or {})
+    for question_id, value in answers.items():
+        field_target = field_targets.get(question_id)
+        if field_target and _clean(value):
+            custom_fields[field_target] = _clean(value)
+
+    clarified_lines = [
+        f"- {question_id.replace('_', ' ')}: {value}"
+        for question_id, value in answers.items()
+        if _clean(value)
+    ]
+    context = _clean(payload.get("context"))
+    if clarified_lines:
+        block = "\n".join(["Critical clarifications", *clarified_lines])
+        context = "\n\n---\n\n".join([part for part in [context, block] if part])
+
+    next_payload = dict(payload)
+    next_payload["context"] = context or None
+    next_payload["custom_fields"] = custom_fields or None
+    return next_payload
+
+
 def _app_url_from_api_url(api_url: str) -> str:
     resolved = _clean(api_url).rstrip("/")
     if not resolved:
@@ -593,29 +734,32 @@ def _app_url_from_api_url(api_url: str) -> str:
     return resolved
 
 
-def _render_created_migration(created: dict, template: dict) -> None:
+def _encode_prefill_draft(payload: dict) -> str:
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii")
+    return encoded.rstrip("=")
+
+
+def _render_prefill_handoff(payload: dict, template: dict) -> None:
     if _state.json:
-        print_output(created, True)
+        print_output(payload, True)
         return
-    migration_id = _clean(created.get("id"))
-    status = _clean(created.get("status") or "analyzing") or "analyzing"
     source = _clean(template.get("source")) or "Unknown source"
     target = _clean(template.get("target")) or "Unknown target"
-    print(f"Created migration for {source} -> {target}.")
-    if migration_id:
-        print(f"Migration ID: {migration_id}")
-    if status in {"analyzing", "pending", "queued", "running"}:
-        print(f"Status: {status} (analysis in progress)")
-    else:
-        print(f"Status: {status}")
+    print(f"Prepared migration draft for {source} -> {target}.")
     path_key = _clean(template.get("template_key"))
     if path_key:
         print(f"Path: {path_key}")
-    if migration_id:
-        print(
-            f"Open in UI: {_app_url_from_api_url(_state.api_url)}/migrations/{migration_id}"
-        )
-        print(f"Run `keshro migration view {migration_id}` to inspect it.")
+    query = urlencode(
+        {
+            "source": source,
+            "target": target,
+            "draft": _encode_prefill_draft(payload),
+        }
+    )
+    print(f"Open in UI: {_app_url_from_api_url(_state.api_url)}/new?{query}")
+    print("Review the prefilled draft in Keshro, then click Analyze Migration.")
 
 
 def _connected_delivery_label_from_plan(plan: dict) -> str | None:
@@ -696,6 +840,96 @@ Rules:
 - Do not silently work around blockers or plan drift.
 - Do not assume Keshro is current unless you updated it.
 - Record meaningful execution changes, especially ones that affect delivery, risk, validation, or the plan."""
+
+
+def _build_continue_prompt(plan: dict, task: dict, dry_run: bool = False) -> str:
+    resolved_plan_id = _clean(plan.get("id")) or "<plan-id>"
+    connected_delivery_label = _connected_delivery_label_from_plan(plan)
+    source = _clean(plan.get("source_type"))
+    target = _clean(plan.get("target_type"))
+    migration_label = (
+        f"the {source} -> {target} migration" if source and target else "a migration"
+    )
+    base = _build_cli_agent_skill_text(
+        plan_id=resolved_plan_id,
+        connected_delivery_label=connected_delivery_label,
+        migration_label=migration_label,
+        dry_run=dry_run,
+    )
+    task_id = _clean(task.get("id")) or "<task-id>"
+    task_title = _clean(task.get("title")) or "Untitled task"
+    task_description = _clean(task.get("description")) or "No description provided."
+    task_status = _clean(task.get("status") or "todo")
+    blocked_reason = _clean(task.get("blocked_reason"))
+    notes = _clean(task.get("notes"))
+    artifacts = [_clean(link) for link in (task.get("artifact_links") or []) if _clean(link)]
+    details = [
+        "",
+        "Current execution focus:",
+        f"- Plan ID: {resolved_plan_id}",
+        f"- Next task ID: {task_id}",
+        f"- Next task title: {task_title}",
+        f"- Next task status: {task_status}",
+        f"- Next task description: {task_description}",
+    ]
+    if blocked_reason:
+        details.append(f"- Existing blocker on this task: {blocked_reason}")
+    if notes:
+        details.append(f"- Existing task notes: {notes}")
+    if artifacts:
+        details.append(f"- Existing task artifacts: {', '.join(artifacts)}")
+    details.extend(
+        [
+            "",
+            "Continue from this task now.",
+            "- Inspect the current workspace before acting.",
+            "- Ground yourself on the plan and this task first.",
+            "- If this task is blocked, do not automatically move to the next task unless the plan clearly supports parallel or out-of-order work.",
+            "- If you continue execution, keep Keshro updated as you work.",
+            "- If you are in dry-run mode, explain what you would do next instead of making changes or writing back.",
+        ]
+    )
+    return "\n".join([base, *details])
+
+
+def _continue_with_claude(plan_id: str | None, dry_run: bool = False) -> None:
+    resolved_plan_id = _current_plan_id(plan_id)
+    if not resolved_plan_id:
+        raise SystemExit(
+            "Plan context required. Pass --plan-id <plan-id> or save one with `keshro config set --plan-id <plan-id>`."
+        )
+    plan = _get_plan_or_exit(resolved_plan_id)
+    task = _next_actionable_task(plan)
+    if not task:
+        raise SystemExit("No actionable tasks remain on this plan.")
+    prompt = _build_continue_prompt(plan, task, dry_run=dry_run)
+    output = _run_prompt_in_claude(
+        prompt,
+        missing_env_message=(
+            "This command is only supported inside Claude Code right now. Run it from a Claude Code session, or use `keshro agent-prompt` instead."
+        ),
+        missing_binary_message=(
+            "This command is only supported inside Claude Code right now. If Claude Code is not available here, use `keshro agent-prompt` instead."
+        ),
+        failure_message_prefix="Claude Code returned: ",
+        empty_message="Claude Code returned no execution response.",
+    )
+    if _state.json:
+        print_output(
+            {
+                "plan_id": resolved_plan_id,
+                "task_id": _clean(task.get("id")) or None,
+                "task_title": _clean(task.get("title")) or None,
+                "dry_run": dry_run,
+                "output": output,
+            },
+            True,
+        )
+        return
+    print(
+        f"Continuing plan {resolved_plan_id} from task {_clean(task.get('title')) or _clean(task.get('id')) or 'unknown task'}."
+    )
+    print(output)
 
 
 def _view_task(plan_id: str | None, task_id: str) -> None:
@@ -1038,6 +1272,11 @@ def _create_migration(
         )
         template_res.raise_for_status()
         template = template_res.json()
+        source = _clean(template.get("source"))
+        target = _clean(template.get("target"))
+
+        if not _state.json:
+            print(f"Collecting migration context for {source} -> {target} with Claude Code...")
 
         discovered_answer = _collect_discovery_answer_from_claude(template)
         answers.update(_extract_discovery_answers(template, discovered_answer))
@@ -1053,8 +1292,6 @@ def _create_migration(
                 + ", ".join(required_fields)
             )
 
-        source = _clean(template.get("source"))
-        target = _clean(template.get("target"))
         merged_context = f"CLI bootstrap for {source} -> {target}."
         if _clean(context):
             merged_context = (
@@ -1096,11 +1333,21 @@ def _create_migration(
             ),
             "custom_fields": custom_fields or None,
         }
-        res = client.post("/api/migrations", json=payload)
-        res.raise_for_status()
-        created = res.json()
-
-    _render_created_migration(created, template)
+        if not _state.json:
+            print("Checking for high-impact follow-up questions...")
+        clarifier_questions = _get_migration_clarifiers(client, payload)
+        if clarifier_questions:
+            if not _state.json:
+                print("Collecting follow-up answers with Claude Code...")
+            clarifier_answers = _collect_clarifier_answers_from_claude(
+                template, payload, clarifier_questions
+            )
+            payload = _merge_clarifier_answers(
+                payload, clarifier_questions, clarifier_answers
+            )
+        elif not _state.json:
+            print("No additional follow-up questions needed.")
+    _render_prefill_handoff(payload, template)
 
 
 @migration_app.command("list")
@@ -1485,6 +1732,26 @@ def _agent_prompt(
 ):
     """Print the Keshro execution prompt for your coding agent."""
     _print_agent_prompt(plan_id, dry_run=dry_run)
+
+
+@app.command("continue")
+def _continue_command(
+    plan_id: Annotated[
+        Optional[str],
+        typer.Option(
+            "--plan-id", "-p", help="Plan ID. Uses saved plan context if omitted."
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Run Claude in planning mode without code changes or Keshro writes.",
+        ),
+    ] = False,
+):
+    """Resume execution from the next actionable task inside Claude Code."""
+    _continue_with_claude(plan_id, dry_run=dry_run)
 
 
 @app.command("agent-skill", hidden=True)

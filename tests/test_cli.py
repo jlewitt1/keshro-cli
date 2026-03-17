@@ -1,6 +1,7 @@
 import json
 import re
 import subprocess
+import base64
 from pathlib import Path
 
 import httpx
@@ -232,6 +233,8 @@ class _FakeClient:
 
     def post(self, path, json=None):
         self.calls.append(("POST", path, json))
+        if path == "/api/migrations/clarifiers":
+            return _FakeResponse({"questions": []})
         if path == "/api/migrations":
             return _FakeResponse(
                 {
@@ -412,16 +415,88 @@ def test_create_migration_from_path_key_prompts_and_posts_payload(
     cli.main(["create", "--path", "aws-batch-to-airflow"])
 
     out = capsys.readouterr().out
-    assert "Created migration for AWS Batch -> Airflow." in out
-    method, path, payload = fake_client.calls[-1]
-    assert method == "POST"
-    assert path == "/api/migrations"
+    assert "Prepared migration draft for AWS Batch -> Airflow." in out
+    clarifier_call = next(call for call in fake_client.calls if call[1] == "/api/migrations/clarifiers")
+    payload = clarifier_call[2]
     assert payload["input_method"] == "cli_agent"
     assert payload["custom_fields"]["batch_workloads"] == "scheduled ETL jobs"
     assert payload["custom_fields"]["__keshro_discovered_context"]
-    assert "Status: analyzing (analysis in progress)" in out
     assert "Open in UI:" in out
-    assert "/migrations/migration-999" in out
+    assert "/new?source=AWS+Batch&target=Airflow&draft=" in out
+    assert "Review the prefilled draft in Keshro, then click Analyze Migration." in out
+
+
+def test_create_migration_from_path_key_applies_shared_clarifiers(
+    fake_client, monkeypatch, capsys
+):
+    monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "1")
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: "/usr/local/bin/claude" if name == "claude" else None,
+    )
+
+    call_count = {"count": 0}
+
+    def _fake_run(cmd, capture_output, text, cwd, check):
+        call_count["count"] += 1
+        if call_count["count"] == 1:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout="\n".join(
+                    [
+                        "## Versions",
+                        "- Source version: 1.0",
+                        "- Target version: 2.9",
+                        "",
+                        "## AWS Batch to Airflow details",
+                        "- AWS Batch workloads: scheduled ETL jobs",
+                    ]
+                ),
+                stderr="",
+            )
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout="- rollback_strategy: switch back to Batch scheduling immediately",
+            stderr="",
+        )
+
+    def _post(path, json=None):
+        fake_client.calls.append(("POST", path, json))
+        if path == "/api/migrations/clarifiers":
+            return _FakeResponse(
+                {
+                    "questions": [
+                        {
+                            "id": "rollback_strategy",
+                            "question": "What rollback strategy do you want if validation fails?",
+                            "field_target": "rollback_strategy",
+                            "answers": [],
+                            "allow_custom": True,
+                        }
+                    ]
+                }
+            )
+        return _FakeResponse({"path": path, "payload": json})
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr(fake_client, "post", _post)
+
+    cli.main(["create", "--path", "aws-batch-to-airflow"])
+
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+    match = re.search(r"draft=([A-Za-z0-9_-]+)", out)
+    assert match
+    encoded = match.group(1)
+    padded = encoded + "=" * ((4 - len(encoded) % 4) % 4)
+    decoded = json.loads(base64.urlsafe_b64decode(padded.encode()).decode())
+    assert (
+        decoded["custom_fields"]["rollback_strategy"]
+        == "switch back to Batch scheduling immediately"
+    )
+    assert "Critical clarifications" in decoded["context"]
+    assert call_count["count"] == 2
 
 
 def test_create_migration_from_path_key_requires_claude_code(fake_client, monkeypatch):
@@ -464,6 +539,73 @@ def test_agent_prompt_dry_run_marks_non_executing_mode(
     out = capsys.readouterr().out
     assert "Dry-run mode:" in out
     assert "Do not write task updates back to Keshro." in out
+
+
+def test_continue_requires_claude_code(fake_client, monkeypatch):
+    monkeypatch.delenv("CLAUDE_CODE_ENTRYPOINT", raising=False)
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    exit_code = cli.main(["continue", "-p", "plan-123"])
+    assert exit_code == 1
+
+
+def test_continue_uses_saved_plan_context_and_invokes_claude(
+    fake_client, monkeypatch, capsys
+):
+    monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
+    monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "1")
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/local/bin/claude")
+
+    captured = {}
+
+    def _fake_run(args, capture_output, text, cwd, check):
+        captured["args"] = args
+        captured["cwd"] = cwd
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout="Claude continued execution.",
+            stderr="",
+        )
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    cli.main(["continue"])
+
+    out = capsys.readouterr().out
+    prompt = captured["args"][2]
+    assert "Continuing plan plan-123 from task Review EventBridge schedules." in out
+    assert "Claude continued execution." in out
+    assert "Current execution focus:" in prompt
+    assert "- Next task ID: review-schedules" in prompt
+    assert "- Next task title: Review EventBridge schedules" in prompt
+    assert "If this task is blocked, do not automatically move to the next task" in prompt
+
+
+def test_continue_dry_run_mentions_non_executing_mode(fake_client, monkeypatch):
+    monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
+    monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "1")
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/local/bin/claude")
+
+    captured = {}
+
+    def _fake_run(args, capture_output, text, cwd, check):
+        captured["args"] = args
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout="Dry run response.",
+            stderr="",
+        )
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    cli.main(["continue", "--dry-run"])
+
+    prompt = captured["args"][2]
+    assert "Dry-run mode:" in prompt
+    assert "If you are in dry-run mode, explain what you would do next" in prompt
 
 
 def test_plan_create_saves_default_plan_automatically(fake_client, monkeypatch, capsys):
