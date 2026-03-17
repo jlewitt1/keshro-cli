@@ -506,106 +506,153 @@ def test_create_migration_from_path_key_requires_claude_code(fake_client, monkey
     assert exit_code == 1
 
 
-def test_agent_prompt_requires_plan_context(fake_client, monkeypatch):
-    monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: {})
-    monkeypatch.setattr("keshro_cli.client.load_auth", lambda: {})
-    exit_code = cli.main(["agent-prompt"])
-    assert exit_code == 1
+
+def _bypass_auth(monkeypatch):
+    """Skip the auth check in continue so tests can focus on prompt output."""
+    monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
 
 
-def test_agent_prompt_uses_saved_plan_context(fake_client, monkeypatch, capsys):
-    monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
-    monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
-
-    cli.main(["agent-prompt"])
-
-    out = capsys.readouterr().out
-    assert (
-        "You are executing the AWS Batch -> Airflow migration tracked in Keshro." in out
-    )
-    assert "keshro plan view plan-123" in out
-    assert "keshro task next -p plan-123" in out
-    assert "linked Linear work" in out
-
-
-def test_agent_prompt_dry_run_marks_non_executing_mode(
+def test_continue_prints_prompt_with_task_context(
     fake_client, monkeypatch, capsys
 ):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
-
-    cli.main(["agent-prompt", "--dry-run"])
-
-    out = capsys.readouterr().out
-    assert "Dry-run mode:" in out
-    assert "Do not write task updates back to Keshro." in out
-
-
-def test_continue_requires_claude_code(fake_client, monkeypatch):
-    monkeypatch.delenv("CLAUDE_CODE_ENTRYPOINT", raising=False)
-    monkeypatch.setattr("shutil.which", lambda name: None)
-    exit_code = cli.main(["continue", "-p", "plan-123"])
-    assert exit_code == 1
-
-
-def test_continue_uses_saved_plan_context_and_invokes_claude(
-    fake_client, monkeypatch, capsys
-):
-    monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
-    monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
-    monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "1")
-    monkeypatch.setattr("shutil.which", lambda name: "/usr/local/bin/claude")
-
-    captured = {}
-
-    def _fake_run(args, capture_output, text, cwd, check):
-        captured["args"] = args
-        captured["cwd"] = cwd
-        return subprocess.CompletedProcess(
-            args=args,
-            returncode=0,
-            stdout="Claude continued execution.",
-            stderr="",
-        )
-
-    monkeypatch.setattr("subprocess.run", _fake_run)
+    _bypass_auth(monkeypatch)
 
     cli.main(["continue"])
 
     out = capsys.readouterr().out
-    prompt = captured["args"][2]
-    assert "Continuing plan plan-123 from task Review EventBridge schedules." in out
-    assert "Claude continued execution." in out
-    assert "Current execution focus:" in prompt
-    assert "- Next task ID: review-schedules" in prompt
-    assert "- Next task title: Review EventBridge schedules" in prompt
-    assert "If this task is blocked, do not automatically move to the next task" in prompt
+    assert "Current execution focus:" in out
+    assert "- Next task ID: review-schedules" in out
+    assert "- Next task title: Review EventBridge schedules" in out
+    assert "If this task is blocked, do not automatically move to the next task" in out
 
 
-def test_continue_dry_run_mentions_non_executing_mode(fake_client, monkeypatch):
+def test_continue_prompt_includes_mcp_warning(
+    fake_client, monkeypatch, capsys
+):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
-    monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "1")
-    monkeypatch.setattr("shutil.which", lambda name: "/usr/local/bin/claude")
+    _bypass_auth(monkeypatch)
 
-    captured = {}
+    cli.main(["continue"])
 
-    def _fake_run(args, capture_output, text, cwd, check):
-        captured["args"] = args
-        return subprocess.CompletedProcess(
-            args=args,
-            returncode=0,
-            stdout="Dry run response.",
-            stderr="",
-        )
+    out = capsys.readouterr().out
+    assert "Do NOT use Keshro MCP tools" in out
 
-    monkeypatch.setattr("subprocess.run", _fake_run)
+
+def test_continue_prompt_includes_ask_before_continue(
+    fake_client, monkeypatch, capsys
+):
+    monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
+    _bypass_auth(monkeypatch)
+
+    cli.main(["continue"])
+
+    out = capsys.readouterr().out
+    assert "ask the user if they want to continue to the next task" in out
+
+
+def test_continue_prompt_includes_error_guidance(
+    fake_client, monkeypatch, capsys
+):
+    monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
+    _bypass_auth(monkeypatch)
+
+    cli.main(["continue"])
+
+    out = capsys.readouterr().out
+    assert "If a keshro command fails" in out
+
+
+def test_continue_prompt_does_not_tell_claude_to_refetch(
+    fake_client, monkeypatch, capsys
+):
+    monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
+    _bypass_auth(monkeypatch)
+
+    cli.main(["continue"])
+
+    out = capsys.readouterr().out
+    assert "Do not re-fetch them" in out
+    assert "Start by grounding" not in out
+
+
+def test_continue_dry_run_mentions_non_executing_mode(
+    fake_client, monkeypatch, capsys
+):
+    monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
+    _bypass_auth(monkeypatch)
 
     cli.main(["continue", "--dry-run"])
 
-    prompt = captured["args"][2]
-    assert "Dry-run mode:" in prompt
-    assert "If you are in dry-run mode, explain what you would do next" in prompt
+    out = capsys.readouterr().out
+    assert "Dry-run mode:" in out
+    assert "If you are in dry-run mode, explain what you would do next" in out
+
+
+def test_continue_exits_when_not_authenticated(fake_client, monkeypatch):
+    monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: {})
+    monkeypatch.setattr("keshro_cli.client.load_auth", lambda: {})
+
+    exit_code = cli.main(["continue", "-p", "plan-123"])
+    assert exit_code == 1
+
+
+def test_continue_exits_when_token_expired(fake_client, monkeypatch):
+    monkeypatch.setattr(
+        "keshro_cli.cli.load_auth",
+        lambda: {"token": "expired-token", "default_plan_id": "plan-123"},
+    )
+    monkeypatch.setattr("keshro_cli.client.load_auth", lambda: {"token": "expired-token"})
+
+    def _fake_make_client(*args, **kwargs):
+        class _ExpiredClient:
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+            def get(self, path, **kw):
+                resp = httpx.Response(401, request=httpx.Request("GET", path))
+                raise httpx.HTTPStatusError("Unauthorized", request=resp.request, response=resp)
+        return _ExpiredClient()
+
+    monkeypatch.setattr("keshro_cli.cli.make_client", _fake_make_client)
+
+    exit_code = cli.main(["continue", "-p", "plan-123"])
+    assert exit_code == 1
+
+
+def test_setup_claude_creates_slash_command(monkeypatch, tmp_path, capsys):
+    commands_dir = tmp_path / "commands"
+    monkeypatch.setattr("keshro_cli.cli.CLAUDE_COMMANDS_DIR", commands_dir)
+
+    cli.main(["setup-claude"])
+
+    out = capsys.readouterr().out
+    assert "Installed Claude Code slash command" in out
+    target = commands_dir / "keshro.md"
+    assert target.exists()
+    content = target.read_text()
+    assert "keshro continue" in content
+    assert "Do not use Keshro MCP tools" in content
+
+
+def test_setup_claude_overwrites_existing(monkeypatch, tmp_path, capsys):
+    commands_dir = tmp_path / "commands"
+    commands_dir.mkdir(parents=True)
+    (commands_dir / "keshro.md").write_text("old content")
+    monkeypatch.setattr("keshro_cli.cli.CLAUDE_COMMANDS_DIR", commands_dir)
+
+    cli.main(["setup-claude"])
+
+    content = (commands_dir / "keshro.md").read_text()
+    assert "old content" not in content
+    assert "keshro continue" in content
 
 
 def test_plan_create_saves_default_plan_automatically(fake_client, monkeypatch, capsys):
