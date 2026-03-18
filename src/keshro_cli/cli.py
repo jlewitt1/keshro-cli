@@ -789,21 +789,9 @@ def _build_cli_agent_skill_text(
     plan_id: str | None = None,
     connected_delivery_label: str | None = None,
     migration_label: str | None = None,
-    dry_run: bool = False,
 ) -> str:
     resolved_plan_id = plan_id or "<plan-id>"
     resolved_migration_label = migration_label or "a migration"
-    dry_run_block = (
-        """
-
-Dry-run mode:
-- Do not make code changes.
-- Do not run destructive commands.
-- Do not write task updates back to Keshro.
-- Instead, inspect the plan, explain what you would do next, call out what you would record in Keshro, and surface any missing inputs or blockers before execution starts."""
-        if dry_run
-        else ""
-    )
     return f"""You are executing {resolved_migration_label} tracked in Keshro.
 
 IMPORTANT: Use `keshro` CLI commands to interact with Keshro. Do NOT use Keshro MCP tools — always use the CLI in your terminal instead.
@@ -811,7 +799,6 @@ IMPORTANT: Use `keshro` CLI commands to interact with Keshro. Do NOT use Keshro 
 The current task and plan context are provided below. Do not re-fetch them with `keshro plan view` or `keshro task next` — start working directly.
 
 Treat Keshro as the live execution record. When meaningful task progress happens, write it back while the work is happening rather than waiting until the end.
-{dry_run_block}
 
 During execution:
 - run `keshro task start <task-id> -p {resolved_plan_id}` as soon as work begins
@@ -843,7 +830,7 @@ Rules:
 - If you need more detail on any task, use `keshro task view <task-id> -p {resolved_plan_id}`."""
 
 
-def _build_continue_prompt(plan: dict, task: dict, dry_run: bool = False) -> str:
+def _build_continue_prompt(plan: dict, task: dict) -> str:
     resolved_plan_id = _clean(plan.get("id")) or "<plan-id>"
     connected_delivery_label = _connected_delivery_label_from_plan(plan)
     source = _clean(plan.get("source_type"))
@@ -855,7 +842,6 @@ def _build_continue_prompt(plan: dict, task: dict, dry_run: bool = False) -> str
         plan_id=resolved_plan_id,
         connected_delivery_label=connected_delivery_label,
         migration_label=migration_label,
-        dry_run=dry_run,
     )
     task_id = _clean(task.get("id")) or "<task-id>"
     task_title = _clean(task.get("title")) or "Untitled task"
@@ -887,7 +873,6 @@ def _build_continue_prompt(plan: dict, task: dict, dry_run: bool = False) -> str
             "- Read existing files relevant to this task to understand the current state before making changes.",
             "- If this task is blocked, do not automatically move to the next task unless the plan clearly supports parallel or out-of-order work.",
             "- If you continue execution, keep Keshro updated as you work.",
-            "- If you are in dry-run mode, explain what you would do next instead of making changes or writing back to Keshro.",
         ]
     )
     return "\n".join([base, *details])
@@ -922,7 +907,7 @@ def _ensure_authenticated() -> None:
         raise
 
 
-def _continue_with_claude(plan_id: str | None, dry_run: bool = False) -> None:
+def _continue_with_claude(plan_id: str | None) -> None:
     _ensure_authenticated()
     resolved_plan_id = _current_plan_id(plan_id)
     if not resolved_plan_id:
@@ -933,20 +918,24 @@ def _continue_with_claude(plan_id: str | None, dry_run: bool = False) -> None:
     task = _next_actionable_task(plan)
     if not task:
         raise SystemExit("No actionable tasks remain on this plan.")
-    prompt = _build_continue_prompt(plan, task, dry_run=dry_run)
+    prompt = _build_continue_prompt(plan, task)
     if _state.json:
         print_output(
             {
                 "plan_id": resolved_plan_id,
                 "task_id": _clean(task.get("id")) or None,
                 "task_title": _clean(task.get("title")) or None,
-                "dry_run": dry_run,
                 "text": prompt,
             },
             True,
         )
         return
-    print(prompt)
+    task_title = _clean(task.get("title")) or "next task"
+    if sys.stdout.isatty():
+        print(f"Resuming: {task_title}")
+        print("Run this in your Claude Code terminal for Claude to pick up the task.")
+    else:
+        print(prompt)
 
 
 def _view_task(plan_id: str | None, task_id: str) -> None:
@@ -1277,7 +1266,7 @@ def _create_migration(
         Optional[str], typer.Option("--org-id", "-o", help="Create under an org.")
     ] = None,
 ):
-    """Create a migration project from a stable path key inside Claude Code."""
+    """Create a migration project from a stable path key inside Claude Code"""
     if not _is_running_inside_claude_code():
         raise SystemExit(
             "This command is only supported inside Claude Code right now. Run it from a Claude Code session, or use the prompt copy/paste path in Keshro instead."
@@ -1702,16 +1691,9 @@ def _continue_command(
             "--plan-id", "-p", help="Plan ID. Uses saved plan context if omitted."
         ),
     ] = None,
-    dry_run: Annotated[
-        bool,
-        typer.Option(
-            "--dry-run",
-            help="Run Claude in planning mode without code changes or Keshro writes.",
-        ),
-    ] = False,
 ):
-    """Print the execution prompt for the next actionable task. Run inside Claude Code — your agent reads the output and follows the instructions."""
-    _continue_with_claude(plan_id, dry_run=dry_run)
+    """Resume the next task from a plan. Only works inside Claude Code."""
+    _continue_with_claude(plan_id)
 
 
 CLAUDE_COMMANDS_DIR = Path.home() / ".claude" / "commands"
@@ -1734,7 +1716,7 @@ Run `keshro` commands via Bash, not as chat messages. Do not use Keshro MCP tool
 
 @app.command("setup-claude")
 def _setup_claude():
-    """Install a global Claude Code slash command for Keshro."""
+    """Install a global Claude Code slash command for Keshro"""
     CLAUDE_COMMANDS_DIR.mkdir(parents=True, exist_ok=True)
     target = CLAUDE_COMMANDS_DIR / "keshro.md"
     target.write_text(KESHRO_SLASH_COMMAND)

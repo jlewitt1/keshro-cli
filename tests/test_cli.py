@@ -581,19 +581,6 @@ def test_continue_prompt_does_not_tell_claude_to_refetch(
     assert "Start by grounding" not in out
 
 
-def test_continue_dry_run_mentions_non_executing_mode(
-    fake_client, monkeypatch, capsys
-):
-    monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
-    monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
-    _bypass_auth(monkeypatch)
-
-    cli.main(["continue", "--dry-run"])
-
-    out = capsys.readouterr().out
-    assert "Dry-run mode:" in out
-    assert "If you are in dry-run mode, explain what you would do next" in out
-
 
 def test_continue_exits_when_not_authenticated(fake_client, monkeypatch):
     monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: {})
