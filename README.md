@@ -2,52 +2,69 @@
 
 Thin CLI for Keshro's hosted API.
 
-## Alpha access
-
-To use the private alpha CLI, a user needs:
-
-1. A Keshro account
-2. CLI access enabled on the Keshro backend
-3. Read access to this private GitHub repo
-4. `uv` installed locally
-
 ## Install
 
-Private repo install with `uv` over SSH:
+Users install the CLI with their Keshro API token:
 
 ```bash
-uv tool install git+ssh://git@github.com/jlewitt1/keshro-cli.git
+curl -fsSL https://api.keshro.com/api/cli/install | sh -s -- ksh_pat_...
 ```
 
-Update an existing install:
+This downloads, installs, and authenticates in one step. Tokens are available in Account -> API in the Keshro app.
+
+### Local development install
 
 ```bash
-uv tool install --force git+https://github.com/jlewitt1/keshro-cli.git
+pip install -e ".[dev]"
 ```
 
-Local development install:
+Or with uv:
 
 ```bash
 uv tool install .
 ```
 
+## Publishing a new CLI version
+
+### Via GitHub Actions (recommended)
+
+1. Update the version in `pyproject.toml` and push
+2. Go to Actions → "Publish CLI" → Run workflow
+3. Select production or staging and run
+
+Requires `DEPLOY_SECRET` in the repo's GitHub secrets (must match the `DEPLOY_SECRET` env var on the backend).
+
+### Manual
+
+1. Update the version in `pyproject.toml`
+2. Build the sdist:
+   ```bash
+   python -m build --sdist
+   ```
+3. Upload to the backend:
+   ```bash
+   curl -X PUT -H "X-Deploy-Secret: $DEPLOY_SECRET" \
+     -F "file=@dist/keshro-0.1.0.tar.gz" \
+     https://api.keshro.com/api/cli/upload
+   ```
+
+Uploading the same filename overwrites the previous version. The `/api/cli/package` endpoint always serves the newest `keshro-*.tar.gz` file.
+
 ## Configure
 
-By default the CLI talks to `http://localhost:8000`.
+By default the CLI talks to `https://api.keshro.com`.
 
-Set a hosted API base URL with:
+Set a different API base URL with:
 
 ```bash
-export KESHRO_API_URL="https://app.keshro.com"
+export KESHRO_API_URL="http://localhost:8000"
 ```
 
 ## Auth
 
 ```bash
-keshro
-kr
-keshro login
-keshro login ksh_pat_...
+keshro login ksh_pat_...     # First-time login
+keshro login                 # Reuse saved session
 keshro logout
 ```
 
@@ -55,23 +72,36 @@ Auth state is stored in `~/.keshro/auth.json`.
 
 `keshro login` reuses your saved session when the token in `~/.keshro/auth.json` is still valid, so you only need `keshro login <api-token>` for first-time sign-in or when refreshing an expired session.
 
-Create or reuse API tokens from the Keshro Account -> API page. If CLI access is not enabled for the account, authenticated CLI commands will return `403`.
-
 ## Commands
 
+### Execution
+
 ```bash
-keshro plan create --title "AWS Batch to Airflow" --source-type "AWS Batch" --target-type "Airflow"
-keshro task next -p <plan-id>
-keshro task start <task-id> -p <plan-id>
-keshro task note <task-id> -p <plan-id> --note "Airflow is orchestrating existing Batch jobs during pilot"
-keshro task artifact <task-id> -p <plan-id> --link "https://github.com/acme/migrations/pull/19"
-keshro task block <task-id> -p <plan-id> --reason "Waiting on Terraform IAM role changes"
-keshro task unblock <task-id> -p <plan-id> --notes "IAM fix applied; resuming pilot"
-keshro task done <task-id> -p <plan-id> --notes "Pilot merged"
-keshro migration history <migration-id>
+keshro continue -p <plan-id>                    # Resume from next task in Claude Code
+keshro continue -p <plan-id> --dry-run           # Preview without making changes
+keshro setup-claude                              # Install global Claude Code slash command
+```
+
+### Plan management
+
+```bash
 keshro plan view <plan-id>
 keshro plan list
 keshro plan update <plan-id> --status ready
+keshro plan create --title "..." --source-type "..." --target-type "..."
+```
+
+### Task management
+
+```bash
+keshro task next -p <plan-id>
+keshro task start <task-id> -p <plan-id>
+keshro task note <task-id> -p <plan-id> -n "..."
+keshro task artifact <task-id> -p <plan-id> -l "<url>"
+keshro task block <task-id> -p <plan-id> -r "..."
+keshro task unblock <task-id> -p <plan-id>
+keshro task done <task-id> -p <plan-id>
+keshro migration history <migration-id>
 ```
 
 ## Execution loop behavior
@@ -90,21 +120,4 @@ Ask first before writing:
 
 - `keshro task done`
 - `keshro task delete`
-- optional `keshro plan replan-notes` when the change materially alters migration scope or sequencing
-
-Concrete examples:
-
-- Claude starts editing the next task's files:
-  - run `keshro task start <task-id> -p <plan-id>`
-- Claude discovers Airflow should orchestrate Batch during the pilot:
-  - run `keshro task note <task-id> -p <plan-id> --note "Airflow will orchestrate Batch during pilot"`
-- Claude opens a PR:
-  - run `keshro task artifact <task-id> -p <plan-id> --link "<pr-url>"`
-- Claude hits a Terraform/IAM blocker:
-  - run `keshro task block <task-id> -p <plan-id> --reason "Waiting on Terraform IAM role changes"`
-- The blocker is resolved:
-  - run `keshro task unblock <task-id> -p <plan-id> --notes "IAM fix applied; resuming pilot"`
-- Claude believes the task is done:
-  - ask the user first, then run `keshro task done <task-id> -p <plan-id> --notes "<what landed>"`
-- The original plan is no longer accurate:
-  - optionally ask first, then run `keshro plan replan-notes "<what changed and why>" -p <plan-id>`
+- optional `keshro plan replan-notes` when the change materially alters scope or sequencing

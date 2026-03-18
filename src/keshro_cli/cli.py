@@ -815,13 +815,15 @@ Treat Keshro as the live execution record. When meaningful task progress happens
 
 During execution:
 - run `keshro task start <task-id> -p {resolved_plan_id}` as soon as work begins
-- use `keshro task note <task-id> -p {resolved_plan_id} "..."` for meaningful discoveries, decisions, or validation findings
-- use `keshro task artifact <task-id> -p {resolved_plan_id} "..."` for PRs, commits, dashboards, issues, and runbooks
-- use `keshro task block <task-id> -p {resolved_plan_id} "..."` the moment a real blocker appears
+- use `keshro task note <task-id> -p {resolved_plan_id} -n "..."` for meaningful discoveries, decisions, or validation findings
+- use `keshro task artifact <task-id> -p {resolved_plan_id} -l "<url>"` for PRs, commits, dashboards, issues, and runbooks
+- use `keshro task block <task-id> -p {resolved_plan_id} -r "..."` the moment a real blocker appears
 - use `keshro task unblock <task-id> -p {resolved_plan_id}` when that blocker is cleared
 - use `keshro plan replan-notes {resolved_plan_id} "..."` only when the plan itself changed materially
+- when you create or modify files, record them with `keshro task note` — list the specific files and what changed
 
 When a task is done:
+- before marking done, record a completion note with `keshro task note <task-id> -p {resolved_plan_id} -n "..."` summarizing: files created/modified, key decisions made, and anything the next task should know
 - ask the user to confirm the task is complete before running `keshro task done`
 - after `keshro task done`, summarize what was accomplished and ask the user if they want to continue to the next task
 - do not automatically start the next task without the user's go-ahead
