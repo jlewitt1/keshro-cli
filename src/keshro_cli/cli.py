@@ -511,10 +511,6 @@ def _build_agent_discovery_prompt(template: dict) -> str:
     )
 
 
-def _is_running_inside_claude_code() -> bool:
-    return any(key.startswith("CLAUDE_CODE_") for key in os.environ)
-
-
 def _collect_discovery_answer_from_claude(template: dict) -> str:
     prompt = _build_agent_discovery_prompt(template)
     return _run_prompt_in_claude(
@@ -540,7 +536,7 @@ def _run_prompt_in_claude(
     failure_message_prefix: str,
     empty_message: str,
 ) -> str:
-    if not _is_running_inside_claude_code():
+    if sys.stdout.isatty():
         raise SystemExit(missing_env_message)
     claude_bin = shutil.which("claude")
     if not claude_bin:
@@ -756,18 +752,22 @@ def _render_prefill_handoff(payload: dict, template: dict) -> None:
     source = _clean(template.get("source")) or "Unknown source"
     target = _clean(template.get("target")) or "Unknown target"
     print(f"Prepared migration draft for {source} -> {target}.")
-    path_key = _clean(template.get("template_key"))
-    if path_key:
-        print(f"Path: {path_key}")
     query = urlencode(
         {
             "source": source,
             "target": target,
             "draft": _encode_prefill_draft(payload),
+            "clarify": "true",
         }
     )
-    print(f"Open in UI: {_app_url_from_api_url(_state.api_url)}/new?{query}")
-    print("Review the prefilled draft in Keshro, then click Analyze Migration.")
+    url = f"{_app_url_from_api_url(_state.api_url)}/new?{query}"
+    import webbrowser
+
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+    print(f"Open this URL to answer follow-up questions and start the analysis:\n{url}")
 
 
 def _connected_delivery_label_from_plan(plan: dict) -> str | None:
@@ -1335,10 +1335,11 @@ def _create_migration(
         Optional[str], typer.Option("--org-id", "-o", help="Create under an org.")
     ] = None,
 ):
-    """Create a migration project from a stable path key inside Claude Code"""
-    if not _is_running_inside_claude_code():
+    """Create a migration project from a stable path key. Requires a coding agent that can run shell commands."""
+    if sys.stdout.isatty():
         raise SystemExit(
-            "This command is only supported inside Claude Code right now. Run it from a Claude Code session, or use the prompt copy/paste path in Keshro instead."
+            "This command needs to run inside a coding agent (e.g. Claude Code) so it can scan your codebase.\n"
+            "Run it from your agent's terminal, or use the prompt copy/paste path in Keshro instead."
         )
     answers = _parse_field_assignments(field)
     with make_client(_state.api_url, _state.token) as client:

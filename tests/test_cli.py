@@ -423,9 +423,7 @@ def test_create_migration_from_path_key_prompts_and_posts_payload(
     assert payload["input_method"] == "cli_agent"
     assert payload["custom_fields"]["batch_workloads"] == "scheduled ETL jobs"
     assert payload["custom_fields"]["__keshro_discovered_context"]
-    assert "Open in UI:" in out
-    assert "/new?source=AWS+Batch&target=Airflow&draft=" in out
-    assert "Review the prefilled draft in Keshro, then click Analyze Migration." in out
+    assert "Prepared migration draft for AWS Batch -> Airflow." in out
 
 
 def test_create_migration_from_path_key_applies_shared_clarifiers(
@@ -485,10 +483,13 @@ def test_create_migration_from_path_key_applies_shared_clarifiers(
     monkeypatch.setattr("subprocess.run", _fake_run)
     monkeypatch.setattr(fake_client, "post", _post)
 
+    opened_urls = []
+    monkeypatch.setattr("webbrowser.open", lambda url: opened_urls.append(url))
+
     cli.main(["create", "--path", "aws-batch-to-airflow"])
 
-    out = ANSI_RE.sub("", capsys.readouterr().out)
-    match = re.search(r"draft=([A-Za-z0-9_-]+)", out)
+    assert len(opened_urls) == 1
+    match = re.search(r"draft=([A-Za-z0-9_-]+)", opened_urls[0])
     assert match
     encoded = match.group(1)
     padded = encoded + "=" * ((4 - len(encoded) % 4) % 4)
