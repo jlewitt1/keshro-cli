@@ -808,6 +808,19 @@ The current task and plan context are provided below. Do not re-fetch them with 
 
 Treat Keshro as the live execution record. When meaningful task progress happens, write it back while the work is happening rather than waiting until the end.
 
+Before running any keshro command or git checkpoint, always print a short human-readable message explaining what you are doing and why. The user should understand the purpose before seeing the command output.
+
+Examples:
+- "Creating a checkpoint before starting this task." then run the git commit.
+- "Marking this task as in progress in Keshro." then run `keshro task start`.
+- "Recording a note about what was discovered." then run `keshro task note`.
+- "Attaching this PR as an artifact." then run `keshro task artifact`.
+- "Flagging a blocker in Keshro." then run `keshro task block`.
+- "Clearing the blocker — resuming work." then run `keshro task unblock`.
+- "Recording the completion summary." then run `keshro task note` with the summary.
+- "Marking this task as done in Keshro." then run `keshro task done`.
+- "Recording a plan change." then run `keshro plan replan-notes`.
+
 During execution:
 - run `keshro task start <task-id> -p {resolved_plan_id}` as soon as work begins
 - use `keshro task note <task-id> -p {resolved_plan_id} -n "..."` for meaningful discoveries, decisions, or validation findings
@@ -908,7 +921,7 @@ def _build_continue_prompt(plan: dict, task: dict, work_dir: str | None = None) 
     continuation = [
         "",
         "Continue from this task now.",
-        f'- Before starting work, create a checkpoint: run `git add -A && git commit -m "keshro: checkpoint before {task_title}"` so changes can be rolled back if needed.',
+        f'- Before starting work, create a git checkpoint so changes can be rolled back if needed: `git add -A && git commit -m "keshro: checkpoint before {task_title}" --allow-empty`',
         "- Before writing code, briefly tell the user what this task involves and which files you expect to touch.",
         "- Read existing files relevant to this task to understand the current state before making changes.",
         "- If this task is blocked, do not automatically move to the next task unless the plan clearly supports parallel or out-of-order work.",
