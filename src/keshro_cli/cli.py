@@ -1,10 +1,10 @@
+import base64
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
-import base64
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -608,9 +608,15 @@ def _get_migration_clarifiers(client: httpx.Client, payload: dict) -> list[dict]
     return list(body.get("questions") or [])
 
 
-def _build_clarifier_prompt(template: dict, payload: dict, questions: list[dict]) -> str:
-    source = _clean(template.get("source")) or _clean(payload.get("source_type")) or "Source"
-    target = _clean(template.get("target")) or _clean(payload.get("target_type")) or "Target"
+def _build_clarifier_prompt(
+    template: dict, payload: dict, questions: list[dict]
+) -> str:
+    source = (
+        _clean(template.get("source")) or _clean(payload.get("source_type")) or "Source"
+    )
+    target = (
+        _clean(template.get("target")) or _clean(payload.get("target_type")) or "Target"
+    )
     existing_fields = dict(payload.get("custom_fields") or {})
     existing_context = _clean(payload.get("context"))
     lines = [
@@ -643,7 +649,9 @@ def _build_clarifier_prompt(template: dict, payload: dict, questions: list[dict]
         if options:
             lines.append("  Options:")
             for option in options:
-                title = _clean(option.get("answer_title")) or _clean(option.get("value"))
+                title = _clean(option.get("answer_title")) or _clean(
+                    option.get("value")
+                )
                 value = _clean(option.get("value"))
                 suffix = " [recommended]" if option.get("recommended") else ""
                 lines.append(f"  - {title}{suffix}: {value}")
@@ -830,7 +838,7 @@ Rules:
 - If you need more detail on any task, use `keshro task view <task-id> -p {resolved_plan_id}`."""
 
 
-def _build_continue_prompt(plan: dict, task: dict) -> str:
+def _build_continue_prompt(plan: dict, task: dict, work_dir: str | None = None) -> str:
     resolved_plan_id = _clean(plan.get("id")) or "<plan-id>"
     connected_delivery_label = _connected_delivery_label_from_plan(plan)
     source = _clean(plan.get("source_type"))
@@ -849,33 +857,73 @@ def _build_continue_prompt(plan: dict, task: dict) -> str:
     task_status = _clean(task.get("status") or "todo")
     blocked_reason = _clean(task.get("blocked_reason"))
     notes = _clean(task.get("notes"))
-    artifacts = [_clean(link) for link in (task.get("artifact_links") or []) if _clean(link)]
-    details = [
-        "",
-        "Current execution focus:",
-        f"- Plan ID: {resolved_plan_id}",
-        f"- Next task ID: {task_id}",
-        f"- Next task title: {task_title}",
-        f"- Next task status: {task_status}",
-        f"- Next task description: {task_description}",
+    artifacts = [
+        _clean(link) for link in (task.get("artifact_links") or []) if _clean(link)
+    ]
+    # Build session history from completed/in-progress tasks
+    steps = sorted(plan.get("plan_steps") or [], key=lambda s: s.get("order", 0))
+    completed_steps = [s for s in steps if s.get("status") == "completed"]
+    history_lines: list[str] = []
+    if completed_steps:
+        history_lines.append("Prior progress:")
+        for s in completed_steps:
+            title = _clean(s.get("title")) or "Untitled"
+            step_notes = _clean(s.get("notes"))
+            step_artifacts = [
+                _clean(a) for a in (s.get("artifact_links") or []) if _clean(a)
+            ]
+            line = f"- [done] {title}"
+            if step_notes:
+                last_note = step_notes.strip().splitlines()[-1].strip()
+                if last_note:
+                    line += f" — {last_note[:120]}"
+            history_lines.append(line)
+            if step_artifacts:
+                history_lines.append(f"  Artifacts: {', '.join(step_artifacts[:3])}")
+        remaining = len(
+            [s for s in steps if s.get("status") in ("todo", "in_progress")]
+        )
+        history_lines.append(f"- {len(completed_steps)} done, {remaining} remaining")
+        history_lines.append("")
+
+    # Task context first (this is what shows in the collapsed Claude Code preview)
+    done_count = len(completed_steps)
+    total_count = len(steps)
+    progress_line = f"[{done_count}/{total_count} done]" if done_count > 0 else ""
+    task_block = [
+        f"Task: {task_title} {progress_line}".strip(),
+        f"Description: {task_description}",
+        f"Status: {task_status}",
+        f"Plan: {resolved_plan_id} | Task ID: {task_id}",
     ]
     if blocked_reason:
-        details.append(f"- Existing blocker on this task: {blocked_reason}")
+        task_block.append(f"Blocker: {blocked_reason}")
     if notes:
-        details.append(f"- Existing task notes: {notes}")
+        task_block.append(f"Notes: {notes}")
     if artifacts:
-        details.append(f"- Existing task artifacts: {', '.join(artifacts)}")
-    details.extend(
-        [
-            "",
-            "Continue from this task now.",
-            "- Before writing code, briefly tell the user what this task involves and which files you expect to touch.",
-            "- Read existing files relevant to this task to understand the current state before making changes.",
-            "- If this task is blocked, do not automatically move to the next task unless the plan clearly supports parallel or out-of-order work.",
-            "- If you continue execution, keep Keshro updated as you work.",
-        ]
-    )
-    return "\n".join([base, *details])
+        task_block.append(f"Artifacts: {', '.join(artifacts)}")
+    if work_dir:
+        task_block.append(f"Project directory: {work_dir}")
+
+    continuation = [
+        "",
+        "Continue from this task now.",
+        f'- Before starting work, create a checkpoint: run `git add -A && git commit -m "keshro: checkpoint before {task_title}"` so changes can be rolled back if needed.',
+        "- Before writing code, briefly tell the user what this task involves and which files you expect to touch.",
+        "- Read existing files relevant to this task to understand the current state before making changes.",
+        "- If this task is blocked, do not automatically move to the next task unless the plan clearly supports parallel or out-of-order work.",
+        "- If you continue execution, keep Keshro updated as you work.",
+        "- Before marking a task done, verify your changes: run linters, check syntax, or run relevant tests if they exist. Record the validation result in your completion note.",
+    ]
+
+    parts = [
+        *task_block,
+        "",
+        *history_lines,
+        base,
+        *continuation,
+    ]
+    return "\n".join(parts)
 
 
 def _ensure_authenticated() -> None:
@@ -907,8 +955,12 @@ def _ensure_authenticated() -> None:
         raise
 
 
-def _continue_with_claude(plan_id: str | None) -> None:
+def _continue_with_claude(plan_id: str | None, work_dir: str | None = None) -> None:
     _ensure_authenticated()
+    if not work_dir:
+        work_dir = (load_auth().get("default_work_dir") or "").strip() or None
+    if work_dir:
+        work_dir = str(Path(work_dir).resolve())
     resolved_plan_id = _current_plan_id(plan_id)
     if not resolved_plan_id:
         raise SystemExit(
@@ -918,7 +970,10 @@ def _continue_with_claude(plan_id: str | None) -> None:
     task = _next_actionable_task(plan)
     if not task:
         raise SystemExit("No actionable tasks remain on this plan.")
-    prompt = _build_continue_prompt(plan, task)
+    prompt = _build_continue_prompt(plan, task, work_dir=work_dir)
+    steps = sorted(plan.get("plan_steps") or [], key=lambda s: s.get("order", 0))
+    done_count = len([s for s in steps if s.get("status") == "completed"])
+    total_count = len(steps)
     if _state.json:
         print_output(
             {
@@ -932,7 +987,8 @@ def _continue_with_claude(plan_id: str | None) -> None:
         return
     task_title = _clean(task.get("title")) or "next task"
     if sys.stdout.isatty():
-        print(f"Resuming: {task_title}")
+        progress = f"[{done_count}/{total_count}]"
+        print(f"{progress} Resuming: {task_title}")
         print("Run this in your Claude Code terminal for Claude to pick up the task.")
     else:
         print(prompt)
@@ -1282,7 +1338,9 @@ def _create_migration(
         target = _clean(template.get("target"))
 
         if not _state.json:
-            print(f"Collecting migration context for {source} -> {target} with Claude Code...")
+            print(
+                f"Collecting migration context for {source} -> {target} with Claude Code..."
+            )
 
         discovered_answer = _collect_discovery_answer_from_claude(template)
         answers.update(_extract_discovery_answers(template, discovered_answer))
@@ -1553,12 +1611,19 @@ def _config_set(
     personal: Annotated[
         bool, typer.Option("--personal", help="Use personal context.")
     ] = False,
+    work_dir: Annotated[
+        Optional[str], typer.Option("--dir", "-d", help="Default project directory.")
+    ] = None,
     clear_plan: Annotated[
         bool, typer.Option("--clear-plan", help="Clear saved plan context.")
     ] = False,
 ):
     """Set default workspace context."""
     updates: dict = {}
+    if work_dir is not None:
+        updates["default_work_dir"] = (
+            str(Path(work_dir).resolve()) if work_dir else None
+        )
     if api_url is not None:
         updates["api_url"] = _clean(api_url) or DEFAULT_API_URL
     if personal:
@@ -1691,9 +1756,17 @@ def _continue_command(
             "--plan-id", "-p", help="Plan ID. Uses saved plan context if omitted."
         ),
     ] = None,
+    work_dir: Annotated[
+        Optional[str],
+        typer.Option(
+            "--dir",
+            "-d",
+            help="Path to the codebase. Use when the project lives in a different directory.",
+        ),
+    ] = None,
 ):
     """Resume the next task from a plan. Only works inside Claude Code."""
-    _continue_with_claude(plan_id)
+    _continue_with_claude(plan_id, work_dir=work_dir)
 
 
 CLAUDE_COMMANDS_DIR = Path.home() / ".claude" / "commands"

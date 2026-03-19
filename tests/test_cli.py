@@ -1,7 +1,7 @@
+import base64
 import json
 import re
 import subprocess
-import base64
 from pathlib import Path
 
 import httpx
@@ -416,7 +416,9 @@ def test_create_migration_from_path_key_prompts_and_posts_payload(
 
     out = capsys.readouterr().out
     assert "Prepared migration draft for AWS Batch -> Airflow." in out
-    clarifier_call = next(call for call in fake_client.calls if call[1] == "/api/migrations/clarifiers")
+    clarifier_call = next(
+        call for call in fake_client.calls if call[1] == "/api/migrations/clarifiers"
+    )
     payload = clarifier_call[2]
     assert payload["input_method"] == "cli_agent"
     assert payload["custom_fields"]["batch_workloads"] == "scheduled ETL jobs"
@@ -506,15 +508,12 @@ def test_create_migration_from_path_key_requires_claude_code(fake_client, monkey
     assert exit_code == 1
 
 
-
 def _bypass_auth(monkeypatch):
     """Skip the auth check in continue so tests can focus on prompt output."""
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
 
 
-def test_continue_prints_prompt_with_task_context(
-    fake_client, monkeypatch, capsys
-):
+def test_continue_prints_prompt_with_task_context(fake_client, monkeypatch, capsys):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     _bypass_auth(monkeypatch)
@@ -522,15 +521,12 @@ def test_continue_prints_prompt_with_task_context(
     cli.main(["continue"])
 
     out = capsys.readouterr().out
-    assert "Current execution focus:" in out
-    assert "- Next task ID: review-schedules" in out
-    assert "- Next task title: Review EventBridge schedules" in out
+    assert "Task: Review EventBridge schedules" in out
+    assert "Task ID: review-schedules" in out
     assert "If this task is blocked, do not automatically move to the next task" in out
 
 
-def test_continue_prompt_includes_mcp_warning(
-    fake_client, monkeypatch, capsys
-):
+def test_continue_prompt_includes_mcp_warning(fake_client, monkeypatch, capsys):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     _bypass_auth(monkeypatch)
@@ -541,9 +537,7 @@ def test_continue_prompt_includes_mcp_warning(
     assert "Do NOT use Keshro MCP tools" in out
 
 
-def test_continue_prompt_includes_ask_before_continue(
-    fake_client, monkeypatch, capsys
-):
+def test_continue_prompt_includes_ask_before_continue(fake_client, monkeypatch, capsys):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     _bypass_auth(monkeypatch)
@@ -554,9 +548,7 @@ def test_continue_prompt_includes_ask_before_continue(
     assert "ask the user if they want to continue to the next task" in out
 
 
-def test_continue_prompt_includes_error_guidance(
-    fake_client, monkeypatch, capsys
-):
+def test_continue_prompt_includes_error_guidance(fake_client, monkeypatch, capsys):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     _bypass_auth(monkeypatch)
@@ -581,7 +573,6 @@ def test_continue_prompt_does_not_tell_claude_to_refetch(
     assert "Start by grounding" not in out
 
 
-
 def test_continue_exits_when_not_authenticated(fake_client, monkeypatch):
     monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: {})
     monkeypatch.setattr("keshro_cli.client.load_auth", lambda: {})
@@ -595,17 +586,24 @@ def test_continue_exits_when_token_expired(fake_client, monkeypatch):
         "keshro_cli.cli.load_auth",
         lambda: {"token": "expired-token", "default_plan_id": "plan-123"},
     )
-    monkeypatch.setattr("keshro_cli.client.load_auth", lambda: {"token": "expired-token"})
+    monkeypatch.setattr(
+        "keshro_cli.client.load_auth", lambda: {"token": "expired-token"}
+    )
 
     def _fake_make_client(*args, **kwargs):
         class _ExpiredClient:
             def __enter__(self):
                 return self
+
             def __exit__(self, *a):
                 return False
+
             def get(self, path, **kw):
                 resp = httpx.Response(401, request=httpx.Request("GET", path))
-                raise httpx.HTTPStatusError("Unauthorized", request=resp.request, response=resp)
+                raise httpx.HTTPStatusError(
+                    "Unauthorized", request=resp.request, response=resp
+                )
+
         return _ExpiredClient()
 
     monkeypatch.setattr("keshro_cli.cli.make_client", _fake_make_client)
