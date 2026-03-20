@@ -498,33 +498,45 @@ def _build_path_discovery_prompt(template: dict) -> str:
 def _build_agent_discovery_prompt(template: dict) -> str:
     source = _clean(template.get("source")) or "Source"
     target = _clean(template.get("target")) or "Target"
-    return "\n".join(
-        [
-            f"You are helping create a Keshro migration for {source} -> {target}.",
-            "Inspect the current workspace and gather the path-specific migration facts.",
-            "Return only the completed markdown template below with the same headings and field labels.",
-            "Do not wrap the answer in code fences. Do not add commentary before or after the template.",
-            "Use `Unknown` for values you cannot verify from the repository, configs, or local docs.",
-            "",
-            _build_path_discovery_prompt(template),
-        ]
-    )
+    discovery_commands = template.get("discovery_commands") or []
+    parts = [
+        f"You are helping create a Keshro migration for {source} -> {target}.",
+        "Inspect the current workspace and gather the path-specific migration facts.",
+        "Return only the completed markdown template below with the same headings and field labels.",
+        "Do not wrap the answer in code fences. Do not add commentary before or after the template.",
+        "Use `Unknown` for values you cannot verify from the repository, configs, or local docs.",
+    ]
+    if discovery_commands:
+        parts.append("")
+        parts.append(
+            "Try running these commands to discover relevant context. "
+            "These are best-effort — if a command fails (tool not installed, no access, permission denied, etc.), "
+            "note which command failed and why in a single line, then continue with what you can find from files and configs. "
+            "Do not stop or error out if a discovery command fails."
+        )
+        for cmd in discovery_commands:
+            parts.append(f"  $ {cmd}")
+    parts.append("")
+    parts.append(_build_path_discovery_prompt(template))
+    return "\n".join(parts)
 
 
-def _collect_discovery_answer_from_claude(template: dict) -> str:
+def _collect_discovery_answer_from_claude(
+    template: dict, work_dir: str | None = None
+) -> str:
     prompt = _build_agent_discovery_prompt(template)
     return _run_prompt_in_claude(
         prompt,
         missing_env_message=(
-            "This command is only supported inside Claude Code right now. Run it from a Claude Code session, or use the prompt copy/paste path in Keshro instead."
+            "This command needs to run inside a coding agent so it can scan your codebase.\n"
+            "Run it from your agent's terminal, or use the prompt copy/paste path in Keshro instead."
         ),
         missing_binary_message=(
-            "This command is only supported inside Claude Code right now. If Claude Code is not available here, use the prompt copy/paste path in Keshro instead."
+            "Could not find a coding agent binary. Make sure you're running this from within your agent's terminal."
         ),
-        failure_message_prefix=(
-            "This command is only supported inside Claude Code right now. Claude Code returned: "
-        ),
+        failure_message_prefix=("Coding agent returned an error: "),
         empty_message="Claude agent returned no discovery response.",
+        work_dir=work_dir,
     )
 
 
@@ -535,12 +547,14 @@ def _run_prompt_in_claude(
     missing_binary_message: str,
     failure_message_prefix: str,
     empty_message: str,
+    work_dir: str | None = None,
 ) -> str:
     if sys.stdout.isatty():
         raise SystemExit(missing_env_message)
     claude_bin = shutil.which("claude")
     if not claude_bin:
         raise SystemExit(missing_binary_message)
+    resolved_dir = str(Path(work_dir).resolve()) if work_dir else os.getcwd()
     result = subprocess.run(
         [
             claude_bin,
@@ -551,16 +565,18 @@ def _run_prompt_in_claude(
             "--permission-mode",
             "auto",
             "--add-dir",
-            os.getcwd(),
+            resolved_dir,
             "--no-session-persistence",
         ],
         capture_output=True,
         text=True,
-        cwd=os.getcwd(),
+        cwd=resolved_dir,
         check=False,
     )
     if result.returncode != 0:
-        detail = _clean(result.stderr) or _clean(result.stdout) or "Claude Code failed."
+        detail = (
+            _clean(result.stderr) or _clean(result.stdout) or "Coding agent failed."
+        )
         raise SystemExit(f"{failure_message_prefix}{detail}")
     answer = _clean(result.stdout)
     if not answer:
@@ -657,7 +673,7 @@ def _build_clarifier_prompt(
 
 
 def _collect_clarifier_answers_from_claude(
-    template: dict, payload: dict, questions: list[dict]
+    template: dict, payload: dict, questions: list[dict], work_dir: str | None = None
 ) -> dict[str, str]:
     if not questions:
         return {}
@@ -665,15 +681,15 @@ def _collect_clarifier_answers_from_claude(
     raw = _run_prompt_in_claude(
         prompt,
         missing_env_message=(
-            "This command is only supported inside Claude Code right now. Run it from a Claude Code session, or use the prompt copy/paste path in Keshro instead."
+            "This command needs to run inside a coding agent so it can scan your codebase.\n"
+            "Run it from your agent's terminal, or use the prompt copy/paste path in Keshro instead."
         ),
         missing_binary_message=(
-            "This command is only supported inside Claude Code right now. If Claude Code is not available here, use the prompt copy/paste path in Keshro instead."
+            "Could not find a coding agent binary. Make sure you're running this from within your agent's terminal."
         ),
-        failure_message_prefix=(
-            "This command is only supported inside Claude Code right now. Claude Code returned: "
-        ),
-        empty_message="Claude agent returned no clarifier answers.",
+        failure_message_prefix="Coding agent returned an error: ",
+        empty_message="Coding agent returned no clarifier answers.",
+        work_dir=work_dir,
     )
     parsed = _parse_discovery_key_values(raw)
     answers: dict[str, str] = {}
@@ -745,13 +761,15 @@ def _encode_prefill_draft(payload: dict) -> str:
     return encoded.rstrip("=")
 
 
-def _render_prefill_handoff(payload: dict, template: dict) -> None:
+def _render_prefill_handoff(
+    payload: dict, template: dict, work_dir: str | None = None
+) -> None:
     if _state.json:
         print_output(payload, True)
         return
     source = _clean(template.get("source")) or "Unknown source"
     target = _clean(template.get("target")) or "Unknown target"
-    print(f"Prepared migration draft for {source} -> {target}.")
+    print(f"\nPrepared migration draft for {source} -> {target}.")
     query = urlencode(
         {
             "source": source,
@@ -767,7 +785,15 @@ def _render_prefill_handoff(payload: dict, template: dict) -> None:
         webbrowser.open(url)
     except Exception:
         pass
-    print(f"Open this URL to answer follow-up questions and start the analysis:\n{url}")
+    base = f"{_app_url_from_api_url(_state.api_url)}/new"
+    print(
+        f"\nContinue here to answer follow-up questions and start the analysis:\n{base}?...\n"
+    )
+    print(f"Full URL (if browser didn't open):\n{url}\n")
+    if not work_dir:
+        print(
+            "Tip: Use --dir to point to your project directory for better auto-discovery."
+        )
 
 
 def _connected_delivery_label_from_plan(plan: dict) -> str | None:
@@ -842,7 +868,9 @@ Rules:
 - If you need more detail on any task, use `keshro task view <task-id> -p {resolved_plan_id}`."""
 
 
-def _build_continue_prompt(plan: dict, task: dict, work_dir: str | None = None, auto_continue: bool = False) -> str:
+def _build_continue_prompt(
+    plan: dict, task: dict, work_dir: str | None = None, auto_continue: bool = False
+) -> str:
     resolved_plan_id = _clean(plan.get("id")) or "<plan-id>"
     connected_delivery_label = _connected_delivery_label_from_plan(plan)
     source = _clean(plan.get("source_type"))
@@ -890,7 +918,7 @@ def _build_continue_prompt(plan: dict, task: dict, work_dir: str | None = None, 
         history_lines.append(f"- {len(completed_steps)} done, {remaining} remaining")
         history_lines.append("")
 
-    # Task context first (this is what shows in the collapsed Claude Code preview)
+    # Task context first (this is what shows in the collapsed agent output preview)
     done_count = len(completed_steps)
     total_count = len(steps)
     progress_line = f"[{done_count}/{total_count} done]" if done_count > 0 else ""
@@ -925,7 +953,7 @@ def _build_continue_prompt(plan: dict, task: dict, work_dir: str | None = None, 
             f"`keshro task next -p {resolved_plan_id}` and continue working. "
             "Still create checkpoints, record notes, and mark tasks done — but do not pause to ask the user between tasks. "
             "If a task fails (tests don't pass, code doesn't compile, validation fails), mark it blocked with "
-            f"`keshro task block <task-id> -p {resolved_plan_id} -r \"...\"` and stop. "
+            f'`keshro task block <task-id> -p {resolved_plan_id} -r "..."` and stop. '
             "Tell the user what failed and why. Do not skip to the next task."
         )
 
@@ -968,7 +996,9 @@ def _ensure_authenticated() -> None:
         raise
 
 
-def _continue_with_claude(plan_id: str | None, work_dir: str | None = None, auto_continue: bool = False) -> None:
+def _continue_with_claude(
+    plan_id: str | None, work_dir: str | None = None, auto_continue: bool = False
+) -> None:
     _ensure_authenticated()
     if not work_dir:
         work_dir = (load_auth().get("default_work_dir") or "").strip() or None
@@ -983,7 +1013,9 @@ def _continue_with_claude(plan_id: str | None, work_dir: str | None = None, auto
     task = _next_actionable_task(plan)
     if not task:
         raise SystemExit("No actionable tasks remain on this plan.")
-    prompt = _build_continue_prompt(plan, task, work_dir=work_dir, auto_continue=auto_continue)
+    prompt = _build_continue_prompt(
+        plan, task, work_dir=work_dir, auto_continue=auto_continue
+    )
     steps = sorted(plan.get("plan_steps") or [], key=lambda s: s.get("order", 0))
     done_count = len([s for s in steps if s.get("status") == "completed"])
     total_count = len(steps)
@@ -1002,7 +1034,9 @@ def _continue_with_claude(plan_id: str | None, work_dir: str | None = None, auto
     if sys.stdout.isatty():
         progress = f"[{done_count}/{total_count}]"
         print(f"{progress} Resuming: {task_title}")
-        print("Run this in your Claude Code terminal for Claude to pick up the task.")
+        print(
+            "Run this in your coding agent's terminal for your agent to pick up the task."
+        )
     else:
         print(prompt)
 
@@ -1334,14 +1368,75 @@ def _create_migration(
     org_id: Annotated[
         Optional[str], typer.Option("--org-id", "-o", help="Create under an org.")
     ] = None,
+    work_dir: Annotated[
+        Optional[str],
+        typer.Option(
+            "--dir",
+            "-d",
+            help="Path to the project codebase. Defaults to current directory.",
+        ),
+    ] = None,
+    repo_url: Annotated[
+        Optional[str],
+        typer.Option(
+            "--repo",
+            "-r",
+            help="Git repo URL to clone and scan. Cloned to a temp directory.",
+        ),
+    ] = None,
 ):
     """Create a migration project from a stable path key. Requires a coding agent that can run shell commands."""
     if sys.stdout.isatty():
         raise SystemExit(
-            "This command needs to run inside a coding agent (e.g. Claude Code) so it can scan your codebase.\n"
+            "This command needs to run inside a coding agent so it can scan your codebase.\n"
             "Run it from your agent's terminal, or use the prompt copy/paste path in Keshro instead."
         )
+    import tempfile
+
     answers = _parse_field_assignments(field)
+    clone_dir = None
+    if repo_url and not work_dir:
+        clone_dir = tempfile.mkdtemp(prefix="keshro-clone-")
+        if not _state.json:
+            print(f"Cloning {repo_url}...")
+        clone_result = subprocess.run(
+            ["git", "clone", "--depth", "1", repo_url, clone_dir],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if clone_result.returncode != 0:
+            raise SystemExit(
+                f"Failed to clone {repo_url}: {_clean(clone_result.stderr)}"
+            )
+        work_dir = clone_dir
+
+    try:
+        return _create_migration_inner(
+            path,
+            answers,
+            context,
+            github_url,
+            resource_url,
+            org_id,
+            work_dir,
+        )
+    finally:
+        if clone_dir:
+            import shutil as _shutil
+
+            _shutil.rmtree(clone_dir, ignore_errors=True)
+
+
+def _create_migration_inner(
+    path: str,
+    answers: dict,
+    context: str | None,
+    github_url: str | None,
+    resource_url: str | None,
+    org_id: str | None,
+    work_dir: str | None,
+) -> None:
     with make_client(_state.api_url, _state.token) as client:
         template_res = client.get(
             "/api/migrations/path-template/lookup", params={"template_key": path}
@@ -1352,22 +1447,26 @@ def _create_migration(
         target = _clean(template.get("target"))
 
         if not _state.json:
-            print(
-                f"Collecting migration context for {source} -> {target} with Claude Code..."
-            )
+            print(f"Collecting migration context for {source} -> {target}...")
 
-        discovered_answer = _collect_discovery_answer_from_claude(template)
-        answers.update(_extract_discovery_answers(template, discovered_answer))
+        resolved_work_dir = str(Path(work_dir).resolve()) if work_dir else None
+        discovered_answer = _collect_discovery_answer_from_claude(
+            template, work_dir=resolved_work_dir
+        )
+        extracted = _extract_discovery_answers(template, discovered_answer)
+        # Don't overwrite manually provided -f values with empty extracted values
+        for key, value in extracted.items():
+            if key not in answers or not answers[key]:
+                answers[key] = value
 
         required_fields = [
             _clean(item.get("label")) or _clean(item.get("id"))
             for item in (template.get("fields") or [])
             if item.get("required") and not answers.get(_clean(item.get("id")))
         ]
-        if required_fields:
-            raise SystemExit(
-                "Claude Code did not return all required discovery fields: "
-                + ", ".join(required_fields)
+        if required_fields and not _state.json:
+            print(
+                f"Some fields couldn't be discovered automatically: {', '.join(required_fields)}"
             )
 
         merged_context = f"CLI bootstrap for {source} -> {target}."
@@ -1416,16 +1515,16 @@ def _create_migration(
         clarifier_questions = _get_migration_clarifiers(client, payload)
         if clarifier_questions:
             if not _state.json:
-                print("Collecting follow-up answers with Claude Code...")
+                print("Collecting follow-up answers...")
             clarifier_answers = _collect_clarifier_answers_from_claude(
-                template, payload, clarifier_questions
+                template, payload, clarifier_questions, work_dir=resolved_work_dir
             )
             payload = _merge_clarifier_answers(
                 payload, clarifier_questions, clarifier_answers
             )
         elif not _state.json:
             print("No additional follow-up questions needed.")
-    _render_prefill_handoff(payload, template)
+    _render_prefill_handoff(payload, template, work_dir=resolved_work_dir)
 
 
 @migration_app.command("list")
