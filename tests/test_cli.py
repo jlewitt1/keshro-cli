@@ -412,6 +412,7 @@ def test_create_migration_from_path_key_prompts_and_posts_payload(
         )
 
     monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr("webbrowser.open", lambda url: None)
     cli.main(["create", "--path", "aws-batch-to-airflow"])
 
     out = capsys.readouterr().out

@@ -1,6 +1,13 @@
 # Keshro CLI
 
-Thin CLI for the Keshro API. The main command is `keshro continue` which prints an execution prompt for Claude Code to follow.
+Thin CLI for the Keshro API. The main command is `keshro continue` which prints an execution prompt for your coding agent to follow.
+
+## Important: Keep docs in sync
+
+When changing CLI commands (adding flags, renaming, changing behavior), always update:
+- `../keshro/frontend/src/app/developers/page.tsx` — the `/developers` page command reference
+- `README.md` — this repo's README
+- `../keshro-mcp/README.md` — if the CLI vs MCP comparison table is affected
 
 ## Related repos
 

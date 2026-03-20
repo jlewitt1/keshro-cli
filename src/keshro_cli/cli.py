@@ -806,20 +806,11 @@ IMPORTANT: Use `keshro` CLI commands to interact with Keshro. Do NOT use Keshro 
 
 The current task and plan context are provided below. Do not re-fetch them with `keshro plan view` or `keshro task next` — start working directly.
 
+Style:
+- Be concise. Do not narrate your thought process — just do the work and report what you did.
+- Before running any keshro command or git checkpoint, print one short sentence explaining why (e.g. "Marking task as in progress."). Then run the command.
+
 Treat Keshro as the live execution record. When meaningful task progress happens, write it back while the work is happening rather than waiting until the end.
-
-Before running any keshro command or git checkpoint, always print a short human-readable message explaining what you are doing and why. The user should understand the purpose before seeing the command output.
-
-Examples:
-- "Creating a checkpoint before starting this task." then run the git commit.
-- "Marking this task as in progress in Keshro." then run `keshro task start`.
-- "Recording a note about what was discovered." then run `keshro task note`.
-- "Attaching this PR as an artifact." then run `keshro task artifact`.
-- "Flagging a blocker in Keshro." then run `keshro task block`.
-- "Clearing the blocker — resuming work." then run `keshro task unblock`.
-- "Recording the completion summary." then run `keshro task note` with the summary.
-- "Marking this task as done in Keshro." then run `keshro task done`.
-- "Recording a plan change." then run `keshro plan replan-notes`.
 
 During execution:
 - run `keshro task start <task-id> -p {resolved_plan_id}` as soon as work begins
@@ -831,7 +822,7 @@ During execution:
 - when you create or modify files, record them with `keshro task note` — list the specific files and what changed
 
 When a task is done:
-- before marking done, record a completion note with `keshro task note <task-id> -p {resolved_plan_id} -n "..."` summarizing: files created/modified, key decisions made, and anything the next task should know
+- record a completion note using this format: `keshro task note <task-id> -p {resolved_plan_id} -n "Files created: ... | Files modified: ... | Key decisions: ... | Next task should know: ..."`
 - ask the user to confirm the task is complete before running `keshro task done`
 - after `keshro task done`, summarize what was accomplished and ask the user if they want to continue to the next task
 - do not automatically start the next task without the user's go-ahead
@@ -841,7 +832,7 @@ Ask the user first before:
 - task deletion
 - major replans that change scope, sequencing, or {connected_delivery_label or "linked delivery work"}
 
-If a keshro command fails, tell the user what happened and continue working on the migration code. Do not retry failed keshro commands unless the user asks.
+If a keshro command fails with a connection error, retry once after 5 seconds. For any other error, tell the user what happened and continue working on the code. Do not retry more than once unless the user asks.
 
 Rules:
 - Keep updates concise, factual, and specific.
@@ -851,7 +842,7 @@ Rules:
 - If you need more detail on any task, use `keshro task view <task-id> -p {resolved_plan_id}`."""
 
 
-def _build_continue_prompt(plan: dict, task: dict, work_dir: str | None = None) -> str:
+def _build_continue_prompt(plan: dict, task: dict, work_dir: str | None = None, auto_continue: bool = False) -> str:
     resolved_plan_id = _clean(plan.get("id")) or "<plan-id>"
     connected_delivery_label = _connected_delivery_label_from_plan(plan)
     source = _clean(plan.get("source_type"))
@@ -928,6 +919,15 @@ def _build_continue_prompt(plan: dict, task: dict, work_dir: str | None = None) 
         "- If you continue execution, keep Keshro updated as you work.",
         "- Before marking a task done, verify your changes: run linters, check syntax, or run relevant tests if they exist. Record the validation result in your completion note.",
     ]
+    if auto_continue:
+        continuation.append(
+            "- AUTO-CONTINUE MODE: After completing each task, automatically pull the next task with "
+            f"`keshro task next -p {resolved_plan_id}` and continue working. "
+            "Still create checkpoints, record notes, and mark tasks done — but do not pause to ask the user between tasks. "
+            "If a task fails (tests don't pass, code doesn't compile, validation fails), mark it blocked with "
+            f"`keshro task block <task-id> -p {resolved_plan_id} -r \"...\"` and stop. "
+            "Tell the user what failed and why. Do not skip to the next task."
+        )
 
     parts = [
         *task_block,
@@ -968,7 +968,7 @@ def _ensure_authenticated() -> None:
         raise
 
 
-def _continue_with_claude(plan_id: str | None, work_dir: str | None = None) -> None:
+def _continue_with_claude(plan_id: str | None, work_dir: str | None = None, auto_continue: bool = False) -> None:
     _ensure_authenticated()
     if not work_dir:
         work_dir = (load_auth().get("default_work_dir") or "").strip() or None
@@ -983,7 +983,7 @@ def _continue_with_claude(plan_id: str | None, work_dir: str | None = None) -> N
     task = _next_actionable_task(plan)
     if not task:
         raise SystemExit("No actionable tasks remain on this plan.")
-    prompt = _build_continue_prompt(plan, task, work_dir=work_dir)
+    prompt = _build_continue_prompt(plan, task, work_dir=work_dir, auto_continue=auto_continue)
     steps = sorted(plan.get("plan_steps") or [], key=lambda s: s.get("order", 0))
     done_count = len([s for s in steps if s.get("status") == "completed"])
     total_count = len(steps)
@@ -1778,9 +1778,16 @@ def _continue_command(
             help="Path to the codebase. Use when the project lives in a different directory.",
         ),
     ] = None,
+    auto_continue: Annotated[
+        bool,
+        typer.Option(
+            "--all",
+            help="Auto-continue through tasks without asking after each one.",
+        ),
+    ] = False,
 ):
-    """Resume the next task from a plan. Only works inside Claude Code."""
-    _continue_with_claude(plan_id, work_dir=work_dir)
+    """Resume the next task from a plan. Only works inside a coding agent."""
+    _continue_with_claude(plan_id, work_dir=work_dir, auto_continue=auto_continue)
 
 
 CLAUDE_COMMANDS_DIR = Path.home() / ".claude" / "commands"
