@@ -77,16 +77,29 @@ Auth state is stored in `~/.keshro/auth.json`.
 ### Execution
 
 ```bash
-keshro continue -p <plan-id>                    # Resume from next task in Claude Code
-keshro continue -p <plan-id> --dir /path/to/repo # Point Claude at a different codebase
-keshro setup-claude                              # Install global Claude Code slash command
+keshro continue -p <plan-id>                      # Resume next task
+keshro continue -p <plan-id> --confirm             # Approve and execute a draft plan
+keshro continue -p <plan-id> --all                 # Auto-continue through all tasks
+keshro continue -p <plan-id> --dir /path/to/repo   # Point agent at a different codebase
+keshro continue -p <plan-id> --no-parallel         # Resume your own in-progress task
+keshro status -p <plan-id>                         # Live dashboard of all tasks and agents
+keshro status --watch                              # Auto-refresh every 10 seconds
+keshro setup-claude                                # Install global Claude Code slash command
 ```
 
 Features built into `keshro continue`:
-- **Session history** — includes completed task summaries so Claude knows what was already done
-- **Git checkpoints** — creates a commit before each task so changes can be rolled back
-- **Validation gates** — Claude verifies changes (linters, tests, syntax) before marking done
-- **Multi-repo** — `--dir` flag lets you point Claude at a codebase in a different directory
+- **Draft plan review** — draft plans show all tasks and require `--confirm` before first execution
+- **Parallel agents** — multiple agents run `continue` on the same plan; each picks up a different task respecting dependencies
+- **Task dependencies** — `depends_on` fields prevent tasks from starting until prerequisites are completed. Auto-detected during plan generation.
+- **Task splitting** — parallelizable tasks are auto-split into sub-tasks that other agents pick up. The agent creates sub-tasks, marks the parent done, and starts on the first sub-task.
+- **Task handoff** — "Next task should know:" notes from completed tasks are extracted and injected into the next task's prompt
+- **Session history** — completed task summaries + git changes since last session
+- **Git checkpoints** — auto-commit before each task for rollback
+- **Validation gates** — verifies changes before marking done
+- **Auto-continue** — `--all` runs through tasks without pausing
+- **Agent session IDs** — each session gets a unique ID for multi-agent tracking
+- **Multi-repo** — `--dir` and `--repo` to point at any codebase
+- **Git-aware resume** — detects repo changes since last checkpoint
 
 ### Plan management
 
