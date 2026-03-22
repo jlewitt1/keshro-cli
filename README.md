@@ -77,16 +77,20 @@ Auth state is stored in `~/.keshro/auth.json`.
 ### Execution
 
 ```bash
-keshro continue -p <plan-id>                    # Resume from next task in Claude Code
-keshro continue -p <plan-id> --dir /path/to/repo # Point Claude at a different codebase
-keshro setup-claude                              # Install global Claude Code slash command
+keshro continue -p <plan-id>                      # Resume next task
+keshro continue -p <plan-id> --all                 # Auto-continue through all tasks
+keshro continue -p <plan-id> --dir /path/to/repo   # Point agent at a different codebase
+keshro continue -p <plan-id> --no-parallel         # Resume your own in-progress task
+keshro setup-claude                                # Install global Claude Code slash command
 ```
 
 Features built into `keshro continue`:
-- **Session history** — includes completed task summaries so Claude knows what was already done
+- **Parallel agents** — multiple agents can run `continue` on the same plan; each picks up a different task automatically (default behavior)
+- **Session history** — includes completed task summaries so your agent knows what was already done
 - **Git checkpoints** — creates a commit before each task so changes can be rolled back
-- **Validation gates** — Claude verifies changes (linters, tests, syntax) before marking done
-- **Multi-repo** — `--dir` flag lets you point Claude at a codebase in a different directory
+- **Validation gates** — verifies changes (linters, tests, syntax) before marking done
+- **Auto-continue** — `--all` flag works through tasks without pausing between them
+- **Multi-repo** — `--dir` flag points the agent at a codebase in a different directory
 
 ### Plan management
 

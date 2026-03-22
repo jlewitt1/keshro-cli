@@ -45,10 +45,21 @@ The CLI is a thin HTTP client. It does not contain business logic — all state 
 
 `keshro continue` works by:
 1. Checking auth (`_ensure_authenticated`)
-2. Fetching the plan and finding the next task
-3. Printing an execution prompt to stdout
-4. Claude Code reads stdout and follows the instructions
-5. When stdout is a TTY (not Claude Code), it shows a short status line instead
+2. Generating a unique session ID (`agent-<hex>`) for multi-agent tracking
+3. Fetching the plan and finding the next task (skips in-progress tasks in parallel mode)
+4. Detecting git changes since the last keshro checkpoint (`_get_git_state_summary`)
+5. Building session history from completed tasks
+6. Printing an execution prompt to stdout
+7. The coding agent reads stdout and follows the instructions
+8. When stdout is a TTY (not an agent), it shows a short status line instead
+
+Key execution features in the prompt:
+- Git checkpoints before each task
+- Validation gates before marking done
+- Standardized completion note format
+- Auto-continue mode (`--all`)
+- Parallel agent assignment (default on)
+- Error retry for connection failures
 
 ## Code conventions
 

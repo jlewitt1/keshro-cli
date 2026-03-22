@@ -868,8 +868,91 @@ Rules:
 - If you need more detail on any task, use `keshro task view <task-id> -p {resolved_plan_id}`."""
 
 
+def _get_git_state_summary(work_dir: str | None = None) -> str:
+    """Detect what changed in the repo since the last keshro checkpoint."""
+    cwd = work_dir or None
+    try:
+        # Find last keshro checkpoint commit
+        last_checkpoint = subprocess.run(
+            [
+                "git",
+                "log",
+                "--oneline",
+                "--grep=keshro: checkpoint",
+                "-1",
+                "--format=%H",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+            check=False,
+        )
+        checkpoint_hash = (last_checkpoint.stdout or "").strip()
+
+        if checkpoint_hash:
+            # Get changes since checkpoint
+            diff_stat = subprocess.run(
+                ["git", "diff", "--stat", checkpoint_hash, "HEAD"],
+                capture_output=True,
+                text=True,
+                cwd=cwd,
+                check=False,
+            )
+            log_result = subprocess.run(
+                ["git", "log", "--oneline", f"{checkpoint_hash}..HEAD"],
+                capture_output=True,
+                text=True,
+                cwd=cwd,
+                check=False,
+            )
+            commits = [
+                l.strip()
+                for l in (log_result.stdout or "").strip().splitlines()
+                if l.strip()
+            ]
+            stat = (diff_stat.stdout or "").strip()
+
+            if not commits and not stat:
+                return ""
+
+            lines = ["Changes since last keshro checkpoint:"]
+            if commits:
+                lines.append(
+                    f"- {len(commits)} commit{'s' if len(commits) != 1 else ''}: {', '.join(c.split(' ', 1)[1] if ' ' in c else c for c in commits[:5])}"
+                )
+            if stat:
+                # Get just the summary line (last line of diff --stat)
+                summary_line = stat.strip().splitlines()[-1] if stat.strip() else ""
+                if summary_line:
+                    lines.append(f"- {summary_line.strip()}")
+            return "\n".join(lines)
+        else:
+            # No checkpoint found — show recent status
+            status = subprocess.run(
+                ["git", "status", "--short"],
+                capture_output=True,
+                text=True,
+                cwd=cwd,
+                check=False,
+            )
+            changed = [
+                l.strip()
+                for l in (status.stdout or "").strip().splitlines()
+                if l.strip()
+            ]
+            if changed:
+                return f"Working tree: {len(changed)} file{'s' if len(changed) != 1 else ''} modified (no prior keshro checkpoint found)"
+            return ""
+    except Exception:
+        return ""
+
+
 def _build_continue_prompt(
-    plan: dict, task: dict, work_dir: str | None = None, auto_continue: bool = False
+    plan: dict,
+    task: dict,
+    work_dir: str | None = None,
+    auto_continue: bool = False,
+    session_id: str = "",
 ) -> str:
     resolved_plan_id = _clean(plan.get("id")) or "<plan-id>"
     connected_delivery_label = _connected_delivery_label_from_plan(plan)
@@ -918,6 +1001,13 @@ def _build_continue_prompt(
         history_lines.append(f"- {len(completed_steps)} done, {remaining} remaining")
         history_lines.append("")
 
+    # Git state since last checkpoint
+    git_state = _get_git_state_summary(work_dir)
+    git_lines: list[str] = []
+    if git_state:
+        git_lines.append(git_state)
+        git_lines.append("")
+
     # Task context first (this is what shows in the collapsed agent output preview)
     done_count = len(completed_steps)
     total_count = len(steps)
@@ -926,7 +1016,7 @@ def _build_continue_prompt(
         f"Task: {task_title} {progress_line}".strip(),
         f"Description: {task_description}",
         f"Status: {task_status}",
-        f"Plan: {resolved_plan_id} | Task ID: {task_id}",
+        f"Plan: {resolved_plan_id} | Task ID: {task_id} | Session: {session_id}",
     ]
     if blocked_reason:
         task_block.append(f"Blocker: {blocked_reason}")
@@ -960,6 +1050,7 @@ def _build_continue_prompt(
     parts = [
         *task_block,
         "",
+        *git_lines,
         *history_lines,
         base,
         *continuation,
@@ -997,9 +1088,15 @@ def _ensure_authenticated() -> None:
 
 
 def _continue_with_claude(
-    plan_id: str | None, work_dir: str | None = None, auto_continue: bool = False
+    plan_id: str | None,
+    work_dir: str | None = None,
+    auto_continue: bool = False,
+    parallel: bool = True,
 ) -> None:
+    import uuid as _uuid
+
     _ensure_authenticated()
+    session_id = f"agent-{_uuid.uuid4().hex[:8]}"
     if not work_dir:
         work_dir = (load_auth().get("default_work_dir") or "").strip() or None
     if work_dir:
@@ -1010,11 +1107,15 @@ def _continue_with_claude(
             "Plan context required. Pass --plan-id <plan-id> or save one with `keshro config set --plan-id <plan-id>`."
         )
     plan = _get_plan_or_exit(resolved_plan_id)
-    task = _next_actionable_task(plan)
+    task = _next_actionable_task(plan, parallel=parallel)
     if not task:
         raise SystemExit("No actionable tasks remain on this plan.")
     prompt = _build_continue_prompt(
-        plan, task, work_dir=work_dir, auto_continue=auto_continue
+        plan,
+        task,
+        work_dir=work_dir,
+        auto_continue=auto_continue,
+        session_id=session_id,
     )
     steps = sorted(plan.get("plan_steps") or [], key=lambda s: s.get("order", 0))
     done_count = len([s for s in steps if s.get("status") == "completed"])
@@ -1072,8 +1173,23 @@ def _find_task(plan: dict, task_id: str) -> dict | None:
     )
 
 
-def _next_actionable_task(plan: dict) -> dict | None:
+def _next_actionable_task(plan: dict, parallel: bool = False) -> dict | None:
     steps = sorted(plan.get("plan_steps") or [], key=lambda step: step.get("order", 0))
+    if parallel:
+        # In parallel mode: skip in_progress tasks (another agent owns them),
+        # only pick up todo tasks with no blocked earlier tasks
+        for step in steps:
+            if _clean(step.get("status") or "todo").lower() != "todo":
+                continue
+            blocked_earlier = any(
+                _clean(s.get("status")).lower() == "blocked"
+                for s in steps
+                if s.get("order", 0) < step.get("order", 0)
+            )
+            if not blocked_earlier:
+                return step
+        return None
+    # Default: pick up in_progress first (resume), then first todo
     for desired_status in ("in_progress", "todo"):
         match = next(
             (
@@ -1884,9 +2000,18 @@ def _continue_command(
             help="Auto-continue through tasks without asking after each one.",
         ),
     ] = False,
+    parallel: Annotated[
+        bool,
+        typer.Option(
+            "--parallel/--no-parallel",
+            help="Skip tasks already in progress by other agents. Default: on.",
+        ),
+    ] = True,
 ):
     """Resume the next task from a plan. Only works inside a coding agent."""
-    _continue_with_claude(plan_id, work_dir=work_dir, auto_continue=auto_continue)
+    _continue_with_claude(
+        plan_id, work_dir=work_dir, auto_continue=auto_continue, parallel=parallel
+    )
 
 
 CLAUDE_COMMANDS_DIR = Path.home() / ".claude" / "commands"
@@ -2078,6 +2203,203 @@ def _plan_view(
             return
         context_label = _current_context_label() if _current_org_id() else None
         _print_plan_detail(plan, context_label=context_label)
+
+
+def _print_plan_status(plan: dict) -> None:
+    """Print a compact live-status dashboard for a plan."""
+    from datetime import datetime, timezone
+
+    title = _clean(plan.get("title")) or "Untitled plan"
+    source = _clean(plan.get("source_type")) or ""
+    target = _clean(plan.get("target_type")) or ""
+    path_label = f"{source} → {target}" if source and target else ""
+    steps = sorted(plan.get("plan_steps") or [], key=lambda s: s.get("order", 0))
+    events = plan.get("task_feedback_events") or []
+
+    done = [s for s in steps if _clean(s.get("status")).lower() == "completed"]
+    in_progress = [s for s in steps if _clean(s.get("status")).lower() == "in_progress"]
+    blocked = [s for s in steps if _clean(s.get("status")).lower() == "blocked"]
+    todo = [s for s in steps if _clean(s.get("status")).lower() == "todo"]
+
+    # Header
+    print(
+        f"\n{CYAN}{title}{RESET} {DIM}{path_label}{RESET} [{len(done)}/{len(steps)} done]"
+    )
+    print()
+
+    # Status symbols
+    STATUS_ICON = {
+        "completed": f"{GREEN}✓{RESET}",
+        "in_progress": f"{YELLOW}●{RESET}",
+        "blocked": f"{RED}✗{RESET}",
+        "todo": f"{DIM}○{RESET}",
+    }
+
+    # Find latest event per task for agent/timing info
+    task_latest_event: dict[str, dict] = {}
+    for event in events:
+        tid = event.get("task_id") or ""
+        existing = task_latest_event.get(tid)
+        if not existing or (event.get("created_at") or "") > (
+            existing.get("created_at") or ""
+        ):
+            task_latest_event[tid] = event
+
+    now = datetime.now(timezone.utc)
+
+    for step in steps:
+        status = _clean(step.get("status") or "todo").lower()
+        icon = STATUS_ICON.get(status, "?")
+        order = step.get("order", 0)
+        step_title = _clean(step.get("title")) or "Untitled"
+        step_id = step.get("id") or ""
+
+        # Build right-side info
+        info_parts: list[str] = []
+        latest = task_latest_event.get(step_id)
+        if latest:
+            source_label = latest.get("source") or ""
+            if source_label:
+                info_parts.append(source_label)
+            created = latest.get("created_at") or ""
+            if created:
+                try:
+                    event_time = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                    delta = now - event_time
+                    if delta.days > 0:
+                        info_parts.append(f"{delta.days}d ago")
+                    elif delta.seconds > 3600:
+                        info_parts.append(f"{delta.seconds // 3600}h ago")
+                    elif delta.seconds > 60:
+                        info_parts.append(f"{delta.seconds // 60}m ago")
+                    else:
+                        info_parts.append("just now")
+                except Exception:
+                    pass
+
+        if status == "in_progress" and latest:
+            created = latest.get("created_at") or ""
+            if created:
+                try:
+                    event_time = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                    elapsed = now - event_time
+                    if elapsed.seconds > 60:
+                        info_parts.append(f"({elapsed.seconds // 60}m)")
+                except Exception:
+                    pass
+
+        if status == "blocked":
+            reason = _clean(step.get("blocked_reason"))
+            if reason:
+                info_parts.append(reason[:50])
+
+        info = f" {DIM}· {' · '.join(info_parts)}{RESET}" if info_parts else ""
+        print(f"  {icon} {order}. {step_title}{info}")
+
+    # Footer
+    print()
+    summary_parts = []
+    if in_progress:
+        summary_parts.append(f"{len(in_progress)} active")
+    if blocked:
+        summary_parts.append(f"{RED}{len(blocked)} blocked{RESET}")
+    if todo:
+        summary_parts.append(f"{len(todo)} remaining")
+
+    # Detect unique active agents from recent in_progress events
+    active_sources = set()
+    for step in in_progress:
+        latest = task_latest_event.get(step.get("id") or "")
+        if latest and latest.get("source"):
+            active_sources.add(latest["source"])
+
+    if active_sources:
+        summary_parts.append(
+            f"{len(active_sources)} agent{'s' if len(active_sources) != 1 else ''}"
+        )
+
+    updated = _clean(plan.get("updated_at"))
+    if updated:
+        try:
+            update_time = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+            delta = now - update_time
+            if delta.seconds < 60:
+                summary_parts.append("updated just now")
+            elif delta.seconds < 3600:
+                summary_parts.append(f"updated {delta.seconds // 60}m ago")
+            elif delta.days == 0:
+                summary_parts.append(f"updated {delta.seconds // 3600}h ago")
+            else:
+                summary_parts.append(f"updated {delta.days}d ago")
+        except Exception:
+            pass
+
+    if summary_parts:
+        print(f"  {DIM}{' · '.join(summary_parts)}{RESET}")
+    print()
+
+
+def _run_status(plan_id: str | None, watch: bool = False) -> None:
+    import time as _time
+
+    resolved_plan_id = _current_plan_id(plan_id)
+    if not resolved_plan_id:
+        raise SystemExit(
+            "Plan context required. Pass --plan-id <plan-id> or save one with `keshro config set --plan-id <plan-id>`."
+        )
+    plan = _get_plan_or_exit(resolved_plan_id)
+    if _state.json:
+        print_output(plan, True)
+        return
+
+    if not watch:
+        _print_plan_status(plan)
+        return
+
+    try:
+        while True:
+            # Clear screen and redraw
+            print("\033[2J\033[H", end="")
+            plan = _get_plan_or_exit(resolved_plan_id)
+            _print_plan_status(plan)
+            print(f"  {DIM}Watching · refreshes every 10s · Ctrl+C to stop{RESET}")
+            _time.sleep(10)
+    except KeyboardInterrupt:
+        print("\nStopped watching.")
+
+
+@plan_app.command("status")
+def _plan_status(
+    plan_id: Annotated[
+        Optional[str],
+        typer.Option(
+            "--plan-id", "-p", help="Plan ID. Uses saved plan context if omitted."
+        ),
+    ] = None,
+    watch: Annotated[
+        bool,
+        typer.Option("--watch", "-w", help="Poll every 10 seconds and redraw."),
+    ] = False,
+):
+    """Live status dashboard for a plan. Shows all tasks, active agents, and blockers."""
+    _run_status(plan_id, watch=watch)
+
+
+@app.command("status")
+def _status_alias(
+    plan_id: Annotated[
+        Optional[str],
+        typer.Option(
+            "--plan-id", "-p", help="Plan ID. Uses saved plan context if omitted."
+        ),
+    ] = None,
+    watch: Annotated[
+        bool,
+        typer.Option("--watch", "-w", help="Poll every 10 seconds and redraw."),
+    ] = False,
+):
+    """Live status dashboard for the current plan."""
+    _run_status(plan_id, watch=watch)
 
 
 @plan_app.command("next")
