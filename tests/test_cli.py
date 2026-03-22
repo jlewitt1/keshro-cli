@@ -187,7 +187,7 @@ class _FakeClient:
                 {
                     "id": "plan-123",
                     "title": "AWS Batch to Airflow pilot",
-                    "status": "draft",
+                    "status": "ready",
                     "source_type": "AWS Batch",
                     "target_type": "Airflow",
                     "summary": "Pilot plan for the first DAG migration.",
@@ -250,7 +250,7 @@ class _FakeClient:
                 {
                     "id": "plan-123",
                     "title": "AWS Batch to Airflow pilot",
-                    "status": "draft",
+                    "status": "ready",
                     "source_type": "AWS Batch",
                     "target_type": "Airflow",
                     "summary": "Pilot plan for the first DAG migration.",

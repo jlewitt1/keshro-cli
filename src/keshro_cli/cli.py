@@ -906,9 +906,9 @@ def _get_git_state_summary(work_dir: str | None = None) -> str:
                 check=False,
             )
             commits = [
-                l.strip()
-                for l in (log_result.stdout or "").strip().splitlines()
-                if l.strip()
+                el.strip()
+                for el in (log_result.stdout or "").strip().splitlines()
+                if el.strip()
             ]
             stat = (diff_stat.stdout or "").strip()
 
@@ -936,9 +936,9 @@ def _get_git_state_summary(work_dir: str | None = None) -> str:
                 check=False,
             )
             changed = [
-                l.strip()
-                for l in (status.stdout or "").strip().splitlines()
-                if l.strip()
+                el.strip()
+                for el in (status.stdout or "").strip().splitlines()
+                if el.strip()
             ]
             if changed:
                 return f"Working tree: {len(changed)} file{'s' if len(changed) != 1 else ''} modified (no prior keshro checkpoint found)"
@@ -979,6 +979,7 @@ def _build_continue_prompt(
     steps = sorted(plan.get("plan_steps") or [], key=lambda s: s.get("order", 0))
     completed_steps = [s for s in steps if s.get("status") == "completed"]
     history_lines: list[str] = []
+    handoff_lines: list[str] = []
     if completed_steps:
         history_lines.append("Prior progress:")
         for s in completed_steps:
@@ -992,6 +993,22 @@ def _build_continue_prompt(
                 last_note = step_notes.strip().splitlines()[-1].strip()
                 if last_note:
                     line += f" — {last_note[:120]}"
+                # Extract "Next task should know:" handoff notes
+                # Split on both newlines and sentence boundaries to catch inline handoffs
+                import re as _re
+
+                note_fragments = _re.split(
+                    r"\n|(?<=\.)\s+(?=Next task should know:|Context for next task:)",
+                    step_notes,
+                )
+                for fragment in note_fragments:
+                    stripped = fragment.strip()
+                    for prefix in ("Next task should know:", "Context for next task:"):
+                        idx = stripped.lower().find(prefix.lower())
+                        if idx >= 0:
+                            handoff = stripped[idx + len(prefix) :].strip().rstrip(".")
+                            if handoff:
+                                handoff_lines.append(f'- From "{title}": {handoff}')
             history_lines.append(line)
             if step_artifacts:
                 history_lines.append(f"  Artifacts: {', '.join(step_artifacts[:3])}")
@@ -999,6 +1016,10 @@ def _build_continue_prompt(
             [s for s in steps if s.get("status") in ("todo", "in_progress")]
         )
         history_lines.append(f"- {len(completed_steps)} done, {remaining} remaining")
+        history_lines.append("")
+    if handoff_lines:
+        history_lines.append("Handoff from previous tasks:")
+        history_lines.extend(handoff_lines)
         history_lines.append("")
 
     # Git state since last checkpoint
@@ -1026,10 +1047,25 @@ def _build_continue_prompt(
         task_block.append(f"Artifacts: {', '.join(artifacts)}")
     if work_dir:
         task_block.append(f"Project directory: {work_dir}")
+    depends_on = task.get("depends_on") or []
+    if depends_on:
+        dep_titles = []
+        for dep_id in depends_on:
+            dep_step = next((s for s in steps if s.get("id") == dep_id), None)
+            dep_titles.append(
+                f"{dep_step.get('title', dep_id)} [{dep_step.get('status', '?')}]"
+                if dep_step
+                else dep_id
+            )
+        task_block.append(f"Depends on: {', '.join(dep_titles)}")
+    is_parallelizable = task.get("parallelizable", False)
+    if is_parallelizable:
+        task_block.append("Parallelizable: yes")
 
     continuation = [
         "",
         "Continue from this task now.",
+        f'- When starting this task, use: `keshro task start {task_id} -p {resolved_plan_id} --reason "session:{session_id}"`',
         f'- Before starting work, create a git checkpoint so changes can be rolled back if needed: `git add -A && git commit -m "keshro: checkpoint before {task_title}" --allow-empty`',
         "- Before writing code, briefly tell the user what this task involves and which files you expect to touch.",
         "- Read existing files relevant to this task to understand the current state before making changes.",
@@ -1045,6 +1081,25 @@ def _build_continue_prompt(
             "If a task fails (tests don't pass, code doesn't compile, validation fails), mark it blocked with "
             f'`keshro task block <task-id> -p {resolved_plan_id} -r "..."` and stop. '
             "Tell the user what failed and why. Do not skip to the next task."
+        )
+
+    if is_parallelizable:
+        continuation.extend(
+            [
+                "",
+                "PARALLEL TASK: This task is marked as parallelizable. Before starting the work itself:",
+                "1. Tell the user: 'This task can be parallelized. I will split it into sub-tasks that other agents can pick up.'",
+                "2. Analyze the task to identify independent units of work (e.g., separate files, independent components, distinct modules).",
+                "3. For each independent unit, create a sub-task using:",
+                f'   `keshro task plan {resolved_plan_id} --title "<sub-task title>" --description "<what to do>" -o "unassigned"`',
+                f"4. Record a note on this parent task: `keshro task note {task_id} -p {resolved_plan_id} "
+                f'-n "Split into N sub-tasks: <list sub-task titles>. Other agents can pick these up with keshro continue."`',
+                f"5. Mark this parent task as completed: `keshro task done {task_id} -p {resolved_plan_id}`",
+                "6. Then pick up and start working on the first sub-task yourself.",
+                "",
+                "The sub-tasks will appear as new todo items in the plan. Other agents running `keshro continue` will automatically pick them up.",
+                "Each sub-task should be independently executable — no sub-task should depend on another sub-task's output.",
+            ]
         )
 
     parts = [
@@ -1092,6 +1147,7 @@ def _continue_with_claude(
     work_dir: str | None = None,
     auto_continue: bool = False,
     parallel: bool = True,
+    confirm: bool = False,
 ) -> None:
     import uuid as _uuid
 
@@ -1107,6 +1163,48 @@ def _continue_with_claude(
             "Plan context required. Pass --plan-id <plan-id> or save one with `keshro config set --plan-id <plan-id>`."
         )
     plan = _get_plan_or_exit(resolved_plan_id)
+
+    # Draft plan warning
+    plan_status = _clean(plan.get("status") or "draft").lower()
+    if plan_status == "draft" and not confirm:
+        steps = sorted(plan.get("plan_steps") or [], key=lambda s: s.get("order", 0))
+        migration_id = _clean(plan.get("migration_id"))
+        app_url = _app_url_from_api_url(_state.api_url)
+        print(
+            f"\n{YELLOW}This plan is in draft. Review the tasks before executing:{RESET}\n"
+        )
+        for s in steps:
+            order = s.get("order", 0)
+            title = _clean(s.get("title")) or "Untitled"
+            deps = s.get("depends_on") or []
+            dep_nums = []
+            for d in deps:
+                dep_step = next((x for x in steps if x.get("id") == d), None)
+                dep_nums.append(f"#{dep_step.get('order', '?')}" if dep_step else d)
+            dep_label = (
+                f" {DIM}(depends on {', '.join(dep_nums)}){RESET}" if dep_nums else ""
+            )
+            parallel_label = (
+                f" {GREEN}parallelizable{RESET}" if s.get("parallelizable") else ""
+            )
+            print(f"  {order}. {title}{dep_label}{parallel_label}")
+        print()
+        if migration_id:
+            print(f"  Review or edit: {app_url}/migrations/{migration_id}?tab=plan")
+        print(f"\n  To execute: keshro continue -p {resolved_plan_id} --confirm\n")
+        raise SystemExit(0)
+
+    # Mark draft plan as active on first confirmed execution
+    if plan_status == "draft" and confirm:
+        try:
+            with make_client(_state.api_url, _state.token) as client:
+                client.patch(
+                    f"/api/plans/{resolved_plan_id}",
+                    json={"status": "ready"},
+                )
+        except Exception:
+            pass  # Non-fatal — plan still executes
+
     task = _next_actionable_task(plan, parallel=parallel)
     if not task:
         raise SystemExit("No actionable tasks remain on this plan.")
@@ -1132,9 +1230,15 @@ def _continue_with_claude(
         )
         return
     task_title = _clean(task.get("title")) or "next task"
+    is_parallel_task = task.get("parallelizable", False)
     if sys.stdout.isatty():
         progress = f"[{done_count}/{total_count}]"
-        print(f"{progress} Resuming: {task_title}")
+        parallel_note = (
+            f" {GREEN}(parallelizable — will split into sub-tasks){RESET}"
+            if is_parallel_task
+            else ""
+        )
+        print(f"{progress} Resuming: {task_title}{parallel_note}")
         print(
             "Run this in your coding agent's terminal for your agent to pick up the task."
         )
@@ -1173,21 +1277,38 @@ def _find_task(plan: dict, task_id: str) -> dict | None:
     )
 
 
+def _dependencies_met(step: dict, steps: list[dict]) -> bool:
+    """Check if all dependencies for a task are completed."""
+    depends_on = step.get("depends_on") or []
+    if not depends_on:
+        return True
+    step_statuses = {
+        _clean(s.get("id")): _clean(s.get("status") or "todo").lower() for s in steps
+    }
+    return all(step_statuses.get(dep_id) == "completed" for dep_id in depends_on)
+
+
 def _next_actionable_task(plan: dict, parallel: bool = False) -> dict | None:
     steps = sorted(plan.get("plan_steps") or [], key=lambda step: step.get("order", 0))
     if parallel:
         # In parallel mode: skip in_progress tasks (another agent owns them),
-        # only pick up todo tasks with no blocked earlier tasks
+        # only pick up todo tasks whose dependencies are met
         for step in steps:
             if _clean(step.get("status") or "todo").lower() != "todo":
                 continue
-            blocked_earlier = any(
-                _clean(s.get("status")).lower() == "blocked"
-                for s in steps
-                if s.get("order", 0) < step.get("order", 0)
-            )
-            if not blocked_earlier:
-                return step
+            if not _dependencies_met(step, steps):
+                continue
+            # Also skip if any earlier task is blocked (fallback when no explicit deps)
+            has_explicit_deps = bool(step.get("depends_on"))
+            if not has_explicit_deps:
+                blocked_earlier = any(
+                    _clean(s.get("status")).lower() == "blocked"
+                    for s in steps
+                    if s.get("order", 0) < step.get("order", 0)
+                )
+                if blocked_earlier:
+                    continue
+            return step
         return None
     # Default: pick up in_progress first (resume), then first todo
     for desired_status in ("in_progress", "todo"):
@@ -2007,10 +2128,21 @@ def _continue_command(
             help="Skip tasks already in progress by other agents. Default: on.",
         ),
     ] = True,
+    confirm: Annotated[
+        bool,
+        typer.Option(
+            "--confirm",
+            help="Confirm execution of a draft plan.",
+        ),
+    ] = False,
 ):
     """Resume the next task from a plan. Only works inside a coding agent."""
     _continue_with_claude(
-        plan_id, work_dir=work_dir, auto_continue=auto_continue, parallel=parallel
+        plan_id,
+        work_dir=work_dir,
+        auto_continue=auto_continue,
+        parallel=parallel,
+        confirm=confirm,
     )
 
 

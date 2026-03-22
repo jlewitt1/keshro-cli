@@ -54,11 +54,16 @@ The CLI is a thin HTTP client. It does not contain business logic — all state 
 8. When stdout is a TTY (not an agent), it shows a short status line instead
 
 Key execution features in the prompt:
+- Draft plan gate — warns on draft plans, requires `--confirm`
 - Git checkpoints before each task
 - Validation gates before marking done
 - Standardized completion note format
 - Auto-continue mode (`--all`)
-- Parallel agent assignment (default on)
+- Parallel agent assignment with dependency checking (default on)
+- Parallelizable task splitting into sub-tasks
+- Task handoff — "Next task should know:" notes flow to the next task
+- Agent session IDs (`--reason "session:<id>"` on task start)
+- Git-aware state detection (changes since last checkpoint)
 - Error retry for connection failures
 
 ## Code conventions
