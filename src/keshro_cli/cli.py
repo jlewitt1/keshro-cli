@@ -2785,7 +2785,7 @@ def _print_plan_status(plan: dict) -> None:
     print()
 
 
-def _run_status(plan_id: str | None, watch: bool = False) -> None:
+def _run_status(plan_id: str | None, watch: bool = False, tui: bool = False) -> None:
     import time as _time
 
     resolved_plan_id = _current_plan_id(plan_id)
@@ -2793,6 +2793,15 @@ def _run_status(plan_id: str | None, watch: bool = False) -> None:
         raise SystemExit(
             "Plan context required. Pass --plan-id <plan-id> or save one with `keshro config set --plan-id <plan-id>`."
         )
+
+    if tui:
+        from .tui import run_tui
+
+        api_url = _state.api_url
+        token = _state.token
+        run_tui(api_url=api_url, token=token, plan_id=resolved_plan_id)
+        return
+
     plan = _get_plan_or_exit(resolved_plan_id)
     if _state.json:
         print_output(plan, True)
@@ -2800,6 +2809,11 @@ def _run_status(plan_id: str | None, watch: bool = False) -> None:
 
     if not watch:
         _print_plan_status(plan)
+        # Also show dependency graph
+        from .graph import render_plan_summary
+
+        print()
+        print(render_plan_summary(plan))
         return
 
     try:
@@ -2826,9 +2840,13 @@ def _plan_status(
         bool,
         typer.Option("--watch", "-w", help="Poll every 10 seconds and redraw."),
     ] = False,
+    tui: Annotated[
+        bool,
+        typer.Option("--tui", help="Launch interactive Textual TUI dashboard."),
+    ] = False,
 ):
     """Live status dashboard for a plan. Shows all tasks, active agents, and blockers."""
-    _run_status(plan_id, watch=watch)
+    _run_status(plan_id, watch=watch, tui=tui)
 
 
 @app.command("status")
@@ -2843,9 +2861,13 @@ def _status_alias(
         bool,
         typer.Option("--watch", "-w", help="Poll every 10 seconds and redraw."),
     ] = False,
+    tui: Annotated[
+        bool,
+        typer.Option("--tui", help="Launch interactive Textual TUI dashboard."),
+    ] = False,
 ):
     """Live status dashboard for the current plan."""
-    _run_status(plan_id, watch=watch)
+    _run_status(plan_id, watch=watch, tui=tui)
 
 
 @plan_app.command("next")
