@@ -28,8 +28,11 @@ class PlanOverview(Static):
     """Shows plan title, progress bar, and summary stats."""
 
     plan_data: reactive[dict | None] = reactive(None)
+    _error: str = ""
 
     def render(self) -> str:
+        if self._error:
+            return f"[red]Connection error:[/red] {self._error}\n[dim]Check that the backend is running and you're logged in.[/dim]"
         if not self.plan_data:
             return "[dim]Loading plan...[/dim]"
         plan = self.plan_data
@@ -219,25 +222,28 @@ class KeshroStatusApp(App):
 
     def _fetch_and_update(self) -> None:
         try:
-            client = httpx.Client(
+            with httpx.Client(
                 base_url=self.api_url,
                 headers={
                     "Authorization": f"Bearer {self.token}",
                     "Content-Type": "application/json",
                 },
                 timeout=5,
-            )
-            resp = client.get(f"/api/plans/{self.plan_id}")
-            resp.raise_for_status()
-            data = resp.json()
+            ) as client:
+                resp = client.get(f"/api/plans/{self.plan_id}")
+                resp.raise_for_status()
+                data = resp.json()
             self._last_data = data
 
             self.query_one("#overview", PlanOverview).plan_data = data
             self.query_one("#agents", ActiveAgents).plan_data = data
             self.query_one("#graph", TaskGraph).plan_data = data
             self.query_one("#events", RecentEvents).plan_data = data
-        except Exception:
-            pass  # Fail silently — show stale data with no disruption
+        except Exception as exc:
+            # Show error in overview panel instead of silently failing
+            overview = self.query_one("#overview", PlanOverview)
+            overview.plan_data = None
+            overview._error = str(exc)
 
     def action_refresh(self) -> None:
         self._fetch_and_update()

@@ -1161,6 +1161,9 @@ class AgentResult:
     stdout: str
     stderr: str
     duration_seconds: float
+    cost_usd: float = 0.0
+    tokens_used: int = 0
+    model: str = ""
 
 
 async def _mark_task_status_async(
@@ -1220,7 +1223,7 @@ async def _launch_single_agent(
                 "--worktree",
                 worktree_name,
                 "--output-format",
-                "text",
+                "json",
                 "--permission-mode",
                 "auto",
                 "--no-session-persistence",
@@ -1248,13 +1251,52 @@ async def _launch_single_agent(
         stdout_text = (stdout_bytes or b"").decode(errors="replace").strip()
         stderr_text = (stderr_bytes or b"").decode(errors="replace").strip()
 
+        # Parse cost and token data from Claude's JSON output
+        cost_usd = 0.0
+        tokens_used = 0
+        model_name = ""
+        try:
+            claude_output = json.loads(stdout_text)
+            cost_usd = claude_output.get("total_cost_usd", 0) or 0
+            usage = claude_output.get("usage", {})
+            tokens_used = (
+                (usage.get("input_tokens", 0) or 0)
+                + (usage.get("cache_read_input_tokens", 0) or 0)
+                + (usage.get("cache_creation_input_tokens", 0) or 0)
+                + (usage.get("output_tokens", 0) or 0)
+            )
+            model_usage = claude_output.get("modelUsage", {})
+            if model_usage:
+                model_name = next(iter(model_usage.keys()), "")
+            # Extract the text result for notes
+            result_text = claude_output.get("result", "")
+        except (json.JSONDecodeError, AttributeError):
+            result_text = stdout_text
+
+        # Report cost via the agent API
+        if cost_usd > 0 or tokens_used > 0:
+            try:
+                await api_client.post(
+                    f"/api/agent/plans/{plan_id}/task-event",
+                    json={
+                        "task_id": task_id,
+                        "event": "note",
+                        "note": f"Agent cost: ${cost_usd:.4f} ({tokens_used:,} tokens, {model_name})",
+                        "tokens_used": tokens_used,
+                        "model": model_name,
+                        "cost_usd": cost_usd,
+                    },
+                )
+            except Exception:
+                pass
+
         if exit_code == 0:
-            note = f"Completed by parallel agent in {duration:.0f}s"
+            note = f"Completed by parallel agent in {duration:.0f}s (${cost_usd:.4f})"
             await _mark_task_status_async(
                 api_client, plan_id, task_id, "completed", notes=note
             )
         else:
-            reason = stderr_text[:200] or stdout_text[:200] or "Agent exited with error"
+            reason = stderr_text[:200] or result_text[:200] or "Agent exited with error"
             await _mark_task_status_async(
                 api_client, plan_id, task_id, "blocked", blocked_reason=reason
             )
@@ -1266,6 +1308,9 @@ async def _launch_single_agent(
             stdout=stdout_text,
             stderr=stderr_text,
             duration_seconds=duration,
+            cost_usd=cost_usd,
+            tokens_used=tokens_used,
+            model=model_name,
         )
 
 
@@ -1347,19 +1392,27 @@ async def _run_parallel(
 
         succeeded = 0
         failed = 0
+        wave_cost = 0.0
+        wave_tokens = 0
         for r in results:
             if isinstance(r, Exception):
                 print(f"  {RED}[error]{RESET}  Agent crashed: {r}")
                 failed += 1
             elif r.exit_code == 0:
-                print(f"  {GREEN}[done]{RESET}   {r.task_title} ({_format_duration(r.duration_seconds)})")
+                cost_label = f" ${r.cost_usd:.2f}" if r.cost_usd > 0 else ""
+                print(f"  {GREEN}[done]{RESET}   {r.task_title} ({_format_duration(r.duration_seconds)}{cost_label})")
                 succeeded += 1
+                wave_cost += r.cost_usd
+                wave_tokens += r.tokens_used
             else:
                 reason = r.stderr[:100] or r.stdout[:100] or "unknown error"
                 print(f"  {RED}[failed]{RESET} {r.task_title} ({_format_duration(r.duration_seconds)}) — {reason}")
                 failed += 1
+                wave_cost += r.cost_usd
+                wave_tokens += r.tokens_used
 
-        print(f"\nWave {wave} complete: {GREEN}{succeeded} succeeded{RESET}, {RED}{failed} failed{RESET}")
+        cost_summary = f"  cost: ${wave_cost:.2f} ({wave_tokens:,} tokens)" if wave_cost > 0 else ""
+        print(f"\nWave {wave} complete: {GREEN}{succeeded} succeeded{RESET}, {RED}{failed} failed{RESET}{cost_summary}")
 
         if not run_all:
             if failed == 0 and succeeded > 0:
@@ -2795,7 +2848,11 @@ def _run_status(plan_id: str | None, watch: bool = False, tui: bool = False) -> 
         )
 
     if tui:
-        from .tui import run_tui
+        try:
+            from .tui import run_tui
+        except ImportError:
+            print(f"{RED}TUI requires textual. Install with: pip install textual{RESET}", file=sys.stderr)
+            raise typer.Exit(1)
 
         api_url = _state.api_url
         token = _state.token
@@ -3956,6 +4013,23 @@ def _rollback(
         raise typer.Exit(1)
 
     print(f"{GREEN}Rolled back to checkpoint {commit_hash[:8]}{RESET}")
+
+    # Record rollback in Keshro audit trail — resets task to todo
+    try:
+        client = make_client()
+        client.post(
+            f"/api/agent/plans/{resolved_plan_id}/task-event",
+            json={
+                "task_id": task_id,
+                "event": "rollback",
+                "reason": f"Rolled back to checkpoint {commit_hash[:8]}",
+            },
+            timeout=10,
+        )
+        print(f"  {DIM}Task '{task_id}' reset to todo in plan.{RESET}")
+    except Exception:
+        print(f"  {YELLOW}Could not update plan (API unreachable). Task status unchanged.{RESET}")
+
     if _state.json:
         print_output({"status": "ok", "action": "rollback", "commit": commit_hash, "task_id": task_id})
 
@@ -4087,6 +4161,142 @@ def _plan_generate(
 
     if not confirm and plan.get("status") == "draft":
         print(f"\n{DIM}Plan is in draft. Run 'keshro continue -p {plan_id} --confirm' to start execution.{RESET}")
+
+    if _state.json:
+        print_output(plan)
+
+
+# ---------------------------------------------------------------------------
+# Plan import command
+# ---------------------------------------------------------------------------
+
+
+@plan_app.command("import")
+def _plan_import(
+    provider: Annotated[str, typer.Argument(help="Provider to import from: linear, jira, github.")],
+    project_id: Annotated[Optional[str], typer.Option("--project", "-p", help="Project or repo ID.")] = None,
+    title: Annotated[Optional[str], typer.Option("--title", "-t", help="Plan title.")] = None,
+    skip_questions: Annotated[bool, typer.Option("--skip-questions", help="Skip clarifying questions.")] = False,
+):
+    """Import issues from Linear, Jira, or GitHub and generate a plan.
+
+    Interactive flow: fetches issues → asks clarifying questions → generates plan.
+    Use --skip-questions to go straight to plan generation.
+    """
+    _ensure_authenticated()
+    client = make_client()
+
+    provider = provider.lower().strip()
+    if provider not in ("linear", "jira", "github"):
+        print(f"{RED}Unsupported provider: {provider}. Use: linear, jira, github{RESET}", file=sys.stderr)
+        raise typer.Exit(1)
+
+    # Step 1: Fetch issues + enrichment + questions
+    print(f"{CYAN}Fetching issues from {provider}...{RESET}")
+    preview_payload: dict = {"provider": provider}
+    if project_id:
+        preview_payload["project_id"] = project_id
+
+    try:
+        resp = client.post("/api/plans/import/preview", json=preview_payload, timeout=60)
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        _print_http_error(exc)
+        raise typer.Exit(1) from exc
+
+    preview = resp.json()
+    issue_count = preview.get("issue_count", 0)
+    questions = preview.get("questions", [])
+    enrichment = preview.get("enrichment_context", "")
+
+    print(f"  {GREEN}Found {issue_count} issues{RESET}")
+    if enrichment:
+        print(f"  {DIM}Enriched with repo context + web research{RESET}")
+
+    # Step 2: Ask clarifying questions (interactive)
+    answers: dict[str, str] = {}
+    if questions and not skip_questions and sys.stdout.isatty():
+        print(f"\n{CYAN}Clarifying questions ({len(questions)}):{RESET}")
+        print(f"{DIM}Your answers help produce a better plan. Press Enter to skip any question.{RESET}\n")
+
+        for q in questions:
+            qid = q.get("id", "")
+            question_text = q.get("question", "")
+            why = q.get("why_this_matters", "")
+            options = q.get("answers", [])
+            placeholder = q.get("placeholder", "")
+
+            print(f"  {YELLOW}{question_text}{RESET}")
+            if why:
+                print(f"  {DIM}{why}{RESET}")
+
+            if options:
+                for idx, opt in enumerate(options, 1):
+                    rec = " (recommended)" if opt.get("recommended") else ""
+                    print(f"    {idx}. {opt.get('answer_title', opt.get('value', ''))}{rec}")
+                raw = input(f"  {DIM}Enter number or type answer [{placeholder or 'skip'}]: {RESET}").strip()
+                if raw:
+                    # Check if it's a number selecting an option
+                    try:
+                        choice_idx = int(raw) - 1
+                        if 0 <= choice_idx < len(options):
+                            answers[qid] = options[choice_idx].get("value", raw)
+                        else:
+                            answers[qid] = raw
+                    except ValueError:
+                        answers[qid] = raw
+            else:
+                raw = input(f"  {DIM}Answer [{placeholder or 'skip'}]: {RESET}").strip()
+                if raw:
+                    answers[qid] = raw
+            print()
+
+        answered = len(answers)
+        print(f"  {DIM}{answered}/{len(questions)} questions answered.{RESET}\n")
+
+    # Step 3: Generate plan
+    print(f"{CYAN}Generating plan...{RESET}")
+    import_payload: dict = {
+        "provider": provider,
+        "issues_text": preview.get("issues_text", ""),
+        "enrichment_context": enrichment,
+    }
+    if title:
+        import_payload["title"] = title
+    if project_id:
+        import_payload["project_id"] = project_id
+    if answers:
+        import_payload["answers"] = answers
+
+    try:
+        resp = client.post("/api/plans/import", json=import_payload, timeout=120)
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        _print_http_error(exc)
+        raise typer.Exit(1) from exc
+
+    plan = resp.json()
+    plan_id = plan.get("id", "")
+    steps = plan.get("plan_steps", [])
+
+    _set_default_plan_after_create(plan)
+
+    print(f"\n{GREEN}Plan created: {plan.get('title', 'Untitled')}{RESET}")
+    print(f"  ID: {plan_id}")
+    print(f"  Tasks: {len(steps)}")
+    print(f"  Status: {plan.get('status', 'draft')}")
+
+    if steps:
+        print(f"\n{CYAN}Tasks:{RESET}")
+        for step in steps:
+            dep_info = ""
+            if step.get("depends_on"):
+                dep_info = f" {DIM}(depends on: {', '.join(step['depends_on'])}){RESET}"
+            refs = step.get("source_refs", [])
+            ref_info = f" {DIM}[{', '.join(refs)}]{RESET}" if refs else ""
+            print(f"  {step.get('order', 0):2d}. {step.get('title', 'Untitled')}{ref_info}{dep_info}")
+
+    print(f"\n{DIM}Run 'keshro continue -p {plan_id} --confirm' to start execution.{RESET}")
 
     if _state.json:
         print_output(plan)
