@@ -851,7 +851,7 @@ During execution:
 - when you create or modify files, record them with `keshro task note` — list the specific files and what changed
 
 When a task is done:
-- record a completion note using this format: `keshro task note <task-id> -p {resolved_plan_id} -n "Files created: ... | Files modified: ... | Key decisions: ... | Next task should know: ..."`
+- record a completion note using this format: `keshro task note <task-id> -p {resolved_plan_id} -n "Files created: ... | Files modified: ... | Key decisions: ... | Acceptance criteria met: ... | Verification: ... | Next task should know: ..."`
 - ask the user to confirm the task is complete before running `keshro task done`
 - when marking done, report your session cost if available: `keshro task done <task-id> -p {resolved_plan_id} --cost <usd_amount> --tokens <token_count> --model <model_name>` (check your session stats for cost/token info)
 - after `keshro task done`, summarize what was accomplished and ask the user if they want to continue to the next task
@@ -1140,7 +1140,8 @@ def _build_continue_prompt(
         "- Read existing files relevant to this task to understand the current state before making changes.",
         "- If this task is blocked, do not automatically move to the next task unless the plan clearly supports parallel or out-of-order work.",
         "- If you continue execution, keep Keshro updated as you work.",
-        "- Before marking a task done, verify your changes: run linters, check syntax, or run relevant tests if they exist. Record the validation result in your completion note.",
+        "- Before marking a task done, verify your changes: run linters, check syntax, or run relevant tests if they exist. Record the validation result in your completion note under `Verification:`.",
+        "- If the task has acceptance criteria, your completion note must explicitly include `Acceptance criteria met:` and `Verification:` before `keshro task done` will succeed.",
     ]
     if auto_continue:
         continuation.append(
@@ -1356,7 +1357,13 @@ async def _launch_single_agent(
             result_text = stdout_text
 
         # Report cost via the agent API
+        cost_event: dict = {}
         if cost_usd > 0 or tokens_used > 0:
+            cost_event = {
+                "tokens_used": tokens_used,
+                "model": model_name,
+                "cost_usd": cost_usd,
+            }
             try:
                 await api_client.post(
                     f"/api/agent/plans/{plan_id}/task-event",
@@ -1364,16 +1371,22 @@ async def _launch_single_agent(
                         "task_id": task_id,
                         "event": "note",
                         "note": f"Agent cost: ${cost_usd:.4f} ({tokens_used:,} tokens, {model_name})",
-                        "tokens_used": tokens_used,
-                        "model": model_name,
-                        "cost_usd": cost_usd,
+                        **cost_event,
                     },
                 )
             except Exception:
                 pass
 
         if exit_code == 0:
-            note = f"Completed by parallel agent in {duration:.0f}s (${cost_usd:.4f})"
+            # Build a detailed completion note
+            cost_parts = [f"{duration:.0f}s"]
+            if tokens_used > 0:
+                cost_parts.append(f"{tokens_used:,} tokens")
+            if model_name:
+                cost_parts.append(model_name)
+            if cost_usd > 0:
+                cost_parts.append(f"${cost_usd:.4f}")
+            note = f"Completed by parallel agent in {' | '.join(cost_parts)}"
             await _mark_task_status_async(
                 api_client, plan_id, task_id, "completed", notes=note
             )
@@ -3269,6 +3282,40 @@ def _build_appended_task_notes(
     )
 
 
+def _task_completion_requirements(task: dict) -> list[str]:
+    requirements: list[str] = []
+    if task.get("acceptance_criteria"):
+        requirements.append("Acceptance criteria met:")
+    if task.get("acceptance_criteria") or task.get("discovery_commands"):
+        requirements.append("Verification:")
+    return requirements
+
+
+def _ensure_completion_note_covers_requirements(
+    plan_id: str | None,
+    task_id: str,
+    note: str | None,
+) -> None:
+    resolved_plan_id = _require_plan_context(plan_id)
+    plan = _get_plan_or_exit(resolved_plan_id)
+    task = _find_task(plan, task_id)
+    if not task:
+        raise SystemExit(f"Task not found: {task_id}")
+    requirements = _task_completion_requirements(task)
+    if not requirements:
+        return
+    cleaned_note = _clean(note)
+    missing = [marker for marker in requirements if marker.lower() not in cleaned_note.lower()]
+    if not missing:
+        return
+    title = _clean(task.get("title")) or task_id
+    raise SystemExit(
+        "Completion note for "
+        f"{title} must include {' and '.join(missing)} "
+        "before this task can be marked done."
+    )
+
+
 def _do_task_start(
     plan_id: str | None,
     task_id: str,
@@ -3295,6 +3342,7 @@ def _do_task_done(
     feedback_reason: str | None = None,
     link: list[str] | None = None,
 ):
+    _ensure_completion_note_covers_requirements(plan_id, task_id, notes)
     _do_task_update(
         plan_id,
         task_id,

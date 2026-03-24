@@ -1171,6 +1171,104 @@ def test_task_done_marks_task_completed(fake_client, capsys):
     assert out["payload"]["blocked_reason"] == ""
 
 
+def test_task_done_requires_completion_evidence_when_acceptance_criteria_exist(
+    fake_client, monkeypatch, capsys
+):
+    original_get = fake_client.get
+
+    def _get(path, params=None):
+        response = original_get(path, params=params)
+        if path != "/api/plans/plan-123":
+            return response
+        plan = response.json()
+        enriched_steps = []
+        for step in plan["plan_steps"]:
+            if step["id"] == "task-456":
+                enriched_steps.append(
+                    {
+                        **step,
+                        "acceptance_criteria": [
+                            "DAG syntax validates without errors",
+                            "Retry logic implemented",
+                        ],
+                        "discovery_commands": [
+                            "airflow dags check dags/",
+                            "python -m py_compile dags/*.py",
+                        ],
+                    }
+                )
+            else:
+                enriched_steps.append(step)
+        return _FakeResponse({**plan, "plan_steps": enriched_steps})
+
+    monkeypatch.setattr(fake_client, "get", _get)
+
+    code = cli.main(
+        [
+            "--json",
+            "task",
+            "done",
+            "plan-123",
+            "task-456",
+            "--notes",
+            "Pilot DAG merged and validated",
+        ]
+    )
+    assert code != 0
+    err = ANSI_RE.sub("", capsys.readouterr().err)
+    assert "Acceptance criteria met:" in err
+    assert "Verification:" in err
+
+
+def test_task_done_accepts_completion_evidence_when_acceptance_criteria_exist(
+    fake_client, monkeypatch, capsys
+):
+    original_get = fake_client.get
+
+    def _get(path, params=None):
+        response = original_get(path, params=params)
+        if path != "/api/plans/plan-123":
+            return response
+        plan = response.json()
+        enriched_steps = []
+        for step in plan["plan_steps"]:
+            if step["id"] == "task-456":
+                enriched_steps.append(
+                    {
+                        **step,
+                        "acceptance_criteria": [
+                            "DAG syntax validates without errors",
+                            "Retry logic implemented",
+                        ],
+                        "discovery_commands": [
+                            "airflow dags check dags/",
+                            "python -m py_compile dags/*.py",
+                        ],
+                    }
+                )
+            else:
+                enriched_steps.append(step)
+        return _FakeResponse({**plan, "plan_steps": enriched_steps})
+
+    monkeypatch.setattr(fake_client, "get", _get)
+
+    cli.main(
+        [
+            "--json",
+            "task",
+            "done",
+            "plan-123",
+            "task-456",
+            "--notes",
+            "Files created: dags/daily_sales_pipeline.py | Acceptance criteria met: DAG syntax validates without errors; retry logic implemented | Verification: airflow dags check dags/ passed; python -m py_compile dags/*.py passed",
+        ]
+    )
+    out = json.loads(capsys.readouterr().out)
+    assert out["payload"]["status"] == "completed"
+    assert "Acceptance criteria met:" in out["payload"]["notes"]
+    assert "Verification:" in out["payload"]["notes"]
+
+
 def test_task_block_marks_task_blocked(fake_client, capsys):
     cli.main(
         [
