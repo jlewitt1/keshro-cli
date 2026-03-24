@@ -853,6 +853,7 @@ During execution:
 When a task is done:
 - record a completion note using this format: `keshro task note <task-id> -p {resolved_plan_id} -n "Files created: ... | Files modified: ... | Key decisions: ... | Next task should know: ..."`
 - ask the user to confirm the task is complete before running `keshro task done`
+- when marking done, report your session cost if available: `keshro task done <task-id> -p {resolved_plan_id} --cost <usd_amount> --tokens <token_count> --model <model_name>` (check your session stats for cost/token info)
 - after `keshro task done`, summarize what was accomplished and ask the user if they want to continue to the next task
 - do not automatically start the next task without the user's go-ahead
 
@@ -950,6 +951,64 @@ def _get_git_state_summary(work_dir: str | None = None) -> str:
         return ""
 
 
+def _extract_topical_context(
+    target_task: dict, all_steps: list[dict], max_entries: int = 5, max_chars: int = 500
+) -> list[str]:
+    """Find learnings from completed tasks that share tags with the target task.
+
+    Returns formatted lines for prompt injection, or empty list if no matches.
+    """
+    target_tags = {t.lower() for t in (target_task.get("tags") or [])}
+    if not target_tags:
+        return []
+
+    scored: list[tuple[int, str, str, set[str]]] = []
+    target_id = target_task.get("id")
+    for step in all_steps:
+        if step.get("status") != "completed" or step.get("id") == target_id:
+            continue
+        notes = (step.get("notes") or "").strip()
+        if not notes:
+            continue
+        step_tags = {t.lower() for t in (step.get("tags") or [])}
+        shared = target_tags & step_tags
+        if not shared:
+            continue
+
+        # Filter out explicit handoff lines (already in the sequential handoff section)
+        lines = []
+        for line in notes.split("\n"):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            lower = stripped.lower()
+            if lower.startswith("next task should know:") or lower.startswith(
+                "context for next task:"
+            ):
+                continue
+            lines.append(stripped)
+        if not lines:
+            continue
+
+        content = "\n".join(lines)
+        if len(content) > max_chars:
+            content = content[:max_chars] + "..."
+        title = step.get("title") or "Untitled"
+        scored.append((len(shared), title, content, shared))
+
+    if not scored:
+        return []
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    result = []
+    for _score, title, content, shared in scored[:max_entries]:
+        shared_str = ", ".join(sorted(shared))
+        result.append(f'- From "{title}" (shared: {shared_str}):')
+        for line in content.split("\n"):
+            result.append(f"  {line}")
+    return result
+
+
 def _build_continue_prompt(
     plan: dict,
     task: dict,
@@ -1023,6 +1082,13 @@ def _build_continue_prompt(
     if handoff_lines:
         history_lines.append("Handoff from previous tasks:")
         history_lines.extend(handoff_lines)
+        history_lines.append("")
+
+    # Topical context — learnings from completed tasks that share tags with this task
+    topical_lines = _extract_topical_context(task, steps)
+    if topical_lines:
+        history_lines.append("Related learnings from tasks in the same domain:")
+        history_lines.extend(topical_lines)
         history_lines.append("")
 
     # Git state since last checkpoint
@@ -3675,8 +3741,17 @@ def _task_done(
     link: Annotated[
         Optional[list[str]], typer.Option("--link", "-l", help="Artifact link.")
     ] = None,
+    cost: Annotated[
+        Optional[float], typer.Option("--cost", help="Session cost in USD.")
+    ] = None,
+    tokens: Annotated[
+        Optional[int], typer.Option("--tokens", help="Total tokens used.")
+    ] = None,
+    model_name: Annotated[
+        Optional[str], typer.Option("--model", help="Model used (e.g., claude-sonnet-4-20250514).")
+    ] = None,
 ):
-    """Mark a task as completed."""
+    """Mark a task as completed. Use --cost/--tokens to report agent session cost."""
     resolved_plan_id: str | None
     resolved_task_id: str
     if plan_id_option:
@@ -3695,6 +3770,24 @@ def _task_done(
         feedback_reason=feedback_reason,
         link=link,
     )
+    # Report cost via agent API
+    if cost is not None or tokens is not None:
+        try:
+            with make_client(_state.api_url, _state.token) as c:
+                c.post(
+                    f"/api/agent/plans/{resolved_plan_id}/task-event",
+                    json={
+                        "task_id": resolved_task_id,
+                        "event": "note",
+                        "note": f"Session cost: ${cost or 0:.4f} ({tokens or 0:,} tokens, {model_name or 'unknown'})",
+                        "tokens_used": tokens or 0,
+                        "model": model_name or "",
+                        "cost_usd": cost or 0,
+                    },
+                    timeout=10,
+                )
+        except Exception:
+            pass
 
 
 @task_app.command("block")
