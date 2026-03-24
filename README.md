@@ -80,12 +80,16 @@ Auth state is stored in `~/.keshro/auth.json`.
 keshro continue -p <plan-id>                      # Resume next task
 keshro continue -p <plan-id> --confirm             # Approve and execute a draft plan
 keshro continue -p <plan-id> --all                 # Auto-continue through all tasks
-keshro continue -p <plan-id> --dir /path/to/repo   # Point agent at a different codebase
-keshro continue -p <plan-id> --no-parallel         # Resume your own in-progress task
+keshro continue -p <plan-id> --concurrency 10      # Up to 10 agents at once (default 5)
+keshro continue -p <plan-id> --dry-run             # Preview which tasks would launch
+keshro continue -p <plan-id> --dir /path/to/repo   # Point agent(s) at a different codebase
+keshro continue -p <plan-id> --no-parallel         # Single-task mode / resume your own in-progress task
 keshro status -p <plan-id>                         # Live dashboard of all tasks and agents
 keshro status --watch                              # Auto-refresh every 10 seconds
 keshro setup-claude                                # Install global Claude Code slash command
 ```
+
+By default, `keshro continue` launches parallel Claude Code agents in isolated git worktrees — one per actionable task, respecting `depends_on` dependencies. When run inside a coding agent (piped stdout), it falls back to single-task mode automatically.
 
 Features built into `keshro continue`:
 - **Draft plan review** — draft plans show all tasks and require `--confirm` before first execution
@@ -98,7 +102,7 @@ Features built into `keshro continue`:
 - **Validation gates** — verifies changes before marking done
 - **Auto-continue** — `--all` runs through tasks without pausing
 - **Agent session IDs** — each session gets a unique ID for multi-agent tracking
-- **Multi-repo** — `--dir` and `--repo` to point at any codebase
+- **Multi-repo** — `--dir` points Claude at a codebase in a different directory
 - **Git-aware resume** — detects repo changes since last checkpoint
 
 ### Plan management

@@ -43,7 +43,17 @@ python -m build --sdist
 
 The CLI is a thin HTTP client. It does not contain business logic — all state lives in the Keshro backend API.
 
-`keshro continue` works by:
+`keshro continue` has two modes based on context:
+
+**User terminal (TTY) — parallel by default:**
+1. Checks auth, fetches the plan
+2. Finds all actionable tasks (deps satisfied, status todo/in_progress)
+3. Launches parallel `claude -p` subprocesses in isolated git worktrees (one per task)
+4. Each agent works on a single task autonomously, marks it done/blocked
+5. With `--all`, completes a wave then launches the next wave of unblocked tasks
+6. `--no-parallel` falls back to single-task mode
+
+**Inside a coding agent (piped stdout) — single-task:**
 1. Checking auth (`_ensure_authenticated`)
 2. Generating a unique session ID (`agent-<hex>`) for multi-agent tracking
 3. Fetching the plan and finding the next task (skips in-progress tasks in parallel mode)
@@ -65,6 +75,8 @@ Key execution features in the prompt:
 - Agent session IDs (`--reason "session:<id>"` on task start)
 - Git-aware state detection (changes since last checkpoint)
 - Error retry for connection failures
+
+Key functions: `_build_continue_prompt()` (single-task), `_build_parallel_prompt()` (parallel), `_all_actionable_tasks()` (dep resolution), `_run_parallel()` (async orchestrator), `_launch_single_agent()` (subprocess management)
 
 ## Code conventions
 

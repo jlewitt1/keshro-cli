@@ -1,11 +1,14 @@
+import asyncio
 import base64
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Optional
@@ -17,7 +20,7 @@ import typer
 
 from . import __version__
 from .auth import cmd_auth_login, cmd_auth_logout
-from .client import get_default_org_id, make_client, print_output
+from .client import get_default_org_id, make_async_client, make_client, print_output
 from .config import DEFAULT_API_URL, load_auth, update_auth
 
 
@@ -1113,6 +1116,267 @@ def _build_continue_prompt(
     return "\n".join(parts)
 
 
+def _task_title_slug(title: str) -> str:
+    """Convert a task title to a branch-safe slug."""
+    slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+    return slug[:50] if slug else "task"
+
+
+def _build_parallel_prompt(
+    plan: dict, task: dict, total_agents: int, work_dir: str | None = None
+) -> str:
+    """Build a prompt for an unattended parallel agent working on a single task."""
+    base_prompt = _build_continue_prompt(plan, task, work_dir=work_dir, auto_continue=False)
+    resolved_plan_id = _clean(plan.get("id")) or "<plan-id>"
+    task_id = _clean(task.get("id")) or "<task-id>"
+    task_title = _clean(task.get("title")) or "Untitled task"
+    branch_name = f"keshro/{_task_title_slug(task_title)}"
+
+    parallel_context = "\n".join(
+        [
+            "",
+            "PARALLEL EXECUTION MODE:",
+            f"- You are one of {total_agents} agents running concurrently in isolated git worktrees.",
+            "- You are responsible for exactly ONE task. Complete it, then exit. Do NOT pull the next task.",
+            f"- Create your changes on a branch named `{branch_name}`.",
+            "- Other agents are working on other tasks simultaneously — note any potential file conflicts in your completion notes.",
+            "- Do not ask the user for confirmation — execute autonomously.",
+            f"- When done, mark the task complete: `keshro task done {task_id} -p {resolved_plan_id}`",
+            f'- If the task fails, mark it blocked: `keshro task block {task_id} -p {resolved_plan_id} -r "reason"`',
+        ]
+    )
+    return base_prompt + parallel_context
+
+
+# ---------------------------------------------------------------------------
+# Parallel execution engine
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AgentResult:
+    task_id: str
+    task_title: str
+    exit_code: int
+    stdout: str
+    stderr: str
+    duration_seconds: float
+
+
+async def _mark_task_status_async(
+    client: httpx.AsyncClient,
+    plan_id: str,
+    task_id: str,
+    status: str,
+    notes: str | None = None,
+    blocked_reason: str | None = None,
+) -> None:
+    body: dict = {"status": status}
+    if notes:
+        body["notes"] = notes[:500]
+    if blocked_reason:
+        body["blocked_reason"] = blocked_reason[:500]
+    try:
+        res = await client.patch(f"/api/plans/{plan_id}/tasks/{task_id}", json=body)
+        res.raise_for_status()
+    except Exception:
+        pass  # don't crash agents over API errors
+
+
+async def _launch_single_agent(
+    task: dict,
+    plan: dict,
+    plan_id: str,
+    work_dir: str,
+    total_agents: int,
+    semaphore: asyncio.Semaphore,
+    api_client: httpx.AsyncClient,
+) -> AgentResult:
+    task_id = _clean(task.get("id")) or "unknown"
+    task_title = _clean(task.get("title")) or "Untitled"
+    worktree_name = f"keshro-{task_id[:8]}"
+    prompt = _build_parallel_prompt(plan, task, total_agents, work_dir=work_dir)
+
+    claude_bin = shutil.which("claude")
+    if not claude_bin:
+        return AgentResult(
+            task_id=task_id,
+            task_title=task_title,
+            exit_code=127,
+            stdout="",
+            stderr="claude binary not found",
+            duration_seconds=0,
+        )
+
+    async with semaphore:
+        await _mark_task_status_async(api_client, plan_id, task_id, "in_progress")
+
+        start = time.monotonic()
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                claude_bin,
+                "-p",
+                prompt,
+                "--worktree",
+                worktree_name,
+                "--output-format",
+                "text",
+                "--permission-mode",
+                "auto",
+                "--no-session-persistence",
+                "--name",
+                f"keshro: {task_title[:40]}",
+                "--add-dir",
+                work_dir,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=work_dir,
+            )
+            stdout_bytes, stderr_bytes = await proc.communicate()
+            exit_code = proc.returncode or 0
+        except Exception as exc:
+            return AgentResult(
+                task_id=task_id,
+                task_title=task_title,
+                exit_code=1,
+                stdout="",
+                stderr=str(exc),
+                duration_seconds=time.monotonic() - start,
+            )
+
+        duration = time.monotonic() - start
+        stdout_text = (stdout_bytes or b"").decode(errors="replace").strip()
+        stderr_text = (stderr_bytes or b"").decode(errors="replace").strip()
+
+        if exit_code == 0:
+            note = f"Completed by parallel agent in {duration:.0f}s"
+            await _mark_task_status_async(
+                api_client, plan_id, task_id, "completed", notes=note
+            )
+        else:
+            reason = stderr_text[:200] or stdout_text[:200] or "Agent exited with error"
+            await _mark_task_status_async(
+                api_client, plan_id, task_id, "blocked", blocked_reason=reason
+            )
+
+        return AgentResult(
+            task_id=task_id,
+            task_title=task_title,
+            exit_code=exit_code,
+            stdout=stdout_text,
+            stderr=stderr_text,
+            duration_seconds=duration,
+        )
+
+
+def _format_duration(seconds: float) -> str:
+    m, s = divmod(int(seconds), 60)
+    return f"{m}m {s:02d}s" if m > 0 else f"{s}s"
+
+
+async def _run_parallel(
+    plan_id: str,
+    work_dir: str | None,
+    max_concurrency: int,
+    run_all: bool,
+    dry_run: bool,
+) -> None:
+    resolved_plan_id = _require_plan_context(plan_id)
+    resolved_dir = str(Path(work_dir).resolve()) if work_dir else os.getcwd()
+
+    claude_bin = shutil.which("claude")
+    if not claude_bin:
+        raise SystemExit("claude binary not found. Install Claude Code first.")
+
+    with make_client(_state.api_url, _state.token) as client:
+        res = client.get(f"/api/plans/{resolved_plan_id}")
+        res.raise_for_status()
+        plan = res.json()
+
+    wave = 1
+    while True:
+        actionable = _all_actionable_tasks(plan)
+        if not actionable:
+            steps = plan.get("plan_steps") or []
+            done = len([s for s in steps if _clean(s.get("status") or "").lower() == "completed"])
+            total = len(steps)
+            if done == total and total > 0:
+                print(f"\n{GREEN}All {total} tasks completed.{RESET}")
+            else:
+                blocked = [s for s in steps if _clean(s.get("status") or "").lower() == "blocked"]
+                if blocked:
+                    print(f"\n{YELLOW}No actionable tasks. {len(blocked)} task(s) blocked:{RESET}")
+                    for s in blocked:
+                        reason = _clean(s.get("blocked_reason")) or "no reason"
+                        print(f"  - {_clean(s.get('title'))}: {reason}")
+                else:
+                    print("No actionable tasks remaining.")
+            break
+
+        steps = plan.get("plan_steps") or []
+        done_count = len([s for s in steps if _clean(s.get("status") or "").lower() == "completed"])
+        total_count = len(steps)
+
+        if wave > 1:
+            print(f"\n{'─' * 40}")
+        print(f"\n{CYAN}Wave {wave}{RESET} — {len(actionable)} task(s) actionable [{done_count}/{total_count} done]")
+
+        for task in actionable:
+            title = _clean(task.get("title")) or "Untitled"
+            tid = _clean(task.get("id")) or "?"
+            deps = task.get("depends_on") or []
+            dep_str = f" (depends on: {', '.join(deps[:3])})" if deps else ""
+            print(f"  {tid[:8]}  {title}{dep_str}")
+
+        if dry_run:
+            print(f"\n{DIM}Dry run — no agents launched.{RESET}")
+            break
+
+        print(f"\nLaunching {len(actionable)} agent(s) (max concurrency: {max_concurrency})...\n")
+
+        semaphore = asyncio.Semaphore(max_concurrency)
+        async with make_async_client(_state.api_url, _state.token) as api_client:
+            agent_tasks = [
+                _launch_single_agent(
+                    task, plan, resolved_plan_id, resolved_dir,
+                    len(actionable), semaphore, api_client,
+                )
+                for task in actionable
+            ]
+            results = await asyncio.gather(*agent_tasks, return_exceptions=True)
+
+        succeeded = 0
+        failed = 0
+        for r in results:
+            if isinstance(r, Exception):
+                print(f"  {RED}[error]{RESET}  Agent crashed: {r}")
+                failed += 1
+            elif r.exit_code == 0:
+                print(f"  {GREEN}[done]{RESET}   {r.task_title} ({_format_duration(r.duration_seconds)})")
+                succeeded += 1
+            else:
+                reason = r.stderr[:100] or r.stdout[:100] or "unknown error"
+                print(f"  {RED}[failed]{RESET} {r.task_title} ({_format_duration(r.duration_seconds)}) — {reason}")
+                failed += 1
+
+        print(f"\nWave {wave} complete: {GREEN}{succeeded} succeeded{RESET}, {RED}{failed} failed{RESET}")
+
+        if not run_all:
+            if failed == 0 and succeeded > 0:
+                remaining = total_count - done_count - succeeded
+                if remaining > 0:
+                    print(f"\n{DIM}{remaining} task(s) remaining. Run with --all to auto-continue through waves.{RESET}")
+            break
+
+        # Re-fetch plan for next wave
+        with make_client(_state.api_url, _state.token) as client:
+            res = client.get(f"/api/plans/{resolved_plan_id}")
+            res.raise_for_status()
+            plan = res.json()
+
+        wave += 1
+
+
 def _ensure_authenticated() -> None:
     """Check auth and provide a clear message if not logged in."""
     auth = load_auth()
@@ -1323,6 +1587,25 @@ def _next_actionable_task(plan: dict, parallel: bool = False) -> dict | None:
         if match:
             return match
     return None
+
+
+def _all_actionable_tasks(plan: dict) -> list[dict]:
+    """Return all tasks whose dependencies are satisfied and status is todo or in_progress."""
+    steps = sorted(plan.get("plan_steps") or [], key=lambda s: s.get("order", 0))
+    completed_ids = {
+        _clean(s.get("id"))
+        for s in steps
+        if _clean(s.get("status") or "todo").lower() == "completed"
+    }
+    actionable = []
+    for step in steps:
+        status = _clean(step.get("status") or "todo").lower()
+        if status not in ("todo", "in_progress"):
+            continue
+        deps = step.get("depends_on") or []
+        if all(_clean(dep) in completed_ids for dep in deps):
+            actionable.append(step)
+    return actionable
 
 
 def _append_replan_summary(existing_summary: str | None, note: str) -> str:
@@ -2121,13 +2404,6 @@ def _continue_command(
             help="Auto-continue through tasks without asking after each one.",
         ),
     ] = False,
-    parallel: Annotated[
-        bool,
-        typer.Option(
-            "--parallel/--no-parallel",
-            help="Skip tasks already in progress by other agents. Default: on.",
-        ),
-    ] = True,
     confirm: Annotated[
         bool,
         typer.Option(
@@ -2135,15 +2411,53 @@ def _continue_command(
             help="Confirm execution of a draft plan.",
         ),
     ] = False,
+    no_parallel: Annotated[
+        bool,
+        typer.Option(
+            "--no-parallel",
+            help="Disable parallel execution and resume a single task (used inside an agent).",
+        ),
+    ] = False,
+    concurrency: Annotated[
+        int,
+        typer.Option(
+            "--concurrency",
+            "-c",
+            help="Max parallel agents (default 5, max 30).",
+        ),
+    ] = 5,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Show what would be launched without actually running agents.",
+        ),
+    ] = False,
 ):
-    """Resume the next task from a plan. Only works inside a coding agent."""
-    _continue_with_claude(
-        plan_id,
-        work_dir=work_dir,
-        auto_continue=auto_continue,
-        parallel=parallel,
-        confirm=confirm,
-    )
+    """Resume execution of a plan. Launches parallel agents by default."""
+    # Inside a coding agent (piped stdout), always single-task mode.
+    # In user's terminal, default to parallel unless --no-parallel is passed.
+    use_parallel = not no_parallel and (sys.stdout.isatty() or dry_run)
+    if not use_parallel:
+        _continue_with_claude(
+            plan_id,
+            work_dir=work_dir,
+            auto_continue=auto_continue,
+            parallel=not no_parallel,
+            confirm=confirm,
+        )
+    else:
+        _ensure_authenticated()
+        concurrency = max(1, min(concurrency, 30))
+        asyncio.run(
+            _run_parallel(
+                plan_id,
+                work_dir=work_dir,
+                max_concurrency=concurrency,
+                run_all=auto_continue,
+                dry_run=dry_run,
+            )
+        )
 
 
 CLAUDE_COMMANDS_DIR = Path.home() / ".claude" / "commands"
