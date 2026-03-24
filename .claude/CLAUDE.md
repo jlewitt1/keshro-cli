@@ -72,6 +72,7 @@ Key execution features in the prompt:
 - Parallel agent assignment with dependency checking (default on)
 - Parallelizable task splitting into sub-tasks
 - Task handoff — "Next task should know:" notes flow to the next task
+- Topical context — `_extract_topical_context()` matches task tags to find relevant learnings from any completed task, not just the preceding one
 - Agent session IDs (`--reason "session:<id>"` on task start)
 - Git-aware state detection (changes since last checkpoint)
 - Error retry for connection failures
