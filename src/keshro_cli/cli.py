@@ -1214,6 +1214,17 @@ async def _launch_single_agent(
     async with semaphore:
         await _mark_task_status_async(api_client, plan_id, task_id, "in_progress")
 
+        # Register with Collaborator if available
+        collab_session_id = f"keshro-{task_id}"
+        try:
+            from .collaborator import session_start, session_end, notify, is_available
+
+            collab_active = is_available()
+            if collab_active:
+                session_start(collab_session_id, work_dir)
+        except Exception:
+            collab_active = False
+
         start = time.monotonic()
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -1238,6 +1249,11 @@ async def _launch_single_agent(
             stdout_bytes, stderr_bytes = await proc.communicate()
             exit_code = proc.returncode or 0
         except Exception as exc:
+            if collab_active:
+                try:
+                    session_end(collab_session_id)
+                except Exception:
+                    pass
             return AgentResult(
                 task_id=task_id,
                 task_title=task_title,
@@ -1300,6 +1316,17 @@ async def _launch_single_agent(
             await _mark_task_status_async(
                 api_client, plan_id, task_id, "blocked", blocked_reason=reason
             )
+
+        # End Collaborator session + notify
+        if collab_active:
+            try:
+                session_end(collab_session_id)
+                if exit_code == 0:
+                    notify(f"✓ {task_title[:50]} completed ({duration:.0f}s)")
+                else:
+                    notify(f"✗ {task_title[:50]} blocked")
+            except Exception:
+                pass
 
         return AgentResult(
             task_id=task_id,
@@ -1378,6 +1405,16 @@ async def _run_parallel(
             break
 
         print(f"\nLaunching {len(actionable)} agent(s) (max concurrency: {max_concurrency})...\n")
+
+        # Notify Collaborator about wave start
+        try:
+            from .collaborator import notify as _collab_notify, is_available as _collab_check
+
+            if _collab_check():
+                task_names = ", ".join(t.get("title", "")[:30] for t in actionable[:3])
+                _collab_notify(f"Wave {wave}: {len(actionable)} agents starting — {task_names}")
+        except Exception:
+            pass
 
         semaphore = asyncio.Semaphore(max_concurrency)
         async with make_async_client(_state.api_url, _state.token) as api_client:
