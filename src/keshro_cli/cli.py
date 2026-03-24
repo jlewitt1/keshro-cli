@@ -3860,6 +3860,287 @@ def _edit_task_alias(
 
 
 # ---------------------------------------------------------------------------
+# Rollback command
+# ---------------------------------------------------------------------------
+
+
+@app.command("rollback")
+def _rollback(
+    task_id: Annotated[str, typer.Argument(help="Task ID to rollback to (reverts to the checkpoint before this task).")],
+    plan_id_option: Annotated[
+        Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
+    ] = None,
+    force: Annotated[bool, typer.Option("--force", "-f", help="Skip confirmation.")] = False,
+):
+    """Rollback to the git checkpoint before a task was started."""
+    resolved_plan_id = _require_plan_context(plan_id_option)
+
+    # Check for uncommitted changes
+    status_result = subprocess.run(
+        ["git", "status", "--porcelain"],
+        capture_output=True, text=True, check=False,
+    )
+    if (status_result.stdout or "").strip():
+        if not force:
+            print(f"{YELLOW}Warning: You have uncommitted changes that will be lost.{RESET}")
+            confirm = typer.confirm("Continue with rollback?", default=False)
+            if not confirm:
+                print("Rollback cancelled.")
+                raise typer.Exit(0)
+
+    # Find the checkpoint commit for this task
+    grep_pattern = f"keshro: checkpoint before {task_id}"
+    log_result = subprocess.run(
+        ["git", "log", "--oneline", "--grep", grep_pattern, "-1", "--format=%H %s"],
+        capture_output=True, text=True, check=False,
+    )
+    checkpoint_line = (log_result.stdout or "").strip()
+    if not checkpoint_line:
+        # Try alternative checkpoint format
+        grep_pattern2 = f"keshro: checkpoint"
+        log_result2 = subprocess.run(
+            ["git", "log", "--oneline", "--grep", grep_pattern2, "--format=%H %s"],
+            capture_output=True, text=True, check=False,
+        )
+        checkpoints = [l.strip() for l in (log_result2.stdout or "").splitlines() if l.strip()]
+        if not checkpoints:
+            print(f"{RED}No checkpoint commit found for task '{task_id}'.{RESET}", file=sys.stderr)
+            print(f"Checkpoints are created automatically when 'keshro continue' starts a task.", file=sys.stderr)
+            raise typer.Exit(1)
+        # Show available checkpoints
+        print(f"{YELLOW}No checkpoint specifically for task '{task_id}'. Available checkpoints:{RESET}")
+        for cp in checkpoints[:10]:
+            parts = cp.split(" ", 1)
+            print(f"  {DIM}{parts[0][:8]}{RESET}  {parts[1] if len(parts) > 1 else ''}")
+        raise typer.Exit(1)
+
+    commit_hash = checkpoint_line.split(" ", 1)[0]
+    commit_msg = checkpoint_line.split(" ", 1)[1] if " " in checkpoint_line else ""
+
+    if not force:
+        print(f"Will rollback to: {DIM}{commit_hash[:8]}{RESET} {commit_msg}")
+        confirm = typer.confirm("Proceed?", default=True)
+        if not confirm:
+            print("Rollback cancelled.")
+            raise typer.Exit(0)
+
+    # Perform the rollback
+    result = subprocess.run(
+        ["git", "reset", "--hard", commit_hash],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        print(f"{RED}Rollback failed: {result.stderr}{RESET}", file=sys.stderr)
+        raise typer.Exit(1)
+
+    print(f"{GREEN}Rolled back to checkpoint {commit_hash[:8]}{RESET}")
+    if _state.json:
+        print_output({"status": "ok", "action": "rollback", "commit": commit_hash, "task_id": task_id})
+
+
+# ---------------------------------------------------------------------------
+# Explain command
+# ---------------------------------------------------------------------------
+
+
+@app.command("explain")
+def _explain(
+    task_id: Annotated[str, typer.Argument(help="Task ID to explain decisions for.")],
+    plan_id_option: Annotated[
+        Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
+    ] = None,
+):
+    """Show the decision audit trail for a task."""
+    resolved_plan_id = _require_plan_context(plan_id_option)
+    client = make_client()
+
+    try:
+        resp = client.get(f"/api/plans/{resolved_plan_id}")
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        _print_http_error(exc)
+        raise typer.Exit(1) from exc
+
+    plan = resp.json()
+    task = _find_task(plan, task_id)
+    if not task:
+        print(f"{RED}Task '{task_id}' not found in plan.{RESET}", file=sys.stderr)
+        raise typer.Exit(1)
+
+    decisions = task.get("decisions", [])
+    if not decisions:
+        print(f"{DIM}No decisions recorded for task '{task_id}'.{RESET}")
+        print(f"Agents record decisions via 'keshro task decide' or the /api/agent/decide endpoint.")
+        if _state.json:
+            print_output({"task_id": task_id, "decisions": []})
+        raise typer.Exit(0)
+
+    if _state.json:
+        print_output({"task_id": task_id, "title": task.get("title", ""), "decisions": decisions})
+        raise typer.Exit(0)
+
+    print(f"\n{CYAN}Decisions for: {task.get('title', task_id)}{RESET}")
+    print(f"{DIM}{'─' * 60}{RESET}\n")
+
+    for i, decision in enumerate(decisions, 1):
+        ts = decision.get("timestamp", "")
+        if ts:
+            ts = ts[:19].replace("T", " ")
+        print(f"  {YELLOW}Decision #{i}{RESET}  {DIM}{ts}{RESET}")
+        print(f"  {CYAN}Context:{RESET}  {decision.get('context', 'N/A')}")
+
+        alternatives = decision.get("alternatives", [])
+        if alternatives:
+            print(f"  {CYAN}Alternatives considered:{RESET}")
+            for alt in alternatives:
+                print(f"    • {alt}")
+
+        print(f"  {GREEN}Choice:{RESET}  {decision.get('choice', 'N/A')}")
+        print(f"  {CYAN}Reasoning:{RESET}  {decision.get('reasoning', 'N/A')}")
+        print()
+
+
+# ---------------------------------------------------------------------------
+# Plan create (generic) command
+# ---------------------------------------------------------------------------
+
+
+@plan_app.command("generate")
+def _plan_generate(
+    description: Annotated[str, typer.Argument(help="Description of the project/work to plan.")],
+    plan_type: Annotated[str, typer.Option("--type", "-t", help="Project type: generic, migration.")] = "generic",
+    title: Annotated[Optional[str], typer.Option("--title", help="Plan title. Auto-generated if omitted.")] = None,
+    confirm: Annotated[bool, typer.Option("--confirm", help="Auto-confirm the draft plan.")] = False,
+):
+    """Generate a plan from a description using AI."""
+    _ensure_authenticated()
+    client = make_client()
+
+    print(f"{CYAN}Generating plan from description...{RESET}")
+
+    # For migration type, use existing flow
+    if plan_type == "migration":
+        print(f"{YELLOW}For migration plans, use 'keshro create' with source/target types.{RESET}")
+        raise typer.Exit(0)
+
+    # Call the plan generation endpoint
+    payload = {
+        "description": description,
+        "project_type": plan_type,
+        "title": title,
+    }
+
+    try:
+        resp = client.post("/api/plans/generate", json=payload, timeout=120)
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            # Endpoint not yet available — provide helpful message
+            print(f"{YELLOW}Plan generation endpoint not yet available.{RESET}")
+            print(f"The /api/plans/generate endpoint will be added in the next backend update.")
+            print(f"\nIn the meantime, create plans manually:")
+            print(f"  keshro plan create --from-file plan.json")
+            raise typer.Exit(0) from exc
+        _print_http_error(exc)
+        raise typer.Exit(1) from exc
+
+    plan = resp.json()
+    plan_id = plan.get("id", "")
+    steps = plan.get("plan_steps", [])
+
+    _set_default_plan_after_create(plan)
+
+    print(f"\n{GREEN}Plan created: {plan.get('title', 'Untitled')}{RESET}")
+    print(f"  ID: {plan_id}")
+    print(f"  Tasks: {len(steps)}")
+    print(f"  Status: {plan.get('status', 'draft')}")
+
+    if steps:
+        print(f"\n{CYAN}Tasks:{RESET}")
+        for step in steps:
+            dep_info = ""
+            if step.get("depends_on"):
+                dep_info = f" {DIM}(depends on: {', '.join(step['depends_on'])}){RESET}"
+            print(f"  {step.get('order', 0):2d}. {step.get('title', 'Untitled')}{dep_info}")
+
+    if not confirm and plan.get("status") == "draft":
+        print(f"\n{DIM}Plan is in draft. Run 'keshro continue -p {plan_id} --confirm' to start execution.{RESET}")
+
+    if _state.json:
+        print_output(plan)
+
+
+# ---------------------------------------------------------------------------
+# Task decide command
+# ---------------------------------------------------------------------------
+
+
+@task_app.command("decide")
+def _task_decide(
+    plan_id_or_task_id: Annotated[
+        str, typer.Argument(help="Plan ID, or Task ID if a default plan is saved.")
+    ],
+    task_id: Annotated[
+        Optional[str],
+        typer.Argument(help="Task ID. Optional when a default plan is saved."),
+    ] = None,
+    plan_id_option: Annotated[
+        Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
+    ] = None,
+    context: Annotated[
+        str, typer.Option("--context", "-c", help="Decision context.")
+    ] = "",
+    choice: Annotated[
+        str, typer.Option("--choice", help="What was decided.")
+    ] = "",
+    reasoning: Annotated[
+        str, typer.Option("--reasoning", "-r", help="Why this choice was made.")
+    ] = "",
+    alternatives: Annotated[
+        Optional[list[str]], typer.Option("--alt", "-a", help="Alternative considered (repeatable).")
+    ] = None,
+):
+    """Record a structured decision for a task."""
+    resolved_plan_id: str | None
+    resolved_task_id: str
+    if plan_id_option:
+        resolved_plan_id = plan_id_option
+        resolved_task_id = task_id or plan_id_or_task_id
+    elif task_id is None:
+        resolved_plan_id = _require_plan_context(None)
+        resolved_task_id = plan_id_or_task_id
+    else:
+        resolved_plan_id = plan_id_or_task_id
+        resolved_task_id = task_id
+
+    if not context or not choice or not reasoning:
+        print(f"{RED}All of --context, --choice, and --reasoning are required.{RESET}", file=sys.stderr)
+        raise typer.Exit(1)
+
+    client = make_client()
+    payload = {
+        "task_id": resolved_task_id,
+        "context": context,
+        "alternatives": alternatives or [],
+        "choice": choice,
+        "reasoning": reasoning,
+    }
+
+    try:
+        resp = client.post(f"/api/agent/plans/{resolved_plan_id}/decide", json=payload)
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        _print_http_error(exc)
+        raise typer.Exit(1) from exc
+
+    result = resp.json()
+    print(f"{GREEN}Decision recorded for task '{resolved_task_id}' ({result.get('decisions_count', 0)} total).{RESET}")
+
+    if _state.json:
+        print_output(result)
+
+
+# ---------------------------------------------------------------------------
 # Error handlers
 # ---------------------------------------------------------------------------
 
