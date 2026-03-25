@@ -5074,13 +5074,14 @@ def _watch_start(
     ] = 1.0,
     foreground: Annotated[
         bool,
-        typer.Option("--foreground", "-f", help="Run in foreground (don't daemonize)."),
-    ] = True,
+        typer.Option("--foreground", "-f", help="Run in foreground instead of backgrounding."),
+    ] = False,
 ):
     """Start the Keshro background daemon.
 
     Watches git activity and automatically tracks task progress.
     Auto-detects the plan from saved config or .keshro file.
+    Runs in the background by default. Use --foreground to keep in terminal.
     """
     if ctx.invoked_subcommand is not None:
         return
@@ -5093,30 +5094,74 @@ def _watch_start(
 
     _ensure_authenticated()
 
+    # Resolve repo root before potentially forking
+    repo_root = Path.cwd()
+    try:
+        import subprocess as _sp
+        result = _sp.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            repo_root = Path(result.stdout.strip())
+    except Exception:
+        pass
+
+    plan_label = plan_id or _current_plan_id() or "auto-detect"
+
+    if not foreground:
+        # Background: spawn a detached subprocess running this command with --foreground
+        import subprocess as _sp
+        cmd = [sys.executable, "-m", "keshro_cli.cli"]
+        # Reconstruct args
+        if _state.api_url:
+            cmd.extend(["--api-url", _state.api_url])
+        cmd.extend(["watch", "--foreground"])
+        if plan_id:
+            cmd.extend(["--plan-id", plan_id])
+        if poll_interval != 1.0:
+            cmd.extend(["--poll-interval", str(poll_interval)])
+
+        # Redirect stdout/stderr to log file
+        from .daemon import LOG_FILE
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        log_fh = open(LOG_FILE, "a")
+
+        proc = _sp.Popen(
+            cmd,
+            stdout=log_fh,
+            stderr=log_fh,
+            stdin=_sp.DEVNULL,
+            start_new_session=True,  # Detach from terminal
+            cwd=str(repo_root),
+        )
+
+        # Wait briefly to check it didn't immediately crash
+        import time as _time
+        _time.sleep(0.5)
+        if proc.poll() is not None:
+            print(f"{RED}Daemon failed to start. Check ~/.keshro/daemon.log{RESET}")
+            raise typer.Exit(1)
+
+        print(f"{GREEN}Keshro daemon started{RESET} (PID {proc.pid})")
+        print(f"  Plan: {plan_label}")
+        print(f"  Repo: {repo_root}")
+        print(f"  Log:  ~/.keshro/daemon.log")
+        print(f"  Stop: keshro watch stop")
+        return
+
+    # Foreground mode: run the daemon in this process
     daemon = KeshroDaemon(
         plan_id=_current_plan_id(plan_id),
         poll_interval=poll_interval,
         api_url=_state.api_url or None,
         token=_state.token,
     )
-
-    # Auto-setup on first run
-    daemon.state.repo_root = __import__("pathlib").Path.cwd()
-    try:
-        import subprocess as _sp
-        result = _sp.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, timeout=5)
-        if result.returncode == 0:
-            daemon.state.repo_root = __import__("pathlib").Path(result.stdout.strip())
-    except Exception:
-        pass
+    daemon.state.repo_root = repo_root
     daemon.setup_repo()
 
-    plan_label = plan_id or _current_plan_id() or "auto-detect"
-    print(f"{GREEN}Starting keshro daemon...{RESET}")
+    print(f"{GREEN}Starting keshro daemon (foreground)...{RESET}")
     print(f"  Plan: {plan_label}")
-    print(f"  Repo: {daemon.state.repo_root}")
+    print(f"  Repo: {repo_root}")
     print(f"  Log:  ~/.keshro/daemon.log")
-    print(f"  Stop: keshro watch stop")
+    print(f"  Stop: Ctrl+C")
     print()
 
     asyncio.run(daemon.start())
@@ -5154,12 +5199,57 @@ def _watch_status():
         print(f"{YELLOW}Daemon is running but status unavailable.{RESET}")
         raise typer.Exit(0)
 
-    print(f"{GREEN}Daemon running{RESET} (PID {status.get('pid', '?')})")
-    if status.get("last_heartbeat"):
-        print(f"  Last heartbeat: {status['last_heartbeat']}")
-    print(f"  Log: {LOG_FILE}")
+    pid = status.get("pid", "?")
+    mode = "observe-only" if status.get("observe_only") else "active"
+    print(f"{GREEN}● Keshro daemon running{RESET} (PID {pid}, {mode})")
     print()
-    print(f"For detailed logs: tail -f {LOG_FILE}")
+
+    # Plan info
+    plan_title = status.get("plan_title") or status.get("plan_id") or "none"
+    print(f"  Plan:    {plan_title}")
+
+    # Current task
+    task_title = status.get("current_task_title")
+    task_id = status.get("current_task_id")
+    if task_title:
+        print(f"  Task:    {task_title} ({task_id})")
+    elif task_id:
+        print(f"  Task:    {task_id}")
+    else:
+        print(f"  Task:    {DIM}none{RESET}")
+
+    # Repo
+    repo = status.get("repo", "")
+    if repo:
+        print(f"  Repo:    {repo}")
+
+    print()
+
+    # Stats
+    events = status.get("events_processed", 0)
+    completed = status.get("tasks_completed", 0)
+    queue = status.get("queue_size", 0)
+    print(f"  Events processed:  {events}")
+    print(f"  Tasks completed:   {completed}")
+    if queue > 0:
+        print(f"  Queued events:     {YELLOW}{queue}{RESET}")
+
+    # Heartbeat
+    hb = status.get("last_heartbeat", "")
+    if hb:
+        print(f"  Last heartbeat:    {hb}")
+
+    # Pending observations
+    obs_count = status.get("pending_observations", 0)
+    recent_obs = status.get("recent_observations", [])
+    if obs_count > 0:
+        print()
+        print(f"  {YELLOW}Pending observations ({obs_count}):{RESET}")
+        for obs in recent_obs[-5:]:
+            print(f"    [{obs.get('type', '?')}] {obs.get('description', '')}")
+
+    print()
+    print(f"  Log: {LOG_FILE}")
 
 
 if __name__ == "__main__":

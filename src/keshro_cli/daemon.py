@@ -43,6 +43,7 @@ logger = logging.getLogger("keshro.daemon")
 KESHRO_DIR = Path.home() / ".keshro"
 PID_FILE = KESHRO_DIR / "daemon.pid"
 HEARTBEAT_FILE = KESHRO_DIR / "last_heartbeat"
+STATUS_FILE = KESHRO_DIR / "daemon-status.json"
 LOG_FILE = KESHRO_DIR / "daemon.log"
 MAX_QUEUE_SIZE = 1000
 HEARTBEAT_INTERVAL = 30  # seconds
@@ -244,6 +245,7 @@ class KeshroDaemon:
         self._write_context()
 
         logger.info(f"Daemon started (PID {os.getpid()}, repo: {repo_root.name})")
+        self._write_status_file()
 
         # Register signal handlers
         loop = asyncio.get_event_loop()
@@ -276,6 +278,7 @@ class KeshroDaemon:
             sock_path = _socket_path(repo_root)
             sock_path.unlink(missing_ok=True)
 
+        STATUS_FILE.unlink(missing_ok=True)
         logger.info("Daemon stopped")
 
     # ------------------------------------------------------------------
@@ -346,6 +349,7 @@ class KeshroDaemon:
 
             self.state.last_heartbeat = datetime.now(timezone.utc).isoformat()
             HEARTBEAT_FILE.write_text(self.state.last_heartbeat)
+            self._write_status_file()
         except Exception as e:
             logger.debug(f"Heartbeat failed: {e}")
 
@@ -575,18 +579,44 @@ class KeshroDaemon:
 
     def get_status(self) -> dict:
         """Return daemon status for `keshro watch status`."""
+        plan_title = ""
+        current_task_title = ""
+        if self.state.plan:
+            plan_title = self.state.plan.get("title") or ""
+            if self.state.current_task_id:
+                task = self._find_task_by_id(self.state.current_task_id)
+                if task:
+                    current_task_title = task.get("title", "")
+
+        recent_obs = [
+            {"type": o.signal_type, "description": o.description, "timestamp": o.timestamp}
+            for o in self.state.observations[-10:]
+        ]
+
         return {
             "running": self.state.running,
+            "pid": os.getpid(),
             "plan_id": self.state.plan_id,
-            "current_task": self.state.current_task_id,
+            "plan_title": plan_title,
+            "current_task_id": self.state.current_task_id,
+            "current_task_title": current_task_title,
             "observe_only": self.state.observe_only,
             "started_at": self.state.started_at,
             "last_heartbeat": self.state.last_heartbeat,
             "events_processed": self.state.events_processed,
             "tasks_completed": self.state.tasks_completed,
             "pending_observations": len(self.state.observations),
+            "recent_observations": recent_obs,
             "queue_size": len(self.state.event_queue),
+            "repo": str(self.state.repo_root or ""),
         }
+
+    def _write_status_file(self) -> None:
+        """Persist status to disk so `keshro watch status` can read it."""
+        try:
+            STATUS_FILE.write_text(json.dumps(self.get_status(), indent=2))
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -631,10 +661,16 @@ def stop_daemon() -> bool:
 
 
 def read_daemon_status() -> dict | None:
-    """Read daemon status from the log/PID file."""
+    """Read daemon status from the status file."""
     if not is_daemon_running():
         return None
-    # Return basic info from PID file
+    # Read rich status from daemon-status.json
+    if STATUS_FILE.exists():
+        try:
+            return json.loads(STATUS_FILE.read_text())
+        except Exception:
+            pass
+    # Fallback to basic PID info
     try:
         pid = int(PID_FILE.read_text().strip())
         last_hb = ""
