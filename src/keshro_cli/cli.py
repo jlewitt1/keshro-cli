@@ -3117,7 +3117,6 @@ def _print_plan_status(plan: dict) -> None:
 
 def _watch_via_sse(plan_id: str) -> None:
     """Watch plan status via SSE stream."""
-    import time as _time
 
     from httpx_sse import connect_sse
 
@@ -3128,12 +3127,16 @@ def _watch_via_sse(plan_id: str) -> None:
     plan = _get_plan_or_exit(plan_id)
     print("\033[2J\033[H", end="")
     _print_plan_status(plan)
-    print(f"  {GREEN}● live{RESET} · SSE connected · Ctrl+C to stop")
+    print(f"  {DIM}Connecting to SSE...{RESET}")
     try:
         with httpx.Client(
             base_url=_state.api_url, headers=headers, timeout=None
         ) as client:
             with connect_sse(client, "GET", f"/v1/plans/{plan_id}/stream") as sse:
+                # Connected — show live indicator
+                print("\033[2J\033[H", end="")
+                _print_plan_status(plan)
+                print(f"  {GREEN}● live{RESET} · SSE connected · Ctrl+C to stop")
                 for event in sse.iter_sse():
                     if event.event and event.event != "comment":
                         plan = _get_plan_or_exit(plan_id)
@@ -3204,7 +3207,10 @@ def _run_status(plan_id: str | None, watch: bool = False, tui: bool = False) -> 
     # Try SSE first, fall back to polling
     try:
         _watch_via_sse(resolved_plan_id)
-    except (ImportError, Exception):
+    except ImportError:
+        _watch_via_polling(resolved_plan_id)
+    except Exception as exc:
+        print(f"  {YELLOW}SSE failed ({exc}), falling back to polling{RESET}")
         _watch_via_polling(resolved_plan_id)
 
 

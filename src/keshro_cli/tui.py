@@ -253,7 +253,7 @@ class KeshroStatusApp(App):
                     async for event in sse.aiter_sse():
                         # Any event (task_updated, plan_updated, etc.) → re-fetch
                         if event.event and event.event != "comment":
-                            self.call_from_thread(self._fetch_and_update)
+                            self.call_later(self._fetch_and_update)
         except Exception:
             self._sse_connected = False
             self._update_live_indicator(False)
