@@ -3046,6 +3046,56 @@ def _print_plan_status(plan: dict) -> None:
     print()
 
 
+
+
+def _watch_via_sse(plan_id: str) -> None:
+    """Watch plan status via SSE stream."""
+    import time as _time
+
+    from httpx_sse import connect_sse
+
+    headers = {
+        "Authorization": f"Bearer {_state.token}",
+        "Accept": "text/event-stream",
+    }
+    plan = _get_plan_or_exit(plan_id)
+    print("\033[2J\033[H", end="")
+    _print_plan_status(plan)
+    print(f"  {GREEN}● live{RESET} · SSE connected · Ctrl+C to stop")
+    try:
+        with httpx.Client(
+            base_url=_state.api_url, headers=headers, timeout=None
+        ) as client:
+            with connect_sse(client, "GET", f"/v1/plans/{plan_id}/stream") as sse:
+                for event in sse.iter_sse():
+                    if event.event and event.event != "comment":
+                        plan = _get_plan_or_exit(plan_id)
+                        print("\033[2J\033[H", end="")
+                        _print_plan_status(plan)
+                        print(
+                            f"  {GREEN}● live{RESET} · SSE connected · Ctrl+C to stop"
+                        )
+    except KeyboardInterrupt:
+        print("\nStopped watching.")
+
+
+def _watch_via_polling(plan_id: str) -> None:
+    """Watch plan status via polling (fallback)."""
+    import time as _time
+
+    try:
+        while True:
+            print("\033[2J\033[H", end="")
+            plan = _get_plan_or_exit(plan_id)
+            _print_plan_status(plan)
+            print(
+                f"  {YELLOW}● polling{RESET} · refreshes every 10s · Ctrl+C to stop"
+            )
+            _time.sleep(10)
+    except KeyboardInterrupt:
+        print("\nStopped watching.")
+
+
 def _run_status(plan_id: str | None, watch: bool = False, tui: bool = False) -> None:
     import time as _time
 
@@ -3084,16 +3134,11 @@ def _run_status(plan_id: str | None, watch: bool = False, tui: bool = False) -> 
         print(render_plan_summary(plan))
         return
 
+    # Try SSE first, fall back to polling
     try:
-        while True:
-            # Clear screen and redraw
-            print("\033[2J\033[H", end="")
-            plan = _get_plan_or_exit(resolved_plan_id)
-            _print_plan_status(plan)
-            print(f"  {DIM}Watching · refreshes every 10s · Ctrl+C to stop{RESET}")
-            _time.sleep(10)
-    except KeyboardInterrupt:
-        print("\nStopped watching.")
+        _watch_via_sse(resolved_plan_id)
+    except (ImportError, Exception):
+        _watch_via_polling(resolved_plan_id)
 
 
 @plan_app.command("status")
