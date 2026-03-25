@@ -1261,6 +1261,7 @@ async def _launch_single_agent(
     total_agents: int,
     semaphore: asyncio.Semaphore,
     api_client: httpx.AsyncClient,
+    session_id: str = "",
 ) -> AgentResult:
     task_id = _clean(task.get("id")) or "unknown"
     task_title = _clean(task.get("title")) or "Untitled"
@@ -1280,6 +1281,18 @@ async def _launch_single_agent(
 
     async with semaphore:
         await _mark_task_status_async(api_client, plan_id, task_id, "in_progress")
+        # Report start with session ID via agent API
+        try:
+            await api_client.post(
+                f"/api/agent/plans/{plan_id}/task-event",
+                json={
+                    "task_id": task_id,
+                    "event": "start",
+                    "agent_session_id": session_id,
+                },
+            )
+        except Exception:
+            pass
 
         # Register with Collaborator if available
         collab_session_id = f"keshro-{task_id}"
@@ -1371,6 +1384,7 @@ async def _launch_single_agent(
                         "task_id": task_id,
                         "event": "note",
                         "note": f"Agent cost: ${cost_usd:.4f} ({tokens_used:,} tokens, {model_name})",
+                        "agent_session_id": session_id,
                         **cost_event,
                     },
                 )
@@ -1390,6 +1404,22 @@ async def _launch_single_agent(
             await _mark_task_status_async(
                 api_client, plan_id, task_id, "completed", notes=note
             )
+            # Report structured metrics via agent API
+            try:
+                await api_client.post(
+                    f"/api/agent/plans/{plan_id}/task-event",
+                    json={
+                        "task_id": task_id,
+                        "event": "done",
+                        "agent_session_id": session_id,
+                        "duration_seconds": duration,
+                        "tokens_used": tokens_used,
+                        "cost_usd": cost_usd,
+                        "model": model_name,
+                    },
+                )
+            except Exception:
+                pass
         else:
             reason = stderr_text[:200] or result_text[:200] or "Agent exited with error"
             await _mark_task_status_async(
@@ -1501,6 +1531,7 @@ async def _run_parallel(
                 _launch_single_agent(
                     task, plan, resolved_plan_id, resolved_dir,
                     len(actionable), semaphore, api_client,
+                    session_id=session_id,
                 )
                 for task in actionable
             ]
