@@ -233,7 +233,7 @@ class KeshroStatusApp(App):
                 },
                 timeout=5,
             ) as client:
-                resp = client.get(f"/api/v1/plans/{self.plan_id}")
+                resp = client.get(f"/v1/plans/{self.plan_id}")
                 resp.raise_for_status()
                 data = resp.json()
             self._last_data = data
