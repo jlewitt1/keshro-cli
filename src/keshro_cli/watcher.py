@@ -51,8 +51,11 @@ class _GitEventHandler(FileSystemEventHandler if HAS_WATCHDOG else object):
         self._lock = threading.Lock()
 
     def on_modified(self, event: FileSystemEvent) -> None:
-        path = Path(event.src_path)
-        rel = str(path.relative_to(self._repo_root))
+        try:
+            path = Path(event.src_path)
+            rel = str(path.relative_to(self._repo_root))
+        except ValueError:
+            return
 
         if rel == ".git/HEAD":
             self._check_branch_switch()
@@ -63,8 +66,11 @@ class _GitEventHandler(FileSystemEventHandler if HAS_WATCHDOG else object):
             pass
 
     def on_created(self, event: FileSystemEvent) -> None:
-        path = Path(event.src_path)
-        rel = str(path.relative_to(self._repo_root))
+        try:
+            path = Path(event.src_path)
+            rel = str(path.relative_to(self._repo_root))
+        except ValueError:
+            return
 
         if rel.startswith(".git/refs/heads/"):
             self._check_commit()

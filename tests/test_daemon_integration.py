@@ -15,13 +15,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from keshro_cli.daemon import (
-    HEARTBEAT_FILE,
     HEARTBEAT_INTERVAL,
     KeshroDaemon,
-    PID_FILE,
-    STATUS_FILE,
     DaemonState,
     _find_current_task,
+    _heartbeat_file,
+    _pid_file,
+    _status_file,
     is_daemon_running,
     read_daemon_status,
     stop_daemon,
@@ -238,14 +238,14 @@ class TestHeartbeatIntegration:
 
         asyncio.run(_heartbeat())
 
-        assert STATUS_FILE.exists()
-        status = json.loads(STATUS_FILE.read_text())
+        assert _status_file(tmp_repo).exists()
+        status = json.loads(_status_file(tmp_repo).read_text())
         assert status["plan_id"] == "plan-1"
         assert status["current_task_id"] == "task-2"
         assert status["running"] is True
 
         # Cleanup
-        STATUS_FILE.unlink(missing_ok=True)
+        _status_file(tmp_repo).unlink(missing_ok=True)
 
     def test_heartbeat_skips_in_observe_only_mode(self, daemon):
         """Heartbeat should be a no-op when no plan is linked."""
@@ -389,14 +389,14 @@ class TestDaemonLifecycle:
                 daemon.state.started_at = "2026-03-25T12:00:00Z"
                 daemon._setup_logging()
 
-                PID_FILE.parent.mkdir(parents=True, exist_ok=True)
-                PID_FILE.write_text(str(os.getpid()))
+                _pid_file(tmp_repo).parent.mkdir(parents=True, exist_ok=True)
+                _pid_file(tmp_repo).write_text(str(os.getpid()))
 
                 # Write context
                 daemon._write_context()
 
                 # Verify PID file exists
-                assert PID_FILE.exists()
+                assert _pid_file(tmp_repo).exists()
 
                 # Verify context file exists
                 assert (tmp_repo / ".claude" / "keshro-context.md").exists()
@@ -405,16 +405,16 @@ class TestDaemonLifecycle:
                 await daemon._cleanup()
 
                 # PID file should be gone
-                assert not PID_FILE.exists()
+                assert not _pid_file(tmp_repo).exists()
                 # Status file should be gone
-                assert not STATUS_FILE.exists()
+                assert not _status_file(tmp_repo).exists()
 
         asyncio.run(_run_briefly())
 
     def test_stale_pid_cleanup(self, tmp_repo):
         """Starting with a stale PID file should clean it up."""
-        PID_FILE.parent.mkdir(parents=True, exist_ok=True)
-        PID_FILE.write_text("99999999")  # Non-existent PID
+        _pid_file(tmp_repo).parent.mkdir(parents=True, exist_ok=True)
+        _pid_file(tmp_repo).write_text("99999999")  # Non-existent PID
 
         daemon = KeshroDaemon(plan_id="plan-1")
         daemon.state.repo_root = tmp_repo
@@ -430,18 +430,18 @@ class TestDaemonLifecycle:
         assert not sock_path.exists()
 
         # Cleanup
-        PID_FILE.unlink(missing_ok=True)
+        _pid_file(tmp_repo).unlink(missing_ok=True)
 
 
 class TestStatusFileIntegration:
     """Test: status file round-trip (daemon writes, CLI reads)."""
 
-    def test_status_round_trip(self, daemon):
+    def test_status_round_trip(self, daemon, tmp_repo):
         """Status written by daemon should be readable by read_daemon_status."""
         daemon._write_status_file()
 
-        assert STATUS_FILE.exists()
-        status = json.loads(STATUS_FILE.read_text())
+        assert _status_file(tmp_repo).exists()
+        status = json.loads(_status_file(tmp_repo).read_text())
 
         assert status["plan_id"] == "plan-1"
         assert status["plan_title"] == "Test Plan"
@@ -452,9 +452,9 @@ class TestStatusFileIntegration:
         assert status["repo"] == str(daemon.state.repo_root)
 
         # Cleanup
-        STATUS_FILE.unlink(missing_ok=True)
+        _status_file(tmp_repo).unlink(missing_ok=True)
 
-    def test_status_includes_recent_observations(self, daemon):
+    def test_status_includes_recent_observations(self, daemon, tmp_repo):
         """Status should include the last 10 observations."""
         from keshro_cli.daemon import Observation
 
@@ -464,14 +464,14 @@ class TestStatusFileIntegration:
             )
 
         daemon._write_status_file()
-        status = json.loads(STATUS_FILE.read_text())
+        status = json.loads(_status_file(tmp_repo).read_text())
 
         assert status["pending_observations"] == 15
         assert len(status["recent_observations"]) == 10  # Last 10 only
         assert status["recent_observations"][-1]["description"] == "obs-14"
 
         # Cleanup
-        STATUS_FILE.unlink(missing_ok=True)
+        _status_file(tmp_repo).unlink(missing_ok=True)
 
 
 class TestAutoSetupIntegration:

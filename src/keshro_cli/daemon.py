@@ -41,12 +41,27 @@ from .watcher import GitWatcher, GitEvent
 logger = logging.getLogger("keshro.daemon")
 
 KESHRO_DIR = Path.home() / ".keshro"
-PID_FILE = KESHRO_DIR / "daemon.pid"
-HEARTBEAT_FILE = KESHRO_DIR / "last_heartbeat"
-STATUS_FILE = KESHRO_DIR / "daemon-status.json"
 LOG_FILE = KESHRO_DIR / "daemon.log"
 MAX_QUEUE_SIZE = 1000
+MAX_OBSERVATIONS = 500
 HEARTBEAT_INTERVAL = 30  # seconds
+
+
+def _repo_hash(repo_root: Path) -> str:
+    return hashlib.sha256(str(repo_root).encode()).hexdigest()[:12]
+
+
+def _pid_file(repo_root: Path) -> Path:
+    """Per-repo PID file: ~/.keshro/daemon-{hash}.pid"""
+    return KESHRO_DIR / f"daemon-{_repo_hash(repo_root)}.pid"
+
+
+def _heartbeat_file(repo_root: Path) -> Path:
+    return KESHRO_DIR / f"daemon-{_repo_hash(repo_root)}.heartbeat"
+
+
+def _status_file(repo_root: Path) -> Path:
+    return KESHRO_DIR / f"daemon-{_repo_hash(repo_root)}-status.json"
 
 
 @dataclass
@@ -70,7 +85,7 @@ class DaemonState:
     running: bool = False
     observe_only: bool = False  # True when no plan found
     event_queue: deque = field(default_factory=lambda: deque(maxlen=MAX_QUEUE_SIZE))
-    observations: list[Observation] = field(default_factory=list)
+    observations: deque = field(default_factory=lambda: deque(maxlen=MAX_OBSERVATIONS))
     files_in_progress: dict[str, str] = field(default_factory=dict)  # file -> task_id
     started_at: str = ""
     last_heartbeat: str = ""
@@ -98,8 +113,7 @@ def _repo_root() -> Path | None:
 
 def _socket_path(repo_root: Path) -> Path:
     """Per-repo socket path: ~/.keshro/daemon-{hash}.sock"""
-    repo_hash = hashlib.sha256(str(repo_root).encode()).hexdigest()[:12]
-    return KESHRO_DIR / f"daemon-{repo_hash}.sock"
+    return KESHRO_DIR / f"daemon-{_repo_hash(repo_root)}.sock"
 
 
 def _match_task_id_in_commit(message: str, plan: dict | None) -> str | None:
@@ -196,9 +210,10 @@ class KeshroDaemon:
             logger.info("Cleaned up stale daemon")
 
         # Check if another daemon is running for this repo
-        if PID_FILE.exists():
+        pid_path = _pid_file(repo_root)
+        if pid_path.exists():
             try:
-                old_pid = int(PID_FILE.read_text().strip())
+                old_pid = int(pid_path.read_text().strip())
                 os.kill(old_pid, 0)  # Check if process exists
                 logger.error(f"Daemon already running (PID {old_pid})")
                 raise SystemExit(
@@ -207,10 +222,10 @@ class KeshroDaemon:
                 )
             except (ProcessLookupError, ValueError):
                 # Stale PID file
-                PID_FILE.unlink(missing_ok=True)
+                pid_path.unlink(missing_ok=True)
 
         # Write PID
-        PID_FILE.write_text(str(os.getpid()))
+        pid_path.write_text(str(os.getpid()))
 
         # Resolve plan
         if not self.state.plan_id:
@@ -272,13 +287,11 @@ class KeshroDaemon:
         await self._flush_queue()
 
         # Cleanup files
-        PID_FILE.unlink(missing_ok=True)
         repo_root = self.state.repo_root
         if repo_root:
-            sock_path = _socket_path(repo_root)
-            sock_path.unlink(missing_ok=True)
-
-        STATUS_FILE.unlink(missing_ok=True)
+            _pid_file(repo_root).unlink(missing_ok=True)
+            _socket_path(repo_root).unlink(missing_ok=True)
+            _status_file(repo_root).unlink(missing_ok=True)
         logger.info("Daemon stopped")
 
     # ------------------------------------------------------------------
@@ -348,7 +361,8 @@ class KeshroDaemon:
                     self._write_context()
 
             self.state.last_heartbeat = datetime.now(timezone.utc).isoformat()
-            HEARTBEAT_FILE.write_text(self.state.last_heartbeat)
+            if self.state.repo_root:
+                _heartbeat_file(self.state.repo_root).write_text(self.state.last_heartbeat)
             self._write_status_file()
         except Exception as e:
             logger.debug(f"Heartbeat failed: {e}")
@@ -497,7 +511,7 @@ class KeshroDaemon:
 
             # Pending observations
             if self.state.observations:
-                recent = self.state.observations[-5:]
+                recent = list(self.state.observations)[-5:]
                 lines.append("## Pending Observations")
                 lines.append("*These were detected but not auto-acted on. Review with `keshro watch status`.*")
                 lines.append("")
@@ -555,16 +569,19 @@ class KeshroDaemon:
         """Check for and clean up a stale daemon socket."""
         if not sock_path.exists():
             return False
-        if PID_FILE.exists():
+        repo_root = self.state.repo_root
+        pid_path = _pid_file(repo_root) if repo_root else None
+        if pid_path and pid_path.exists():
             try:
-                old_pid = int(PID_FILE.read_text().strip())
+                old_pid = int(pid_path.read_text().strip())
                 os.kill(old_pid, 0)
                 return False  # Process is alive
             except (ProcessLookupError, ValueError):
                 pass
         # Stale — clean up
         sock_path.unlink(missing_ok=True)
-        PID_FILE.unlink(missing_ok=True)
+        if pid_path:
+            pid_path.unlink(missing_ok=True)
         return True
 
     def _setup_logging(self) -> None:
@@ -588,9 +605,10 @@ class KeshroDaemon:
                 if task:
                     current_task_title = task.get("title", "")
 
+        obs_list = list(self.state.observations)
         recent_obs = [
             {"type": o.signal_type, "description": o.description, "timestamp": o.timestamp}
-            for o in self.state.observations[-10:]
+            for o in obs_list[-10:]
         ]
 
         return {
@@ -613,8 +631,10 @@ class KeshroDaemon:
 
     def _write_status_file(self) -> None:
         """Persist status to disk so `keshro watch status` can read it."""
+        if not self.state.repo_root:
+            return
         try:
-            STATUS_FILE.write_text(json.dumps(self.get_status(), indent=2))
+            _status_file(self.state.repo_root).write_text(json.dumps(self.get_status(), indent=2))
         except OSError:
             pass
 
@@ -624,27 +644,32 @@ class KeshroDaemon:
 # ---------------------------------------------------------------------------
 
 
-def is_daemon_running() -> bool:
-    """Check if a daemon is running for the current repo."""
-    repo_root = _repo_root()
+def is_daemon_running(repo: Path | None = None) -> bool:
+    """Check if a daemon is running for the given (or current) repo."""
+    repo_root = repo or _repo_root()
     if not repo_root:
         return False
-    if not PID_FILE.exists():
+    pid_path = _pid_file(repo_root)
+    if not pid_path.exists():
         return False
     try:
-        pid = int(PID_FILE.read_text().strip())
+        pid = int(pid_path.read_text().strip())
         os.kill(pid, 0)
         return True
     except (ProcessLookupError, ValueError, FileNotFoundError):
         return False
 
 
-def stop_daemon() -> bool:
+def stop_daemon(repo: Path | None = None) -> bool:
     """Stop the running daemon by sending SIGTERM."""
-    if not PID_FILE.exists():
+    repo_root = repo or _repo_root()
+    if not repo_root:
+        return False
+    pid_path = _pid_file(repo_root)
+    if not pid_path.exists():
         return False
     try:
-        pid = int(PID_FILE.read_text().strip())
+        pid = int(pid_path.read_text().strip())
         os.kill(pid, signal.SIGTERM)
         # Wait briefly for cleanup
         for _ in range(20):
@@ -652,30 +677,35 @@ def stop_daemon() -> bool:
             try:
                 os.kill(pid, 0)
             except ProcessLookupError:
-                PID_FILE.unlink(missing_ok=True)
+                pid_path.unlink(missing_ok=True)
                 return True
         return False
     except (ProcessLookupError, ValueError):
-        PID_FILE.unlink(missing_ok=True)
+        pid_path.unlink(missing_ok=True)
         return True
 
 
-def read_daemon_status() -> dict | None:
-    """Read daemon status from the status file."""
-    if not is_daemon_running():
+def read_daemon_status(repo: Path | None = None) -> dict | None:
+    """Read daemon status from the per-repo status file."""
+    repo_root = repo or _repo_root()
+    if not repo_root:
         return None
-    # Read rich status from daemon-status.json
-    if STATUS_FILE.exists():
+    if not is_daemon_running(repo_root):
+        return None
+    # Read rich status from per-repo status file
+    sf = _status_file(repo_root)
+    if sf.exists():
         try:
-            return json.loads(STATUS_FILE.read_text())
+            return json.loads(sf.read_text())
         except Exception:
             pass
     # Fallback to basic PID info
     try:
-        pid = int(PID_FILE.read_text().strip())
+        pid = int(_pid_file(repo_root).read_text().strip())
         last_hb = ""
-        if HEARTBEAT_FILE.exists():
-            last_hb = HEARTBEAT_FILE.read_text().strip()
+        hf = _heartbeat_file(repo_root)
+        if hf.exists():
+            last_hb = hf.read_text().strip()
         return {
             "running": True,
             "pid": pid,

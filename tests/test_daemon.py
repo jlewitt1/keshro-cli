@@ -13,9 +13,11 @@ import pytest
 from keshro_cli.daemon import (
     DaemonState,
     KeshroDaemon,
+    MAX_QUEUE_SIZE,
     Observation,
     _find_current_task,
     _match_task_id_in_commit,
+    _pid_file,
     _repo_root,
     _socket_path,
     is_daemon_running,
@@ -350,4 +352,3 @@ class TestQueueOverflow:
         assert daemon.state.event_queue[-1]["task_id"] == f"task-{MAX_QUEUE_SIZE + 9}"
 
 
-MAX_QUEUE_SIZE = 1000  # Match daemon.py
