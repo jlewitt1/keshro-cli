@@ -39,7 +39,7 @@ jobs:
             -X PUT \
             -H "X-Deploy-Secret: $DEPLOY_SECRET" \
             -F "file=@$PACKAGE" \
-            "$API_URL/api/cli/upload" \
+            "$API_URL/v1/cli/upload" \
             -o /tmp/upload-response.json)
           cat /tmp/upload-response.json
           echo ""

@@ -7,7 +7,7 @@ from .config import clear_auth, load_auth, save_auth
 def _fetch_user(base_url: str, token: str) -> dict:
     with httpx.Client(base_url=base_url, timeout=30) as client:
         res = client.get(
-            "/api/auth/me",
+            "/v1/auth/me",
             headers={"Authorization": f"Bearer {token}"},
         )
         res.raise_for_status()
