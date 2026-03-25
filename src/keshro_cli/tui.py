@@ -1,7 +1,6 @@
 """Textual TUI dashboard for keshro status.
 
-Shows real-time agent progress, dependency graph, and recent events.
-Polls the API every 2 seconds.
+Connects via SSE for real-time updates, falls back to polling.
 """
 
 from __future__ import annotations
@@ -10,6 +9,7 @@ import httpx
 from textual.app import App, ComposeResult
 from textual.reactive import reactive
 from textual.widgets import Footer, Header, Static
+from textual.worker import Worker, WorkerState
 
 from .graph import render_progress_bar
 
@@ -26,6 +26,7 @@ class PlanOverview(Static):
 
     plan_data: reactive[dict | None] = reactive(None)
     _error: str = ""
+    _live: bool = False
 
     def render(self) -> str:
         if self._error:
@@ -43,8 +44,10 @@ class PlanOverview(Static):
 
         bar = render_progress_bar(completed, total, width=40)
 
+        mode = "[green]● live[/green]" if self._live else "[yellow]● polling[/yellow]"
+
         lines = [
-            f"[bold cyan]{title}[/bold cyan]  [dim]({status})[/dim]",
+            f"[bold cyan]{title}[/bold cyan]  [dim]({status})[/dim]  {mode}",
             "",
             f"  {bar}",
             "",
@@ -161,7 +164,7 @@ class RecentEvents(Static):
 
 
 class KeshroStatusApp(App):
-    """Keshro TUI dashboard — real-time plan monitoring."""
+    """Keshro TUI dashboard — real-time plan monitoring via SSE."""
 
     CSS = """
     Screen {
@@ -208,6 +211,7 @@ class KeshroStatusApp(App):
         self.token = token
         self.plan_id = plan_id
         self._last_data: dict | None = None
+        self._sse_connected: bool = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -221,7 +225,60 @@ class KeshroStatusApp(App):
         self.title = "KESHRO STATUS"
         self.sub_title = f"Plan: {self.plan_id[:20]}"
         self._fetch_and_update()
-        self.set_interval(2.0, self._fetch_and_update)
+        self._start_sse()
+
+    def _start_sse(self) -> None:
+        """Start SSE listener as a Textual worker."""
+        self._sse_worker = self.run_worker(
+            self._sse_listen, exclusive=True, group="sse"
+        )
+
+    async def _sse_listen(self) -> None:
+        """Connect to SSE stream; on any event, re-fetch plan data."""
+        from httpx_sse import aconnect_sse
+
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "text/event-stream",
+        }
+        try:
+            async with httpx.AsyncClient(
+                base_url=self.api_url, headers=headers, timeout=None
+            ) as client:
+                async with aconnect_sse(
+                    client, "GET", f"/v1/plans/{self.plan_id}/stream"
+                ) as sse:
+                    self._sse_connected = True
+                    self._update_live_indicator(True)
+                    async for event in sse.aiter_sse():
+                        # Any event (task_updated, plan_updated, etc.) → re-fetch
+                        if event.event and event.event != "comment":
+                            self.call_later(self._fetch_and_update)
+        except Exception:
+            self._sse_connected = False
+            self._update_live_indicator(False)
+            # Fall back to polling
+            self._start_polling_fallback()
+
+    def _start_polling_fallback(self) -> None:
+        """Fall back to 10s polling if SSE is unavailable."""
+        self._poll_timer = self.set_interval(10.0, self._fetch_and_update)
+
+    def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
+        """If SSE worker dies, start polling fallback."""
+        if event.worker.group == "sse" and event.state == WorkerState.ERROR:
+            self._sse_connected = False
+            self._update_live_indicator(False)
+            self._start_polling_fallback()
+
+    def _update_live_indicator(self, live: bool) -> None:
+        """Update the overview panel's live/polling indicator."""
+        try:
+            overview = self.query_one("#overview", PlanOverview)
+            overview._live = live
+            overview.refresh()
+        except Exception:
+            pass
 
     def _fetch_and_update(self) -> None:
         try:
@@ -243,7 +300,6 @@ class KeshroStatusApp(App):
             self.query_one("#graph", TaskGraph).plan_data = data
             self.query_one("#events", RecentEvents).plan_data = data
         except Exception as exc:
-            # Show error in overview panel instead of silently failing
             overview = self.query_one("#overview", PlanOverview)
             overview.plan_data = None
             overview._error = str(exc)

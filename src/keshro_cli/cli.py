@@ -1130,6 +1130,31 @@ def _build_continue_prompt(
     if is_parallelizable:
         task_block.append("Parallelizable: yes")
 
+    # Acceptance criteria
+    acceptance = task.get("acceptance_criteria") or []
+    if acceptance:
+        task_block.append("Acceptance criteria:")
+        for ac in acceptance:
+            task_block.append(f"  - {ac}")
+
+    # Risk level + reason
+    risk_level = task.get("risk_level") or ""
+    risk_reason = task.get("risk_reason") or ""
+    if risk_level in ("high", "medium"):
+        task_block.append(f"Risk: {risk_level}" + (f" — {risk_reason}" if risk_reason else ""))
+
+    # Related files
+    related_files = task.get("related_files") or []
+    if related_files:
+        task_block.append(f"Related files: {', '.join(related_files)}")
+
+    # Plan enrichment sources (so agent knows what context was used)
+    enrichment_sources = plan.get("enrichment_sources") or []
+    if enrichment_sources:
+        names = [s.get("name", "") for s in enrichment_sources if s.get("name")]
+        if names:
+            task_block.append(f"Plan context sources: {', '.join(names)}")
+
     continuation = [
         "",
         "Continue from this task now.",
@@ -3043,7 +3068,102 @@ def _print_plan_status(plan: dict) -> None:
 
     if summary_parts:
         print(f"  {DIM}{' · '.join(summary_parts)}{RESET}")
+
+    # Cost summary
+    agent_cost = plan.get("agent_cost") or {}
+    cost_usd = agent_cost.get("total_cost_usd") or 0
+    total_tokens = agent_cost.get("total_tokens") or 0
+    total_duration = agent_cost.get("total_duration_seconds") or 0
+    tasks_tracked = agent_cost.get("tasks_tracked") or 0
+    if cost_usd > 0 or total_duration > 0:
+        cost_parts = []
+        if total_duration > 0:
+            mins = int(total_duration // 60)
+            secs = int(total_duration % 60)
+            cost_parts.append(f"{mins}m {secs}s" if mins > 0 else f"{secs}s")
+        if total_tokens > 0:
+            cost_parts.append(f"{total_tokens:,} tokens")
+        if cost_usd > 0:
+            cost_parts.append(f"${cost_usd:.2f}")
+        if tasks_tracked > 1:
+            avg_cost = cost_usd / tasks_tracked
+            avg_dur = total_duration / tasks_tracked
+            avg_mins = int(avg_dur // 60)
+            avg_secs = int(avg_dur % 60)
+            avg_time = f"{avg_mins}m {avg_secs}s" if avg_mins > 0 else f"{avg_secs}s"
+            cost_parts.append(f"avg {avg_time} · ${avg_cost:.2f}/task")
+        print(f"  {DIM}Cost: {' · '.join(cost_parts)}{RESET}")
+
+        # Per-model breakdown
+        by_model = agent_cost.get("by_model") or {}
+        if by_model:
+            for model, data in by_model.items():
+                m_tasks = data.get("tasks", 0)
+                m_cost = data.get("cost_usd", 0)
+                m_tokens = data.get("tokens", 0)
+                print(f"    {DIM}{model}: {m_tasks} task{'s' if m_tasks != 1 else ''} · {m_tokens:,} tok · ${m_cost:.2f}{RESET}")
+
+    # Enrichment sources
+    sources = plan.get("enrichment_sources") or []
+    if sources:
+        names = [s.get("name", "") for s in sources if s.get("name")]
+        if names:
+            print(f"  {DIM}Informed by: {', '.join(names)}{RESET}")
+
     print()
+
+
+
+
+def _watch_via_sse(plan_id: str) -> None:
+    """Watch plan status via SSE stream."""
+
+    from httpx_sse import connect_sse
+
+    headers = {
+        "Authorization": f"Bearer {_state.token}",
+        "Accept": "text/event-stream",
+    }
+    plan = _get_plan_or_exit(plan_id)
+    print("\033[2J\033[H", end="")
+    _print_plan_status(plan)
+    print(f"  {DIM}Connecting to SSE...{RESET}")
+    try:
+        with httpx.Client(
+            base_url=_state.api_url, headers=headers, timeout=None
+        ) as client:
+            with connect_sse(client, "GET", f"/v1/plans/{plan_id}/stream") as sse:
+                # Connected — show live indicator
+                print("\033[2J\033[H", end="")
+                _print_plan_status(plan)
+                print(f"  {GREEN}● live{RESET} · SSE connected · Ctrl+C to stop")
+                for event in sse.iter_sse():
+                    if event.event and event.event != "comment":
+                        plan = _get_plan_or_exit(plan_id)
+                        print("\033[2J\033[H", end="")
+                        _print_plan_status(plan)
+                        print(
+                            f"  {GREEN}● live{RESET} · SSE connected · Ctrl+C to stop"
+                        )
+    except KeyboardInterrupt:
+        print("\nStopped watching.")
+
+
+def _watch_via_polling(plan_id: str) -> None:
+    """Watch plan status via polling (fallback)."""
+    import time as _time
+
+    try:
+        while True:
+            print("\033[2J\033[H", end="")
+            plan = _get_plan_or_exit(plan_id)
+            _print_plan_status(plan)
+            print(
+                f"  {YELLOW}● polling{RESET} · refreshes every 10s · Ctrl+C to stop"
+            )
+            _time.sleep(10)
+    except KeyboardInterrupt:
+        print("\nStopped watching.")
 
 
 def _run_status(plan_id: str | None, watch: bool = False, tui: bool = False) -> None:
@@ -3084,16 +3204,14 @@ def _run_status(plan_id: str | None, watch: bool = False, tui: bool = False) -> 
         print(render_plan_summary(plan))
         return
 
+    # Try SSE first, fall back to polling
     try:
-        while True:
-            # Clear screen and redraw
-            print("\033[2J\033[H", end="")
-            plan = _get_plan_or_exit(resolved_plan_id)
-            _print_plan_status(plan)
-            print(f"  {DIM}Watching · refreshes every 10s · Ctrl+C to stop{RESET}")
-            _time.sleep(10)
-    except KeyboardInterrupt:
-        print("\nStopped watching.")
+        _watch_via_sse(resolved_plan_id)
+    except ImportError:
+        _watch_via_polling(resolved_plan_id)
+    except Exception as exc:
+        print(f"  {YELLOW}SSE failed ({exc}), falling back to polling{RESET}")
+        _watch_via_polling(resolved_plan_id)
 
 
 @plan_app.command("status")
@@ -4457,15 +4575,6 @@ def _plan_generate(
         resp = client.post("/v1/plans/generate", json=payload, timeout=120)
         resp.raise_for_status()
     except httpx.HTTPStatusError as exc:
-        if exc.response.status_code == 404:
-            # Endpoint not yet available — provide helpful message
-            print(f"{YELLOW}Plan generation endpoint not yet available.{RESET}")
-            print(
-                "The /api/plans/generate endpoint will be added in the next backend update."
-            )
-            print("\nIn the meantime, create plans manually:")
-            print("  keshro plan create --from-file plan.json")
-            raise typer.Exit(0) from exc
         _print_http_error(exc)
         raise typer.Exit(1) from exc
 
@@ -4480,14 +4589,43 @@ def _plan_generate(
     print(f"  Tasks: {len(steps)}")
     print(f"  Status: {plan.get('status', 'draft')}")
 
+    # Show enrichment sources
+    sources = plan.get("enrichment_sources") or []
+    if sources:
+        names = [s.get("name", "") for s in sources if s.get("name")]
+        if names:
+            print(f"  Informed by: {', '.join(names)}")
+
+    # Show analysis if available
+    analysis = plan.get("decisions") or {}
+    if isinstance(analysis, dict):
+        conf = analysis.get("confidence_score")
+        risks = analysis.get("risks") or []
+        unknowns = analysis.get("unknowns") or []
+        parts = []
+        if conf is not None:
+            parts.append(f"confidence: {conf}%")
+        if risks:
+            parts.append(f"{len(risks)} risk{'s' if len(risks) != 1 else ''}")
+        if unknowns:
+            parts.append(f"{len(unknowns)} unknown{'s' if len(unknowns) != 1 else ''}")
+        if parts:
+            print(f"  Analysis: {' · '.join(parts)}")
+
     if steps:
         print(f"\n{CYAN}Tasks:{RESET}")
         for step in steps:
             dep_info = ""
             if step.get("depends_on"):
                 dep_info = f" {DIM}(depends on: {', '.join(step['depends_on'])}){RESET}"
+            risk = step.get("risk_level") or ""
+            risk_badge = ""
+            if risk == "high":
+                risk_badge = f" {RED}[high risk]{RESET}"
+            elif risk == "medium":
+                risk_badge = f" {YELLOW}[medium]{RESET}"
             print(
-                f"  {step.get('order', 0):2d}. {step.get('title', 'Untitled')}{dep_info}"
+                f"  {step.get('order', 0):2d}. {step.get('title', 'Untitled')}{risk_badge}{dep_info}"
             )
 
     if not confirm and plan.get("status") == "draft":
@@ -4656,6 +4794,105 @@ def _plan_import(
 
     if _state.json:
         print_output(plan)
+
+
+# ---------------------------------------------------------------------------
+# Plan push / sync-pull commands
+# ---------------------------------------------------------------------------
+
+
+@plan_app.command("push")
+def _plan_push(
+    plan_id: Annotated[
+        Optional[str],
+        typer.Option("--plan-id", "-p", help="Plan ID."),
+    ] = None,
+    provider: Annotated[
+        str, typer.Option("--provider", help="Target: linear, jira, or github.")
+    ] = "linear",
+    team_id: Annotated[
+        Optional[str],
+        typer.Option("--team-id", help="Linear team ID or Jira project key."),
+    ] = None,
+    project_id: Annotated[
+        Optional[str],
+        typer.Option("--project-id", help="Linear project ID (optional)."),
+    ] = None,
+    sync_mode: Annotated[
+        str,
+        typer.Option("--mode", help="'standalone' (individual issues) or 'grouped' (with parent)."),
+    ] = "standalone",
+):
+    """Push plan tasks to Linear, Jira, or GitHub as issues."""
+    _ensure_authenticated()
+    resolved = _current_plan_id(plan_id)
+    if not resolved:
+        print(f"{RED}Plan ID required.{RESET}", file=sys.stderr)
+        raise typer.Exit(1)
+
+    client = make_client()
+    payload: dict = {"provider": provider, "sync_mode": sync_mode}
+    if team_id:
+        payload["team_id"] = team_id
+    if project_id:
+        payload["project_id"] = project_id
+
+    print(f"{CYAN}Pushing plan to {provider}...{RESET}")
+    try:
+        resp = client.post(f"/v1/plans/{resolved}/push", json=payload, timeout=60)
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        _print_http_error(exc)
+        raise typer.Exit(1) from exc
+
+    data = resp.json()
+    created = data.get("created", 0)
+    updated = data.get("updated", 0)
+    print(f"{GREEN}Done.{RESET} {created} issue(s) created, {updated} updated.")
+
+    if _state.json:
+        print_output(data)
+
+
+@plan_app.command("sync-pull")
+def _plan_sync_pull(
+    plan_id: Annotated[
+        Optional[str],
+        typer.Option("--plan-id", "-p", help="Plan ID."),
+    ] = None,
+):
+    """Pull status updates from linked Linear/Jira issues back into the plan."""
+    _ensure_authenticated()
+    resolved = _current_plan_id(plan_id)
+    if not resolved:
+        print(f"{RED}Plan ID required.{RESET}", file=sys.stderr)
+        raise typer.Exit(1)
+
+    client = make_client()
+    print(f"{CYAN}Pulling status from linked issues...{RESET}")
+    try:
+        resp = client.post(f"/v1/plans/{resolved}/sync-pull", timeout=30)
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        _print_http_error(exc)
+        raise typer.Exit(1) from exc
+
+    data = resp.json()
+    synced = data.get("synced", 0)
+    changes = data.get("changes", [])
+
+    if synced == 0:
+        print(f"{DIM}No status changes detected.{RESET}")
+    else:
+        print(f"{GREEN}{synced} task(s) updated:{RESET}")
+        for change in changes:
+            print(
+                f"  {change.get('external_key', '?')} → {change.get('external_status', '?')} "
+                f"(was: {change.get('current_status', '?')})"
+            )
+
+    if _state.json:
+        print_output(data)
 
 
 # ---------------------------------------------------------------------------
