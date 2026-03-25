@@ -10,3 +10,4 @@ build/
 .idea/
 .qodo/
 .claude/
+.gstack/

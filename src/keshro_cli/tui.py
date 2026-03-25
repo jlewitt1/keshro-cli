@@ -6,15 +6,12 @@ Polls the API every 2 seconds.
 
 from __future__ import annotations
 
-import time
-
 import httpx
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
 from textual.widgets import Footer, Header, Static
 
-from .graph import render_plan_summary, render_progress_bar
+from .graph import render_progress_bar
 
 STATUS_ICONS = {
     "completed": "✓",
@@ -63,7 +60,9 @@ class PlanOverview(Static):
 
         cost = plan.get("agent_cost", {})
         if cost.get("total_cost_usd"):
-            lines.append(f"  [dim]Cost: ${cost['total_cost_usd']:.2f} ({cost.get('total_tokens', 0):,} tokens)[/dim]")
+            lines.append(
+                f"  [dim]Cost: ${cost['total_cost_usd']:.2f} ({cost.get('total_tokens', 0):,} tokens)[/dim]"
+            )
 
         return "\n".join(lines)
 
@@ -122,7 +121,9 @@ class TaskGraph(Static):
             if deps:
                 dep_str = f" [dim]← {', '.join(deps)}[/dim]"
 
-            lines.append(f"  [{style}]{icon}[/{style}] {step.get('id', '?'):20s} {title}{dep_str}")
+            lines.append(
+                f"  [{style}]{icon}[/{style}] {step.get('id', '?'):20s} {title}{dep_str}"
+            )
 
         return "\n".join(lines)
 
@@ -152,7 +153,9 @@ class RecentEvents(Static):
                 "task_note": "dim",
             }
             style = style_map.get(event_type, "dim")
-            lines.append(f"  [dim]{ts}[/dim]  [{style}]{event_type:12s}[/{style}]  {task_title}")
+            lines.append(
+                f"  [dim]{ts}[/dim]  [{style}]{event_type:12s}[/{style}]  {task_title}"
+            )
 
         return "\n".join(lines)
 

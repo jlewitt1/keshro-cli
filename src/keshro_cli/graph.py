@@ -46,7 +46,9 @@ def render_graph(steps: list[dict], use_color: bool = True) -> str:
         return "  (no tasks)"
 
     id_to_step = {s.get("id", f"task-{i}"): s for i, s in enumerate(steps)}
-    id_to_order = {s.get("id", f"task-{i}"): s.get("order", i) for i, s in enumerate(steps)}
+    id_to_order = {
+        s.get("id", f"task-{i}"): s.get("order", i) for i, s in enumerate(steps)
+    }
 
     # Find root tasks (no dependencies)
     all_ids = set(id_to_step.keys())
@@ -55,8 +57,11 @@ def render_graph(steps: list[dict], use_color: bool = True) -> str:
         for dep in step.get("depends_on", []):
             dependent_ids.add(step.get("id"))
 
-    root_ids = [s.get("id") for s in sorted(steps, key=lambda s: s.get("order", 0))
-                if not s.get("depends_on")]
+    root_ids = [
+        s.get("id")
+        for s in sorted(steps, key=lambda s: s.get("order", 0))
+        if not s.get("depends_on")
+    ]
 
     # Build adjacency: parent -> children
     children: dict[str, list[str]] = {sid: [] for sid in all_ids}

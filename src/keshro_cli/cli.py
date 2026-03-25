@@ -4,11 +4,10 @@ import json
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Optional
@@ -1193,7 +1192,9 @@ def _build_parallel_prompt(
     plan: dict, task: dict, total_agents: int, work_dir: str | None = None
 ) -> str:
     """Build a prompt for an unattended parallel agent working on a single task."""
-    base_prompt = _build_continue_prompt(plan, task, work_dir=work_dir, auto_continue=False)
+    base_prompt = _build_continue_prompt(
+        plan, task, work_dir=work_dir, auto_continue=False
+    )
     resolved_plan_id = _clean(plan.get("id")) or "<plan-id>"
     task_id = _clean(task.get("id")) or "<task-id>"
     task_title = _clean(task.get("title")) or "Untitled task"
@@ -1297,7 +1298,7 @@ async def _launch_single_agent(
         # Register with Collaborator if available
         collab_session_id = f"keshro-{task_id}"
         try:
-            from .collaborator import session_start, session_end, notify, is_available
+            from .collaborator import is_available, notify, session_end, session_start
 
             collab_active = is_available()
             if collab_active:
@@ -1479,14 +1480,26 @@ async def _run_parallel(
         actionable = _all_actionable_tasks(plan)
         if not actionable:
             steps = plan.get("plan_steps") or []
-            done = len([s for s in steps if _clean(s.get("status") or "").lower() == "completed"])
+            done = len(
+                [
+                    s
+                    for s in steps
+                    if _clean(s.get("status") or "").lower() == "completed"
+                ]
+            )
             total = len(steps)
             if done == total and total > 0:
                 print(f"\n{GREEN}All {total} tasks completed.{RESET}")
             else:
-                blocked = [s for s in steps if _clean(s.get("status") or "").lower() == "blocked"]
+                blocked = [
+                    s
+                    for s in steps
+                    if _clean(s.get("status") or "").lower() == "blocked"
+                ]
                 if blocked:
-                    print(f"\n{YELLOW}No actionable tasks. {len(blocked)} task(s) blocked:{RESET}")
+                    print(
+                        f"\n{YELLOW}No actionable tasks. {len(blocked)} task(s) blocked:{RESET}"
+                    )
                     for s in blocked:
                         reason = _clean(s.get("blocked_reason")) or "no reason"
                         print(f"  - {_clean(s.get('title'))}: {reason}")
@@ -1495,12 +1508,16 @@ async def _run_parallel(
             break
 
         steps = plan.get("plan_steps") or []
-        done_count = len([s for s in steps if _clean(s.get("status") or "").lower() == "completed"])
+        done_count = len(
+            [s for s in steps if _clean(s.get("status") or "").lower() == "completed"]
+        )
         total_count = len(steps)
 
         if wave > 1:
             print(f"\n{'─' * 40}")
-        print(f"\n{CYAN}Wave {wave}{RESET} — {len(actionable)} task(s) actionable [{done_count}/{total_count} done]")
+        print(
+            f"\n{CYAN}Wave {wave}{RESET} — {len(actionable)} task(s) actionable [{done_count}/{total_count} done]"
+        )
 
         for task in actionable:
             title = _clean(task.get("title")) or "Untitled"
@@ -1509,19 +1526,46 @@ async def _run_parallel(
             dep_str = f" (depends on: {', '.join(deps[:3])})" if deps else ""
             print(f"  {tid[:8]}  {title}{dep_str}")
 
+        # File conflict detection — warn if parallel tasks touch same files
+        _file_conflict_warnings = []
+        for i, t1 in enumerate(actionable):
+            files1 = set(t1.get("related_files") or [])
+            if not files1:
+                continue
+            for t2 in actionable[i + 1 :]:
+                files2 = set(t2.get("related_files") or [])
+                shared = files1 & files2
+                if shared:
+                    _file_conflict_warnings.append(
+                        f"  {YELLOW}⚠ {_clean(t1.get('title'))[:30]} + {_clean(t2.get('title'))[:30]} share: {', '.join(sorted(shared)[:3])}{RESET}"
+                    )
+        if _file_conflict_warnings:
+            print(
+                f"\n{YELLOW}File conflicts detected (agents may need to merge):{RESET}"
+            )
+            for w in _file_conflict_warnings[:5]:
+                print(w)
+
         if dry_run:
             print(f"\n{DIM}Dry run — no agents launched.{RESET}")
             break
 
-        print(f"\nLaunching {len(actionable)} agent(s) (max concurrency: {max_concurrency})...\n")
+        print(
+            f"\nLaunching {len(actionable)} agent(s) (max concurrency: {max_concurrency})...\n"
+        )
 
         # Notify Collaborator about wave start
         try:
-            from .collaborator import notify as _collab_notify, is_available as _collab_check
+            from .collaborator import (
+                is_available as _collab_check,
+                notify as _collab_notify,
+            )
 
             if _collab_check():
                 task_names = ", ".join(t.get("title", "")[:30] for t in actionable[:3])
-                _collab_notify(f"Wave {wave}: {len(actionable)} agents starting — {task_names}")
+                _collab_notify(
+                    f"Wave {wave}: {len(actionable)} agents starting — {task_names}"
+                )
         except Exception:
             pass
 
@@ -1529,8 +1573,13 @@ async def _run_parallel(
         async with make_async_client(_state.api_url, _state.token) as api_client:
             agent_tasks = [
                 _launch_single_agent(
-                    task, plan, resolved_plan_id, resolved_dir,
-                    len(actionable), semaphore, api_client,
+                    task,
+                    plan,
+                    resolved_plan_id,
+                    resolved_dir,
+                    len(actionable),
+                    semaphore,
+                    api_client,
                     session_id=session_id,
                 )
                 for task in actionable
@@ -1547,25 +1596,37 @@ async def _run_parallel(
                 failed += 1
             elif r.exit_code == 0:
                 cost_label = f" ${r.cost_usd:.2f}" if r.cost_usd > 0 else ""
-                print(f"  {GREEN}[done]{RESET}   {r.task_title} ({_format_duration(r.duration_seconds)}{cost_label})")
+                print(
+                    f"  {GREEN}[done]{RESET}   {r.task_title} ({_format_duration(r.duration_seconds)}{cost_label})"
+                )
                 succeeded += 1
                 wave_cost += r.cost_usd
                 wave_tokens += r.tokens_used
             else:
                 reason = r.stderr[:100] or r.stdout[:100] or "unknown error"
-                print(f"  {RED}[failed]{RESET} {r.task_title} ({_format_duration(r.duration_seconds)}) — {reason}")
+                print(
+                    f"  {RED}[failed]{RESET} {r.task_title} ({_format_duration(r.duration_seconds)}) — {reason}"
+                )
                 failed += 1
                 wave_cost += r.cost_usd
                 wave_tokens += r.tokens_used
 
-        cost_summary = f"  cost: ${wave_cost:.2f} ({wave_tokens:,} tokens)" if wave_cost > 0 else ""
-        print(f"\nWave {wave} complete: {GREEN}{succeeded} succeeded{RESET}, {RED}{failed} failed{RESET}{cost_summary}")
+        cost_summary = (
+            f"  cost: ${wave_cost:.2f} ({wave_tokens:,} tokens)"
+            if wave_cost > 0
+            else ""
+        )
+        print(
+            f"\nWave {wave} complete: {GREEN}{succeeded} succeeded{RESET}, {RED}{failed} failed{RESET}{cost_summary}"
+        )
 
         if not run_all:
             if failed == 0 and succeeded > 0:
                 remaining = total_count - done_count - succeeded
                 if remaining > 0:
-                    print(f"\n{DIM}{remaining} task(s) remaining. Run with --all to auto-continue through waves.{RESET}")
+                    print(
+                        f"\n{DIM}{remaining} task(s) remaining. Run with --all to auto-continue through waves.{RESET}"
+                    )
             break
 
         # Re-fetch plan for next wave
@@ -2998,7 +3059,10 @@ def _run_status(plan_id: str | None, watch: bool = False, tui: bool = False) -> 
         try:
             from .tui import run_tui
         except ImportError:
-            print(f"{RED}TUI requires textual. Install with: pip install textual{RESET}", file=sys.stderr)
+            print(
+                f"{RED}TUI requires textual. Install with: pip install textual{RESET}",
+                file=sys.stderr,
+            )
             raise typer.Exit(1)
 
         api_url = _state.api_url
@@ -3336,7 +3400,9 @@ def _ensure_completion_note_covers_requirements(
     if not requirements:
         return
     cleaned_note = _clean(note)
-    missing = [marker for marker in requirements if marker.lower() not in cleaned_note.lower()]
+    missing = [
+        marker for marker in requirements if marker.lower() not in cleaned_note.lower()
+    ]
     if not missing:
         return
     title = _clean(task.get("title")) or task_id
@@ -3827,7 +3893,8 @@ def _task_done(
         Optional[int], typer.Option("--tokens", help="Total tokens used.")
     ] = None,
     model_name: Annotated[
-        Optional[str], typer.Option("--model", help="Model used (e.g., claude-sonnet-4-20250514).")
+        Optional[str],
+        typer.Option("--model", help="Model used (e.g., claude-sonnet-4-20250514)."),
     ] = None,
 ):
     """Mark a task as completed. Use --cost/--tokens to report agent session cost."""
@@ -4154,11 +4221,18 @@ def _edit_task_alias(
 
 @app.command("rollback")
 def _rollback(
-    task_id: Annotated[str, typer.Argument(help="Task ID to rollback to (reverts to the checkpoint before this task).")],
+    task_id: Annotated[
+        str,
+        typer.Argument(
+            help="Task ID to rollback to (reverts to the checkpoint before this task)."
+        ),
+    ],
     plan_id_option: Annotated[
         Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
     ] = None,
-    force: Annotated[bool, typer.Option("--force", "-f", help="Skip confirmation.")] = False,
+    force: Annotated[
+        bool, typer.Option("--force", "-f", help="Skip confirmation.")
+    ] = False,
 ):
     """Rollback to the git checkpoint before a task was started."""
     resolved_plan_id = _require_plan_context(plan_id_option)
@@ -4166,11 +4240,15 @@ def _rollback(
     # Check for uncommitted changes
     status_result = subprocess.run(
         ["git", "status", "--porcelain"],
-        capture_output=True, text=True, check=False,
+        capture_output=True,
+        text=True,
+        check=False,
     )
     if (status_result.stdout or "").strip():
         if not force:
-            print(f"{YELLOW}Warning: You have uncommitted changes that will be lost.{RESET}")
+            print(
+                f"{YELLOW}Warning: You have uncommitted changes that will be lost.{RESET}"
+            )
             confirm = typer.confirm("Continue with rollback?", default=False)
             if not confirm:
                 print("Rollback cancelled.")
@@ -4180,23 +4258,37 @@ def _rollback(
     grep_pattern = f"keshro: checkpoint before {task_id}"
     log_result = subprocess.run(
         ["git", "log", "--oneline", "--grep", grep_pattern, "-1", "--format=%H %s"],
-        capture_output=True, text=True, check=False,
+        capture_output=True,
+        text=True,
+        check=False,
     )
     checkpoint_line = (log_result.stdout or "").strip()
     if not checkpoint_line:
         # Try alternative checkpoint format
-        grep_pattern2 = f"keshro: checkpoint"
+        grep_pattern2 = "keshro: checkpoint"
         log_result2 = subprocess.run(
             ["git", "log", "--oneline", "--grep", grep_pattern2, "--format=%H %s"],
-            capture_output=True, text=True, check=False,
+            capture_output=True,
+            text=True,
+            check=False,
         )
-        checkpoints = [l.strip() for l in (log_result2.stdout or "").splitlines() if l.strip()]
+        checkpoints = [
+            el.strip() for el in (log_result2.stdout or "").splitlines() if el.strip()
+        ]
         if not checkpoints:
-            print(f"{RED}No checkpoint commit found for task '{task_id}'.{RESET}", file=sys.stderr)
-            print(f"Checkpoints are created automatically when 'keshro continue' starts a task.", file=sys.stderr)
+            print(
+                f"{RED}No checkpoint commit found for task '{task_id}'.{RESET}",
+                file=sys.stderr,
+            )
+            print(
+                "Checkpoints are created automatically when 'keshro continue' starts a task.",
+                file=sys.stderr,
+            )
             raise typer.Exit(1)
         # Show available checkpoints
-        print(f"{YELLOW}No checkpoint specifically for task '{task_id}'. Available checkpoints:{RESET}")
+        print(
+            f"{YELLOW}No checkpoint specifically for task '{task_id}'. Available checkpoints:{RESET}"
+        )
         for cp in checkpoints[:10]:
             parts = cp.split(" ", 1)
             print(f"  {DIM}{parts[0][:8]}{RESET}  {parts[1] if len(parts) > 1 else ''}")
@@ -4215,7 +4307,9 @@ def _rollback(
     # Perform the rollback
     result = subprocess.run(
         ["git", "reset", "--hard", commit_hash],
-        capture_output=True, text=True, check=False,
+        capture_output=True,
+        text=True,
+        check=False,
     )
     if result.returncode != 0:
         print(f"{RED}Rollback failed: {result.stderr}{RESET}", file=sys.stderr)
@@ -4237,10 +4331,19 @@ def _rollback(
         )
         print(f"  {DIM}Task '{task_id}' reset to todo in plan.{RESET}")
     except Exception:
-        print(f"  {YELLOW}Could not update plan (API unreachable). Task status unchanged.{RESET}")
+        print(
+            f"  {YELLOW}Could not update plan (API unreachable). Task status unchanged.{RESET}"
+        )
 
     if _state.json:
-        print_output({"status": "ok", "action": "rollback", "commit": commit_hash, "task_id": task_id})
+        print_output(
+            {
+                "status": "ok",
+                "action": "rollback",
+                "commit": commit_hash,
+                "task_id": task_id,
+            }
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -4275,13 +4378,17 @@ def _explain(
     decisions = task.get("decisions", [])
     if not decisions:
         print(f"{DIM}No decisions recorded for task '{task_id}'.{RESET}")
-        print(f"Agents record decisions via 'keshro task decide' or the /api/agent/decide endpoint.")
+        print(
+            "Agents record decisions via 'keshro task decide' or the /api/agent/decide endpoint."
+        )
         if _state.json:
             print_output({"task_id": task_id, "decisions": []})
         raise typer.Exit(0)
 
     if _state.json:
-        print_output({"task_id": task_id, "title": task.get("title", ""), "decisions": decisions})
+        print_output(
+            {"task_id": task_id, "title": task.get("title", ""), "decisions": decisions}
+        )
         raise typer.Exit(0)
 
     print(f"\n{CYAN}Decisions for: {task.get('title', task_id)}{RESET}")
@@ -4312,10 +4419,19 @@ def _explain(
 
 @plan_app.command("generate")
 def _plan_generate(
-    description: Annotated[str, typer.Argument(help="Description of the project/work to plan.")],
-    plan_type: Annotated[str, typer.Option("--type", "-t", help="Project type: generic, migration.")] = "generic",
-    title: Annotated[Optional[str], typer.Option("--title", help="Plan title. Auto-generated if omitted.")] = None,
-    confirm: Annotated[bool, typer.Option("--confirm", help="Auto-confirm the draft plan.")] = False,
+    description: Annotated[
+        str, typer.Argument(help="Description of the project/work to plan.")
+    ],
+    plan_type: Annotated[
+        str, typer.Option("--type", "-t", help="Project type: generic, migration.")
+    ] = "generic",
+    title: Annotated[
+        Optional[str],
+        typer.Option("--title", help="Plan title. Auto-generated if omitted."),
+    ] = None,
+    confirm: Annotated[
+        bool, typer.Option("--confirm", help="Auto-confirm the draft plan.")
+    ] = False,
 ):
     """Generate a plan from a description using AI."""
     _ensure_authenticated()
@@ -4325,7 +4441,9 @@ def _plan_generate(
 
     # For migration type, use existing flow
     if plan_type == "migration":
-        print(f"{YELLOW}For migration plans, use 'keshro create' with source/target types.{RESET}")
+        print(
+            f"{YELLOW}For migration plans, use 'keshro create' with source/target types.{RESET}"
+        )
         raise typer.Exit(0)
 
     # Call the plan generation endpoint
@@ -4342,9 +4460,11 @@ def _plan_generate(
         if exc.response.status_code == 404:
             # Endpoint not yet available — provide helpful message
             print(f"{YELLOW}Plan generation endpoint not yet available.{RESET}")
-            print(f"The /api/plans/generate endpoint will be added in the next backend update.")
-            print(f"\nIn the meantime, create plans manually:")
-            print(f"  keshro plan create --from-file plan.json")
+            print(
+                "The /api/plans/generate endpoint will be added in the next backend update."
+            )
+            print("\nIn the meantime, create plans manually:")
+            print("  keshro plan create --from-file plan.json")
             raise typer.Exit(0) from exc
         _print_http_error(exc)
         raise typer.Exit(1) from exc
@@ -4366,10 +4486,14 @@ def _plan_generate(
             dep_info = ""
             if step.get("depends_on"):
                 dep_info = f" {DIM}(depends on: {', '.join(step['depends_on'])}){RESET}"
-            print(f"  {step.get('order', 0):2d}. {step.get('title', 'Untitled')}{dep_info}")
+            print(
+                f"  {step.get('order', 0):2d}. {step.get('title', 'Untitled')}{dep_info}"
+            )
 
     if not confirm and plan.get("status") == "draft":
-        print(f"\n{DIM}Plan is in draft. Run 'keshro continue -p {plan_id} --confirm' to start execution.{RESET}")
+        print(
+            f"\n{DIM}Plan is in draft. Run 'keshro continue -p {plan_id} --confirm' to start execution.{RESET}"
+        )
 
     if _state.json:
         print_output(plan)
@@ -4382,10 +4506,18 @@ def _plan_generate(
 
 @plan_app.command("import")
 def _plan_import(
-    provider: Annotated[str, typer.Argument(help="Provider to import from: linear, jira, github.")],
-    project_id: Annotated[Optional[str], typer.Option("--project", "-p", help="Project or repo ID.")] = None,
-    title: Annotated[Optional[str], typer.Option("--title", "-t", help="Plan title.")] = None,
-    skip_questions: Annotated[bool, typer.Option("--skip-questions", help="Skip clarifying questions.")] = False,
+    provider: Annotated[
+        str, typer.Argument(help="Provider to import from: linear, jira, github.")
+    ],
+    project_id: Annotated[
+        Optional[str], typer.Option("--project", "-p", help="Project or repo ID.")
+    ] = None,
+    title: Annotated[
+        Optional[str], typer.Option("--title", "-t", help="Plan title.")
+    ] = None,
+    skip_questions: Annotated[
+        bool, typer.Option("--skip-questions", help="Skip clarifying questions.")
+    ] = False,
 ):
     """Import issues from Linear, Jira, or GitHub and generate a plan.
 
@@ -4397,7 +4529,10 @@ def _plan_import(
 
     provider = provider.lower().strip()
     if provider not in ("linear", "jira", "github"):
-        print(f"{RED}Unsupported provider: {provider}. Use: linear, jira, github{RESET}", file=sys.stderr)
+        print(
+            f"{RED}Unsupported provider: {provider}. Use: linear, jira, github{RESET}",
+            file=sys.stderr,
+        )
         raise typer.Exit(1)
 
     # Step 1: Fetch issues + enrichment + questions
@@ -4407,7 +4542,9 @@ def _plan_import(
         preview_payload["project_id"] = project_id
 
     try:
-        resp = client.post("/api/plans/import/preview", json=preview_payload, timeout=60)
+        resp = client.post(
+            "/api/plans/import/preview", json=preview_payload, timeout=60
+        )
         resp.raise_for_status()
     except httpx.HTTPStatusError as exc:
         _print_http_error(exc)
@@ -4426,7 +4563,9 @@ def _plan_import(
     answers: dict[str, str] = {}
     if questions and not skip_questions and sys.stdout.isatty():
         print(f"\n{CYAN}Clarifying questions ({len(questions)}):{RESET}")
-        print(f"{DIM}Your answers help produce a better plan. Press Enter to skip any question.{RESET}\n")
+        print(
+            f"{DIM}Your answers help produce a better plan. Press Enter to skip any question.{RESET}\n"
+        )
 
         for q in questions:
             qid = q.get("id", "")
@@ -4442,8 +4581,12 @@ def _plan_import(
             if options:
                 for idx, opt in enumerate(options, 1):
                     rec = " (recommended)" if opt.get("recommended") else ""
-                    print(f"    {idx}. {opt.get('answer_title', opt.get('value', ''))}{rec}")
-                raw = input(f"  {DIM}Enter number or type answer [{placeholder or 'skip'}]: {RESET}").strip()
+                    print(
+                        f"    {idx}. {opt.get('answer_title', opt.get('value', ''))}{rec}"
+                    )
+                raw = input(
+                    f"  {DIM}Enter number or type answer [{placeholder or 'skip'}]: {RESET}"
+                ).strip()
                 if raw:
                     # Check if it's a number selecting an option
                     try:
@@ -4503,9 +4646,13 @@ def _plan_import(
                 dep_info = f" {DIM}(depends on: {', '.join(step['depends_on'])}){RESET}"
             refs = step.get("source_refs", [])
             ref_info = f" {DIM}[{', '.join(refs)}]{RESET}" if refs else ""
-            print(f"  {step.get('order', 0):2d}. {step.get('title', 'Untitled')}{ref_info}{dep_info}")
+            print(
+                f"  {step.get('order', 0):2d}. {step.get('title', 'Untitled')}{ref_info}{dep_info}"
+            )
 
-    print(f"\n{DIM}Run 'keshro continue -p {plan_id} --confirm' to start execution.{RESET}")
+    print(
+        f"\n{DIM}Run 'keshro continue -p {plan_id} --confirm' to start execution.{RESET}"
+    )
 
     if _state.json:
         print_output(plan)
@@ -4531,14 +4678,13 @@ def _task_decide(
     context: Annotated[
         str, typer.Option("--context", "-c", help="Decision context.")
     ] = "",
-    choice: Annotated[
-        str, typer.Option("--choice", help="What was decided.")
-    ] = "",
+    choice: Annotated[str, typer.Option("--choice", help="What was decided.")] = "",
     reasoning: Annotated[
         str, typer.Option("--reasoning", "-r", help="Why this choice was made.")
     ] = "",
     alternatives: Annotated[
-        Optional[list[str]], typer.Option("--alt", "-a", help="Alternative considered (repeatable).")
+        Optional[list[str]],
+        typer.Option("--alt", "-a", help="Alternative considered (repeatable)."),
     ] = None,
 ):
     """Record a structured decision for a task."""
@@ -4555,7 +4701,10 @@ def _task_decide(
         resolved_task_id = task_id
 
     if not context or not choice or not reasoning:
-        print(f"{RED}All of --context, --choice, and --reasoning are required.{RESET}", file=sys.stderr)
+        print(
+            f"{RED}All of --context, --choice, and --reasoning are required.{RESET}",
+            file=sys.stderr,
+        )
         raise typer.Exit(1)
 
     client = make_client()
@@ -4575,7 +4724,9 @@ def _task_decide(
         raise typer.Exit(1) from exc
 
     result = resp.json()
-    print(f"{GREEN}Decision recorded for task '{resolved_task_id}' ({result.get('decisions_count', 0)} total).{RESET}")
+    print(
+        f"{GREEN}Decision recorded for task '{resolved_task_id}' ({result.get('decisions_count', 0)} total).{RESET}"
+    )
 
     if _state.json:
         print_output(result)

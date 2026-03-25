@@ -63,25 +63,34 @@ def is_available() -> bool:
 
 def session_start(session_id: str, cwd: str) -> bool:
     """Register a new agent session with Collaborator."""
-    result = _rpc_call("agent.sessionStart", {
-        "session_id": session_id,
-        "cwd": cwd,
-    })
+    result = _rpc_call(
+        "agent.sessionStart",
+        {
+            "session_id": session_id,
+            "cwd": cwd,
+        },
+    )
     return result is not None
 
 
 def session_end(session_id: str) -> bool:
     """End an agent session in Collaborator."""
-    result = _rpc_call("agent.sessionEnd", {
-        "session_id": session_id,
-    })
+    result = _rpc_call(
+        "agent.sessionEnd",
+        {
+            "session_id": session_id,
+        },
+    )
     return result is not None
 
 
 def notify(body: str, title: str = "Keshro") -> bool:
     """Send a native macOS notification via Collaborator."""
-    result = _rpc_call("app.notify", {
-        "title": title,
-        "body": body,
-    })
+    result = _rpc_call(
+        "app.notify",
+        {
+            "title": title,
+            "body": body,
+        },
+    )
     return result is not None
