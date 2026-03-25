@@ -5,7 +5,7 @@ The intelligent execution layer for coding agents. Keshro makes agents learn fro
 ## Install
 
 ```bash
-curl -fsSL https://api.keshro.com/api/cli/install | sh -s -- ksh_pat_...
+curl -fsSL https://api.keshro.com/api/v1/cli/install | sh -s -- ksh_pat_...
 ```
 
 This downloads, installs, and authenticates in one step. Get your token from **Account → API** in the Keshro app.
@@ -115,5 +115,5 @@ This prompt is printed to stdout for the coding agent (Claude Code) to follow.
 python -m build --sdist
 curl -X PUT -H "X-Deploy-Secret: $DEPLOY_SECRET" \
   -F "file=@dist/keshro-0.1.0.tar.gz" \
-  https://api.keshro.com/api/cli/upload
+  https://api.keshro.com/api/v1/cli/upload
 ```

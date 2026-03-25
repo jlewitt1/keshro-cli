@@ -123,7 +123,7 @@ def _resolve_plan_context(plan_id: str | None) -> tuple[str | None, str | None]:
     if not explicit_id:
         return None, None
     with make_client(_state.api_url, _state.token) as client:
-        res = client.get(f"/api/plans/{explicit_id}")
+        res = client.get(f"/api/v1/plans/{explicit_id}")
         res.raise_for_status()
         plan = res.json()
     return explicit_id, _clean(plan.get("title")) or explicit_id
@@ -139,7 +139,7 @@ def _resolve_org_context(
     if not explicit_name:
         return None, None
     with make_client(_state.api_url, _state.token) as client:
-        res = client.get("/api/orgs")
+        res = client.get("/api/v1/orgs")
         res.raise_for_status()
         orgs = res.json()
     needle = explicit_name.lower()
@@ -616,7 +616,7 @@ def _extract_discovery_answers(template: dict, raw: str) -> dict[str, str]:
 
 
 def _get_migration_clarifiers(client: httpx.Client, payload: dict) -> list[dict]:
-    response = client.post("/api/migrations/clarifiers", json=payload)
+    response = client.post("/api/v1/migrations/clarifiers", json=payload)
     response.raise_for_status()
     body = response.json() or {}
     return list(body.get("questions") or [])
@@ -1248,7 +1248,7 @@ async def _mark_task_status_async(
     if blocked_reason:
         body["blocked_reason"] = blocked_reason[:500]
     try:
-        res = await client.patch(f"/api/plans/{plan_id}/tasks/{task_id}", json=body)
+        res = await client.patch(f"/api/v1/plans/{plan_id}/tasks/{task_id}", json=body)
         res.raise_for_status()
     except Exception:
         pass  # don't crash agents over API errors
@@ -1285,7 +1285,7 @@ async def _launch_single_agent(
         # Report start with session ID via agent API
         try:
             await api_client.post(
-                f"/api/agent/plans/{plan_id}/task-event",
+                f"/api/v1/agent/plans/{plan_id}/task-event",
                 json={
                     "task_id": task_id,
                     "event": "start",
@@ -1380,7 +1380,7 @@ async def _launch_single_agent(
             }
             try:
                 await api_client.post(
-                    f"/api/agent/plans/{plan_id}/task-event",
+                    f"/api/v1/agent/plans/{plan_id}/task-event",
                     json={
                         "task_id": task_id,
                         "event": "note",
@@ -1408,7 +1408,7 @@ async def _launch_single_agent(
             # Report structured metrics via agent API
             try:
                 await api_client.post(
-                    f"/api/agent/plans/{plan_id}/task-event",
+                    f"/api/v1/agent/plans/{plan_id}/task-event",
                     json={
                         "task_id": task_id,
                         "event": "done",
@@ -1471,7 +1471,7 @@ async def _run_parallel(
         raise SystemExit("claude binary not found. Install Claude Code first.")
 
     with make_client(_state.api_url, _state.token) as client:
-        res = client.get(f"/api/plans/{resolved_plan_id}")
+        res = client.get(f"/api/v1/plans/{resolved_plan_id}")
         res.raise_for_status()
         plan = res.json()
 
@@ -1631,7 +1631,7 @@ async def _run_parallel(
 
         # Re-fetch plan for next wave
         with make_client(_state.api_url, _state.token) as client:
-            res = client.get(f"/api/plans/{resolved_plan_id}")
+            res = client.get(f"/api/v1/plans/{resolved_plan_id}")
             res.raise_for_status()
             plan = res.json()
 
@@ -1652,7 +1652,7 @@ def _ensure_authenticated() -> None:
     try:
         with make_client() as client:
             res = client.get(
-                "/api/auth/me",
+                "/api/v1/auth/me",
                 headers={"Authorization": f"Bearer {token}"},
             )
             res.raise_for_status()
@@ -1724,7 +1724,7 @@ def _continue_with_claude(
         try:
             with make_client(_state.api_url, _state.token) as client:
                 client.patch(
-                    f"/api/plans/{resolved_plan_id}",
+                    f"/api/v1/plans/{resolved_plan_id}",
                     json={"status": "ready"},
                 )
         except Exception:
@@ -1774,7 +1774,7 @@ def _continue_with_claude(
 def _view_task(plan_id: str | None, task_id: str) -> None:
     resolved_plan_id = _require_plan_context(plan_id)
     with make_client(_state.api_url, _state.token) as client:
-        res = client.get(f"/api/plans/{resolved_plan_id}")
+        res = client.get(f"/api/v1/plans/{resolved_plan_id}")
         res.raise_for_status()
         plan = res.json()
         if _state.json:
@@ -1786,7 +1786,7 @@ def _view_task(plan_id: str | None, task_id: str) -> None:
 def _get_plan_or_exit(plan_id: str | None) -> dict:
     resolved_plan_id = _require_plan_context(plan_id)
     with make_client(_state.api_url, _state.token) as client:
-        res = client.get(f"/api/plans/{resolved_plan_id}")
+        res = client.get(f"/api/v1/plans/{resolved_plan_id}")
         res.raise_for_status()
         return res.json()
 
@@ -1889,7 +1889,7 @@ def _delete_task(
 ) -> None:
     resolved_plan_id = _require_plan_context(plan_id)
     with make_client(_state.api_url, _state.token) as client:
-        plan_res = client.get(f"/api/plans/{resolved_plan_id}")
+        plan_res = client.get(f"/api/v1/plans/{resolved_plan_id}")
         plan_res.raise_for_status()
         plan = plan_res.json()
         task = next(
@@ -1917,7 +1917,7 @@ def _delete_task(
         )
         res = client.request(
             "DELETE",
-            f"/api/plans/{resolved_plan_id}/tasks/{task_id}",
+            f"/api/v1/plans/{resolved_plan_id}/tasks/{task_id}",
             json=payload,
         )
         res.raise_for_status()
@@ -2220,7 +2220,7 @@ def _create_migration_inner(
 ) -> None:
     with make_client(_state.api_url, _state.token) as client:
         template_res = client.get(
-            "/api/migrations/path-template/lookup", params={"template_key": path}
+            "/api/v1/migrations/path-template/lookup", params={"template_key": path}
         )
         template_res.raise_for_status()
         template = template_res.json()
@@ -2334,7 +2334,7 @@ def _migration_list(
     if status:
         params["status"] = status
     with make_client(_state.api_url, _state.token) as client:
-        res = client.get("/api/migrations", params=params)
+        res = client.get("/api/v1/migrations", params=params)
         res.raise_for_status()
         migrations = sorted(
             res.json(), key=lambda m: _clean(m.get("created_at")), reverse=True
@@ -2374,7 +2374,7 @@ def _migration_view(
 ):
     """Show full details for a migration project."""
     with make_client(_state.api_url, _state.token) as client:
-        res = client.get(f"/api/migrations/{migration_id}")
+        res = client.get(f"/api/v1/migrations/{migration_id}")
         res.raise_for_status()
         migration = res.json()
         if _state.json:
@@ -2390,10 +2390,10 @@ def _migration_history(
 ):
     """Show the execution history / audit trail for a migration."""
     with make_client(_state.api_url, _state.token) as client:
-        migration_res = client.get(f"/api/migrations/{migration_id}")
+        migration_res = client.get(f"/api/v1/migrations/{migration_id}")
         migration_res.raise_for_status()
         migration = migration_res.json()
-        plan_res = client.get(f"/api/migrations/{migration_id}/plan")
+        plan_res = client.get(f"/api/v1/migrations/{migration_id}/plan")
         plan_res.raise_for_status()
         plan = plan_res.json()
         if _state.json:
@@ -2417,7 +2417,7 @@ def _migration_delete(
 ):
     """Delete a migration project."""
     with make_client(_state.api_url, _state.token) as client:
-        res = client.delete(f"/api/migrations/{migration_id}")
+        res = client.delete(f"/api/v1/migrations/{migration_id}")
         res.raise_for_status()
         if _state.json:
             print_output(res.json(), True)
@@ -2439,10 +2439,10 @@ def _config_show():
             with make_client(
                 auth.get("api_url") or DEFAULT_API_URL, auth.get("token")
             ) as client:
-                me_res = client.get("/api/auth/me")
+                me_res = client.get("/api/v1/auth/me")
                 me_res.raise_for_status()
                 authenticated = True
-                res = client.get("/api/orgs")
+                res = client.get("/api/v1/orgs")
                 res.raise_for_status()
                 orgs = res.json() or []
         except Exception:
@@ -2567,7 +2567,7 @@ def _cmd_plan_templates(
     verbose: bool = False,
 ):
     with make_client(_state.api_url, _state.token) as client:
-        res = client.get("/api/plans/templates")
+        res = client.get("/api/v1/plans/templates")
         res.raise_for_status()
         templates = res.json()
         effective_name = template_name or name
@@ -2806,7 +2806,7 @@ def _plan_create(
             "import_source": "template",
         }
         with make_client(_state.api_url, _state.token) as client:
-            res = client.post("/api/plans/from-template", json=payload)
+            res = client.post("/api/v1/plans/from-template", json=payload)
             res.raise_for_status()
             created = res.json()
             print_output(created, _state.json)
@@ -2837,7 +2837,7 @@ def _plan_create(
         }
     _validate_plan_payload(payload)
     with make_client(_state.api_url, _state.token) as client:
-        res = client.post("/api/plans", json=payload)
+        res = client.post("/api/v1/plans", json=payload)
         res.raise_for_status()
         created = res.json()
         print_output(created, _state.json)
@@ -2864,7 +2864,7 @@ def _plan_list(
     if resolved_org:
         params["org_id"] = resolved_org
     with make_client(_state.api_url, _state.token) as client:
-        res = client.get("/api/plans", params=params)
+        res = client.get("/api/v1/plans", params=params)
         res.raise_for_status()
         plans = res.json()
         plans = sorted(plans, key=lambda p: _clean(p.get("updated_at")), reverse=True)
@@ -2902,7 +2902,7 @@ def _plan_view(
 ):
     """Show full details for a plan including steps."""
     with make_client(_state.api_url, _state.token) as client:
-        res = client.get(f"/api/plans/{plan_id}")
+        res = client.get(f"/api/v1/plans/{plan_id}")
         res.raise_for_status()
         plan = res.json()
         if _state.json:
@@ -3226,7 +3226,7 @@ def _plan_update(
     if link is not None:
         payload["external_links"] = link
     with make_client(_state.api_url, _state.token) as client:
-        res = client.patch(f"/api/plans/{plan_id}", json=payload)
+        res = client.patch(f"/api/v1/plans/{plan_id}", json=payload)
         res.raise_for_status()
         print_output(res.json(), _state.json)
 
@@ -3250,7 +3250,7 @@ def _plan_replan_notes(
         "summary": _append_replan_summary(plan.get("summary"), note),
     }
     with make_client(_state.api_url, _state.token) as client:
-        res = client.patch(f"/api/plans/{resolved_plan_id}", json=payload)
+        res = client.patch(f"/api/v1/plans/{resolved_plan_id}", json=payload)
         res.raise_for_status()
         updated = res.json()
         if _state.json:
@@ -3265,7 +3265,7 @@ def _plan_delete(
 ):
     """Delete a plan."""
     with make_client(_state.api_url, _state.token) as client:
-        res = client.delete(f"/api/plans/{plan_id}")
+        res = client.delete(f"/api/v1/plans/{plan_id}")
         res.raise_for_status()
         saved_plan_id = _current_plan_id()
         if saved_plan_id == plan_id:
@@ -3304,7 +3304,7 @@ def _do_task_add(
         "artifact_links": link or [],
     }
     with make_client(_state.api_url, _state.token) as client:
-        res = client.post(f"/api/plans/{plan_id}/tasks", json=payload)
+        res = client.post(f"/api/v1/plans/{plan_id}/tasks", json=payload)
         res.raise_for_status()
         plan = res.json()
         if _state.json:
@@ -3344,7 +3344,7 @@ def _do_task_update(
         payload["artifact_links"] = link
     with make_client(_state.api_url, _state.token) as client:
         res = client.patch(
-            f"/api/plans/{plan_id}/tasks/{task_id}",
+            f"/api/v1/plans/{plan_id}/tasks/{task_id}",
             json=payload,
         )
         res.raise_for_status()
@@ -3921,7 +3921,7 @@ def _task_done(
         try:
             with make_client(_state.api_url, _state.token) as c:
                 c.post(
-                    f"/api/agent/plans/{resolved_plan_id}/task-event",
+                    f"/api/v1/agent/plans/{resolved_plan_id}/task-event",
                     json={
                         "task_id": resolved_task_id,
                         "event": "note",
@@ -4321,7 +4321,7 @@ def _rollback(
     try:
         client = make_client()
         client.post(
-            f"/api/agent/plans/{resolved_plan_id}/task-event",
+            f"/api/v1/agent/plans/{resolved_plan_id}/task-event",
             json={
                 "task_id": task_id,
                 "event": "rollback",
@@ -4363,7 +4363,7 @@ def _explain(
     client = make_client()
 
     try:
-        resp = client.get(f"/api/plans/{resolved_plan_id}")
+        resp = client.get(f"/api/v1/plans/{resolved_plan_id}")
         resp.raise_for_status()
     except httpx.HTTPStatusError as exc:
         _print_http_error(exc)
@@ -4454,7 +4454,7 @@ def _plan_generate(
     }
 
     try:
-        resp = client.post("/api/plans/generate", json=payload, timeout=120)
+        resp = client.post("/api/v1/plans/generate", json=payload, timeout=120)
         resp.raise_for_status()
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code == 404:
@@ -4543,7 +4543,7 @@ def _plan_import(
 
     try:
         resp = client.post(
-            "/api/plans/import/preview", json=preview_payload, timeout=60
+            "/api/v1/plans/import/preview", json=preview_payload, timeout=60
         )
         resp.raise_for_status()
     except httpx.HTTPStatusError as exc:
@@ -4621,7 +4621,7 @@ def _plan_import(
         import_payload["answers"] = answers
 
     try:
-        resp = client.post("/api/plans/import", json=import_payload, timeout=120)
+        resp = client.post("/api/v1/plans/import", json=import_payload, timeout=120)
         resp.raise_for_status()
     except httpx.HTTPStatusError as exc:
         _print_http_error(exc)
@@ -4717,7 +4717,7 @@ def _task_decide(
     }
 
     try:
-        resp = client.post(f"/api/agent/plans/{resolved_plan_id}/decide", json=payload)
+        resp = client.post(f"/api/v1/agent/plans/{resolved_plan_id}/decide", json=payload)
         resp.raise_for_status()
     except httpx.HTTPStatusError as exc:
         _print_http_error(exc)

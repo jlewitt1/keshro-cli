@@ -50,7 +50,7 @@ class _FakeClient:
 
     def get(self, path, params=None):
         self.calls.append(("GET", path, params))
-        if path == "/api/plans/templates":
+        if path == "/api/v1/plans/templates":
             return _FakeResponse(
                 [
                     {
@@ -65,14 +65,14 @@ class _FakeClient:
                     }
                 ]
             )
-        if path == "/api/orgs":
+        if path == "/api/v1/orgs":
             return _FakeResponse(
                 [
                     {"id": "org-123", "name": "Acme"},
                     {"id": "org-456", "name": "Demo Inc"},
                 ]
             )
-        if path == "/api/migrations":
+        if path == "/api/v1/migrations":
             return _FakeResponse(
                 [
                     {
@@ -89,7 +89,7 @@ class _FakeClient:
                     }
                 ]
             )
-        if path == "/api/migrations/migration-123":
+        if path == "/api/v1/migrations/migration-123":
             return _FakeResponse(
                 {
                     "id": "migration-123",
@@ -115,7 +115,7 @@ class _FakeClient:
                     "org_id": "org-123",
                 }
             )
-        if path == "/api/migrations/path-template/lookup":
+        if path == "/api/v1/migrations/path-template/lookup":
             template_key = (params or {}).get("template_key")
             if template_key == "aws-batch-to-airflow":
                 return _FakeResponse(
@@ -147,7 +147,7 @@ class _FakeClient:
                     }
                 )
             return _FakeResponse({"detail": "not found"})
-        if path == "/api/migrations/migration-123/plan":
+        if path == "/api/v1/migrations/migration-123/plan":
             return _FakeResponse(
                 {
                     "id": "plan-123",
@@ -166,7 +166,7 @@ class _FakeClient:
                     ],
                 }
             )
-        if path == "/api/plans":
+        if path == "/api/v1/plans":
             return _FakeResponse(
                 [
                     {
@@ -182,7 +182,7 @@ class _FakeClient:
                     }
                 ]
             )
-        if path == "/api/plans/plan-123":
+        if path == "/api/v1/plans/plan-123":
             return _FakeResponse(
                 {
                     "id": "plan-123",
@@ -233,9 +233,9 @@ class _FakeClient:
 
     def post(self, path, json=None):
         self.calls.append(("POST", path, json))
-        if path == "/api/migrations/clarifiers":
+        if path == "/api/v1/migrations/clarifiers":
             return _FakeResponse({"questions": []})
-        if path == "/api/migrations":
+        if path == "/api/v1/migrations":
             return _FakeResponse(
                 {
                     "id": "migration-999",
@@ -245,7 +245,7 @@ class _FakeClient:
                     "input_method": json.get("input_method"),
                 }
             )
-        if path == "/api/plans/from-template":
+        if path == "/api/v1/plans/from-template":
             return _FakeResponse(
                 {
                     "id": "plan-123",
@@ -258,7 +258,7 @@ class _FakeClient:
                     "migration_id": json.get("migration_id"),
                 }
             )
-        if path == "/api/plans":
+        if path == "/api/v1/plans":
             return _FakeResponse(
                 {
                     "id": "plan-123",
@@ -418,7 +418,7 @@ def test_create_migration_from_path_key_prompts_and_posts_payload(
     out = capsys.readouterr().out
     assert "Prepared migration draft for AWS Batch -> Airflow." in out
     clarifier_call = next(
-        call for call in fake_client.calls if call[1] == "/api/migrations/clarifiers"
+        call for call in fake_client.calls if call[1] == "/api/v1/migrations/clarifiers"
     )
     payload = clarifier_call[2]
     assert payload["input_method"] == "cli_agent"
@@ -465,7 +465,7 @@ def test_create_migration_from_path_key_applies_shared_clarifiers(
 
     def _post(path, json=None):
         fake_client.calls.append(("POST", path, json))
-        if path == "/api/migrations/clarifiers":
+        if path == "/api/v1/migrations/clarifiers":
             return _FakeResponse(
                 {
                     "questions": [
@@ -734,7 +734,7 @@ def test_migration_delete_hits_endpoint(fake_client, capsys):
     cli.main(["migration", "delete", "migration-123"])
     out = capsys.readouterr().out.strip()
     assert out == "Deleted migration migration-123."
-    assert ("DELETE", "/api/migrations/migration-123", None) in fake_client.calls
+    assert ("DELETE", "/api/v1/migrations/migration-123", None) in fake_client.calls
 
 
 def test_migration_list_json_outputs_machine_readable_rows(fake_client, capsys):
@@ -782,7 +782,7 @@ def test_plan_list_empty_state_shows_org_context(fake_client, capsys, monkeypatc
 
     class _EmptyClient(_FakeClient):
         def get(self, path, params=None):
-            if path == "/api/plans":
+            if path == "/api/v1/plans":
                 return _FakeResponse([])
             return super().get(path, params=params)
 
@@ -856,7 +856,7 @@ def test_plan_delete_calls_delete_endpoint(fake_client, capsys):
     cli.main(["--json", "plan", "delete", "plan-123"])
     out = json.loads(capsys.readouterr().out)
     assert out["success"] is True
-    assert out["path"] == "/api/plans/plan-123"
+    assert out["path"] == "/api/v1/plans/plan-123"
 
 
 def test_json_flag_can_appear_after_subcommand(fake_client, capsys):
@@ -1021,7 +1021,7 @@ def test_task_edit_patches_existing_task(fake_client, capsys):
         ]
     )
     out = json.loads(capsys.readouterr().out)
-    assert out["path"] == "/api/plans/plan-123/tasks/task-456"
+    assert out["path"] == "/api/v1/plans/plan-123/tasks/task-456"
     assert out["payload"]["status"] == "in_progress"
     assert out["payload"]["artifact_links"] == [
         "https://github.com/acme/migrations/pull/19"
@@ -1043,7 +1043,7 @@ def test_task_edit_accepts_blocked_reason_short_alias_r(fake_client, capsys):
         ]
     )
     out = json.loads(capsys.readouterr().out)
-    assert out["path"] == "/api/plans/plan-123/tasks/task-456"
+    assert out["path"] == "/api/v1/plans/plan-123/tasks/task-456"
     assert out["payload"]["status"] == "blocked"
     assert out["payload"]["blocked_reason"] == "Waiting on Airflow access"
 
@@ -1081,7 +1081,7 @@ def test_task_edit_uses_saved_plan_context(fake_client, capsys, monkeypatch):
         ]
     )
     out = json.loads(capsys.readouterr().out)
-    assert out["path"] == "/api/plans/plan-123/tasks/task-456"
+    assert out["path"] == "/api/v1/plans/plan-123/tasks/task-456"
     assert out["payload"]["status"] == "in_progress"
 
 
@@ -1099,7 +1099,7 @@ def test_task_edit_accepts_plan_id_option(fake_client, capsys):
         ]
     )
     out = json.loads(capsys.readouterr().out)
-    assert out["path"] == "/api/plans/plan-123/tasks/task-456"
+    assert out["path"] == "/api/v1/plans/plan-123/tasks/task-456"
 
 
 def test_plan_next_returns_first_actionable_task(fake_client, capsys):
@@ -1124,7 +1124,7 @@ def test_task_start_marks_task_in_progress(fake_client, capsys):
         ]
     )
     out = json.loads(capsys.readouterr().out)
-    assert out["path"] == "/api/plans/plan-123/tasks/task-456"
+    assert out["path"] == "/api/v1/plans/plan-123/tasks/task-456"
     assert out["payload"]["status"] == "in_progress"
     assert "Starting the pilot implementation" in out["payload"]["notes"]
     assert "[20" in out["payload"]["notes"]
@@ -1161,7 +1161,7 @@ def test_task_done_marks_task_completed(fake_client, capsys):
         ]
     )
     out = json.loads(capsys.readouterr().out)
-    assert out["path"] == "/api/plans/plan-123/tasks/task-456"
+    assert out["path"] == "/api/v1/plans/plan-123/tasks/task-456"
     assert out["payload"]["status"] == "completed"
     assert "Pilot DAG merged and validated" in out["payload"]["notes"]
     assert "[20" in out["payload"]["notes"]
@@ -1178,7 +1178,7 @@ def test_task_done_requires_completion_evidence_when_acceptance_criteria_exist(
 
     def _get(path, params=None):
         response = original_get(path, params=params)
-        if path != "/api/plans/plan-123":
+        if path != "/api/v1/plans/plan-123":
             return response
         plan = response.json()
         enriched_steps = []
@@ -1227,7 +1227,7 @@ def test_task_done_accepts_completion_evidence_when_acceptance_criteria_exist(
 
     def _get(path, params=None):
         response = original_get(path, params=params)
-        if path != "/api/plans/plan-123":
+        if path != "/api/v1/plans/plan-123":
             return response
         plan = response.json()
         enriched_steps = []
@@ -1284,7 +1284,7 @@ def test_task_block_marks_task_blocked(fake_client, capsys):
         ]
     )
     out = json.loads(capsys.readouterr().out)
-    assert out["path"] == "/api/plans/plan-123/tasks/task-456"
+    assert out["path"] == "/api/v1/plans/plan-123/tasks/task-456"
     assert out["payload"]["status"] == "blocked"
     assert out["payload"]["blocked_reason"] == "Waiting on Terraform IAM role changes"
     assert (
@@ -1306,7 +1306,7 @@ def test_task_unblock_clears_blocked_reason(fake_client, capsys):
         ]
     )
     out = json.loads(capsys.readouterr().out)
-    assert out["path"] == "/api/plans/plan-123/tasks/task-456"
+    assert out["path"] == "/api/v1/plans/plan-123/tasks/task-456"
     assert out["payload"]["status"] == "in_progress"
     assert out["payload"]["blocked_reason"] == ""
     assert "Terraform role applied; resuming pilot" in out["payload"]["notes"]
@@ -1373,7 +1373,7 @@ def test_task_note_appends_timestamped_note(fake_client, capsys):
         ]
     )
     out = json.loads(capsys.readouterr().out)
-    assert out["path"] == "/api/plans/plan-123/tasks/task-456"
+    assert out["path"] == "/api/v1/plans/plan-123/tasks/task-456"
     assert "Airflow will orchestrate Batch during the pilot" in out["payload"]["notes"]
     assert "[20" in out["payload"]["notes"]
 
@@ -1391,7 +1391,7 @@ def test_task_artifact_appends_link_without_overwriting(fake_client, capsys):
         ]
     )
     out = json.loads(capsys.readouterr().out)
-    assert out["path"] == "/api/plans/plan-123/tasks/task-456"
+    assert out["path"] == "/api/v1/plans/plan-123/tasks/task-456"
     assert out["payload"]["artifact_links"] == [
         "https://github.com/acme/migrations/pull/99"
     ]
@@ -1409,7 +1409,7 @@ def test_plan_replan_notes_appends_summary(fake_client, capsys):
         ]
     )
     out = json.loads(capsys.readouterr().out)
-    assert out["path"] == "/api/plans/plan-123"
+    assert out["path"] == "/api/v1/plans/plan-123"
     assert "Pilot plan for the first DAG migration." in out["payload"]["summary"]
     assert (
         "Need to keep Batch as the runtime while Airflow takes over orchestration."
@@ -1488,7 +1488,7 @@ def test_task_next_uses_saved_plan_context(fake_client, capsys, monkeypatch):
     cli.main(["task", "next"])
     method, path, _ = fake_client.calls[-1]
     assert method == "GET"
-    assert path == "/api/plans/plan-123"
+    assert path == "/api/v1/plans/plan-123"
 
 
 def test_plan_replan_notes_accepts_plan_id_option(fake_client, capsys):
@@ -1503,7 +1503,7 @@ def test_plan_replan_notes_accepts_plan_id_option(fake_client, capsys):
         ]
     )
     out = json.loads(capsys.readouterr().out)
-    assert out["path"] == "/api/plans/plan-123"
+    assert out["path"] == "/api/v1/plans/plan-123"
     assert "Pilot DAG completed" in out["payload"]["summary"]
 
 
@@ -1540,9 +1540,9 @@ def test_config_prints_saved_auth_metadata(monkeypatch, capsys):
             return False
 
         def get(self, path, params=None):
-            if path == "/api/auth/me":
+            if path == "/api/v1/auth/me":
                 return _FakeResponse({"email": "cli@example.com", "id": "user-1"})
-            if path == "/api/orgs":
+            if path == "/api/v1/orgs":
                 return _FakeResponse([])
             raise AssertionError(path)
 
@@ -1596,7 +1596,7 @@ def test_auth_login_with_token_prints_human_text_by_default(monkeypatch, capsys)
             return False
 
         def get(self, path, headers=None):
-            assert path == "/api/auth/me"
+            assert path == "/api/v1/auth/me"
             assert headers == {"Authorization": "Bearer ksh_pat_test"}
             return _FakeResponse({"email": "cli@example.com", "id": "user-1"})
 
@@ -1622,7 +1622,7 @@ def test_auth_login_with_token_validates_with_auth_me(monkeypatch, capsys):
             return False
 
         def get(self, path, headers=None):
-            assert path == "/api/auth/me"
+            assert path == "/api/v1/auth/me"
             assert headers == {"Authorization": "Bearer ksh_pat_test"}
             return _FakeResponse({"email": "cli@example.com", "id": "user-1"})
 
@@ -1681,7 +1681,7 @@ def test_config_marks_stale_token_as_not_authenticated(monkeypatch, capsys):
             return False
 
         def get(self, path, params=None):
-            assert path == "/api/auth/me"
+            assert path == "/api/v1/auth/me"
             return _UnauthorizedResponse()
 
     monkeypatch.setattr(
@@ -1731,7 +1731,7 @@ def test_auth_login_without_token_reuses_saved_session(monkeypatch, capsys):
             return False
 
         def get(self, path, headers=None):
-            assert path == "/api/auth/me"
+            assert path == "/api/v1/auth/me"
             assert headers == {"Authorization": "Bearer jwt-123"}
             return _FakeResponse({"email": "cli@example.com", "id": "user-1"})
 
@@ -1866,7 +1866,7 @@ def test_plan_create_allows_migration_seed_without_title(monkeypatch, capsys):
     cli.main(["plan", "create", "migration-123"])
     captured = capsys.readouterr()
     assert captured.err == ""
-    assert seen["path"] == "/api/plans"
+    assert seen["path"] == "/api/v1/plans"
     assert seen["json"]["migration_id"] == "migration-123"
     assert seen["json"]["title"] is None
     assert seen["json"]["import_source"] == "analysis"
@@ -1892,6 +1892,6 @@ def test_request_errors_render_connection_help(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert code == 1
     assert (
-        "Could not reach Keshro at http://localhost:8000/api/plans/templates."
+        "Could not reach Keshro at http://localhost:8000/api/v1/plans/templates."
         in captured.err
     )
