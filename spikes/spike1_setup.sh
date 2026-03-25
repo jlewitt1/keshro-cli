@@ -35,17 +35,18 @@ if command -v jq &>/dev/null; then
         }]
     ' > "$SETTINGS_FILE"
 else
-    python3 -c "
-import json, sys
-settings = json.loads('''$EXISTING''') if '''$EXISTING'''.strip() else {}
+    EXISTING="$EXISTING" HOOK_SCRIPT="$HOOK_SCRIPT" python3 - > "$SETTINGS_FILE" <<'PYEOF'
+import json, sys, os
+existing_raw = os.environ.get("EXISTING", "{}").strip()
+settings = json.loads(existing_raw) if existing_raw else {}
 hooks = settings.setdefault('hooks', {})
 post = hooks.setdefault('PostToolUse', [])
 post.append({
     'matcher': 'Bash',
-    'hooks': [{'type': 'command', 'command': '$HOOK_SCRIPT'}]
+    'hooks': [{'type': 'command', 'command': os.environ['HOOK_SCRIPT']}]
 })
 json.dump(settings, sys.stdout, indent=2)
-" > "$SETTINGS_FILE"
+PYEOF
 fi
 
 echo "✓ Spike 1 hook installed"
