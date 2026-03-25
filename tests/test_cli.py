@@ -48,7 +48,7 @@ class _FakeClient:
     def __exit__(self, exc_type, exc, tb):
         return False
 
-    def get(self, path, params=None):
+    def get(self, path, params=None, headers=None, timeout=None):
         self.calls.append(("GET", path, params))
         if path == "/v1/plans/templates":
             return _FakeResponse(
@@ -231,8 +231,18 @@ class _FakeClient:
             )
         return _FakeResponse({"ok": True})
 
-    def post(self, path, json=None):
+    def post(self, path, json=None, timeout=None):
         self.calls.append(("POST", path, json))
+        if "/push" in path:
+            return _FakeResponse({"created": 3, "updated": 1})
+        if "/sync-pull" in path:
+            return _FakeResponse({
+                "synced": 2,
+                "changes": [
+                    {"external_key": "KES-101", "external_status": "completed", "current_status": "in_progress"},
+                    {"external_key": "KES-102", "external_status": "in_progress", "current_status": "todo"},
+                ],
+            })
         if path == "/v1/migrations/clarifiers":
             return _FakeResponse({"questions": []})
         if path == "/v1/migrations":
@@ -1895,3 +1905,101 @@ def test_request_errors_render_connection_help(monkeypatch, capsys):
         "Could not reach Keshro at http://localhost:8000/v1/plans/templates."
         in captured.err
     )
+
+
+# ---------------------------------------------------------------------------
+# plan push / sync-pull / generate enrichment / status cost tests
+# ---------------------------------------------------------------------------
+
+
+def test_plan_push(fake_client, capsys, monkeypatch):
+    auth = {**_auth_with_plan(), "token": "ksh_pat_test"}
+    monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: auth)
+    monkeypatch.setattr("keshro_cli.client.load_auth", lambda: auth)
+    code = cli.main(["plan", "push", "-p", "plan-123", "--provider", "linear"])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "3 issue(s) created" in captured.out
+    assert "1 updated" in captured.out
+
+
+def test_plan_sync_pull(fake_client, capsys, monkeypatch):
+    _auth = {**_auth_with_plan(), "token": "ksh_pat_test"}
+    monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: _auth)
+    monkeypatch.setattr("keshro_cli.client.load_auth", lambda: _auth)
+    code = cli.main(["plan", "sync-pull", "-p", "plan-123"])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "2 task(s) updated" in captured.out
+    assert "KES-101" in captured.out
+
+
+def test_plan_generate_shows_enrichment(fake_client, capsys, monkeypatch):
+    _auth = {**_auth_with_plan(), "token": "ksh_pat_test"}
+    monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: _auth)
+    monkeypatch.setattr("keshro_cli.client.load_auth", lambda: _auth)
+    original_post = fake_client.post
+    def _post_gen(path, json=None, timeout=None):
+        if "/generate" in path:
+            return _FakeResponse({
+                "id": "plan-gen-1",
+                "title": "Auth Refactor",
+                "status": "draft",
+                "plan_steps": [
+                    {"order": 1, "title": "Update auth", "depends_on": [], "risk_level": "high"},
+                ],
+                "enrichment_sources": [
+                    {"name": "Greptile", "description": "Codebase analysis"},
+                ],
+                "decisions": {
+                    "confidence_score": 82,
+                    "risks": [{"severity": "high", "description": "Auth"}],
+                },
+            })
+        return original_post(path, json=json, timeout=timeout)
+    fake_client.post = _post_gen
+    code = cli.main(["plan", "generate", "Refactor auth module"])
+    captured = capsys.readouterr()
+    out = ANSI_RE.sub("", captured.out)
+    assert code == 0
+    assert "Greptile" in out
+    assert "confidence: 82%" in out
+    assert "[high risk]" in out
+
+
+def test_status_shows_cost_summary(fake_client, capsys, monkeypatch):
+    _auth = {**_auth_with_plan(), "token": "ksh_pat_test"}
+    monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: _auth)
+    monkeypatch.setattr("keshro_cli.client.load_auth", lambda: _auth)
+    original_get = fake_client.get
+    def _get_cost(path, params=None, timeout=None):
+        if path == "/v1/plans/plan-123":
+            return _FakeResponse({
+                "id": "plan-123",
+                "title": "Auth Refactor",
+                "status": "in_progress",
+                "plan_steps": [
+                    {"id": "t1", "order": 1, "title": "Task 1", "status": "completed"},
+                ],
+                "task_feedback_events": [],
+                "agent_cost": {
+                    "total_cost_usd": 4.50,
+                    "total_tokens": 250000,
+                    "total_duration_seconds": 720,
+                    "tasks_tracked": 2,
+                    "by_model": {
+                        "claude-sonnet-4": {"tasks": 2, "cost_usd": 4.50, "tokens": 250000, "duration_seconds": 720},
+                    },
+                },
+                "enrichment_sources": [{"name": "Greptile", "description": "x"}],
+            })
+        return original_get(path, params=params)
+    fake_client.get = _get_cost
+    code = cli.main(["status", "-p", "plan-123"])
+    captured = capsys.readouterr()
+    out = ANSI_RE.sub("", captured.out)
+    assert code == 0
+    assert "$4.50" in out
+    assert "250,000 tokens" in out
+    assert "claude-sonnet-4" in out
+    assert "Greptile" in out

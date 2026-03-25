@@ -254,6 +254,10 @@ class KeshroStatusApp(App):
                         # Any event (task_updated, plan_updated, etc.) → re-fetch
                         if event.event and event.event != "comment":
                             self.call_later(self._fetch_and_update)
+                    # Stream closed cleanly — fall back to polling
+                    self._sse_connected = False
+                    self._update_live_indicator(False)
+                    self._start_polling_fallback()
         except Exception:
             self._sse_connected = False
             self._update_live_indicator(False)
