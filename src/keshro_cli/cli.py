@@ -57,9 +57,11 @@ task_app = typer.Typer(help="Task management")
 migration_app = typer.Typer(help="Migration project management")
 config_app = typer.Typer(help="Configuration", invoke_without_command=True)
 plan_task_app = typer.Typer(help="Plan task management")
+watch_app = typer.Typer(help="Background daemon for execution tracking")
 
 app.add_typer(plan_app, name="plan")
 app.add_typer(task_app, name="task")
+app.add_typer(watch_app, name="watch")
 app.add_typer(migration_app, name="migration")
 app.add_typer(config_app, name="config")
 plan_app.add_typer(plan_task_app, name="task")
@@ -5052,6 +5054,112 @@ def main(argv: list[str] | None = None):
     except httpx.RequestError as exc:
         _print_request_error(exc)
         return 1
+
+
+# ---------------------------------------------------------------------------
+# Watch commands (background daemon)
+# ---------------------------------------------------------------------------
+
+
+@watch_app.callback(invoke_without_command=True)
+def _watch_start(
+    ctx: typer.Context,
+    plan_id: Annotated[
+        Optional[str],
+        typer.Option("--plan-id", "-p", help="Plan ID. Auto-detected if omitted."),
+    ] = None,
+    poll_interval: Annotated[
+        float,
+        typer.Option("--poll-interval", help="Git poll interval in seconds."),
+    ] = 1.0,
+    foreground: Annotated[
+        bool,
+        typer.Option("--foreground", "-f", help="Run in foreground (don't daemonize)."),
+    ] = True,
+):
+    """Start the Keshro background daemon.
+
+    Watches git activity and automatically tracks task progress.
+    Auto-detects the plan from saved config or .keshro file.
+    """
+    if ctx.invoked_subcommand is not None:
+        return
+
+    from .daemon import KeshroDaemon, is_daemon_running
+
+    if is_daemon_running():
+        print(f"{YELLOW}Daemon is already running. Use `keshro watch stop` to stop it.{RESET}")
+        raise typer.Exit(0)
+
+    _ensure_authenticated()
+
+    daemon = KeshroDaemon(
+        plan_id=_current_plan_id(plan_id),
+        poll_interval=poll_interval,
+        api_url=_state.api_url or None,
+        token=_state.token,
+    )
+
+    # Auto-setup on first run
+    daemon.state.repo_root = __import__("pathlib").Path.cwd()
+    try:
+        import subprocess as _sp
+        result = _sp.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            daemon.state.repo_root = __import__("pathlib").Path(result.stdout.strip())
+    except Exception:
+        pass
+    daemon.setup_repo()
+
+    plan_label = plan_id or _current_plan_id() or "auto-detect"
+    print(f"{GREEN}Starting keshro daemon...{RESET}")
+    print(f"  Plan: {plan_label}")
+    print(f"  Repo: {daemon.state.repo_root}")
+    print(f"  Log:  ~/.keshro/daemon.log")
+    print(f"  Stop: keshro watch stop")
+    print()
+
+    asyncio.run(daemon.start())
+
+
+@watch_app.command("stop")
+def _watch_stop():
+    """Stop the running daemon."""
+    from .daemon import stop_daemon, is_daemon_running
+
+    if not is_daemon_running():
+        print(f"{YELLOW}No daemon is running.{RESET}")
+        raise typer.Exit(0)
+
+    print(f"{CYAN}Stopping daemon...{RESET}")
+    if stop_daemon():
+        print(f"{GREEN}Daemon stopped.{RESET}")
+    else:
+        print(f"{RED}Failed to stop daemon. Check ~/.keshro/daemon.pid{RESET}")
+        raise typer.Exit(1)
+
+
+@watch_app.command("status")
+def _watch_status():
+    """Show daemon status and pending observations."""
+    from .daemon import read_daemon_status, is_daemon_running, LOG_FILE
+
+    if not is_daemon_running():
+        print(f"{DIM}Daemon is not running.{RESET}")
+        print(f"Start with: keshro watch")
+        raise typer.Exit(0)
+
+    status = read_daemon_status()
+    if not status:
+        print(f"{YELLOW}Daemon is running but status unavailable.{RESET}")
+        raise typer.Exit(0)
+
+    print(f"{GREEN}Daemon running{RESET} (PID {status.get('pid', '?')})")
+    if status.get("last_heartbeat"):
+        print(f"  Last heartbeat: {status['last_heartbeat']}")
+    print(f"  Log: {LOG_FILE}")
+    print()
+    print(f"For detailed logs: tail -f {LOG_FILE}")
 
 
 if __name__ == "__main__":
