@@ -11,3 +11,6 @@ build/
 .qodo/
 .claude/
 .gstack/
+
+# Keshro daemon context (auto-generated)
+.claude/keshro-context.md
