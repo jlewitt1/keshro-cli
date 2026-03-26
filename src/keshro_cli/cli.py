@@ -1580,9 +1580,10 @@ async def _run_parallel(
         print(
             f"\nLaunching {len(actionable)} agent(s) (max concurrency: {max_concurrency})...\n"
         )
-        print(
-            f"{DIM}💡 Monitor all agents: keshro status --tui -p {resolved_plan_id}{RESET}\n"
-        )
+        if wave == 1:
+            print(
+                f"{DIM}💡 Monitor all agents: keshro status --tui -p {resolved_plan_id}{RESET}\n"
+            )
 
         # Notify Collaborator about wave start
         try:
