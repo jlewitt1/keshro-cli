@@ -24,26 +24,23 @@ import hashlib
 import json
 import logging
 import os
-import re
 import signal
-import sys
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
-from .client import get_api_url, get_token, make_async_client
+from .client import get_token, make_async_client
 from .config import load_auth
 from .hooks import (
-    HookSocketServer,
     detect_keshro_command,
     extract_file_paths,
+    HookSocketServer,
     install_hooks,
     uninstall_hooks,
 )
-from .watcher import GitWatcher, GitEvent
+from .watcher import GitEvent, GitWatcher
 
 
 def _extract_topical_context(
@@ -57,7 +54,10 @@ def _extract_topical_context(
     scored: list[tuple[int, str, str]] = []
     target_id = target_task.get("id")
     for step in all_steps:
-        if step.get("status") not in ("done", "completed") or step.get("id") == target_id:
+        if (
+            step.get("status") not in ("done", "completed")
+            or step.get("id") == target_id
+        ):
             continue
         notes = (step.get("notes") or "").strip()
         if not notes:
@@ -82,6 +82,7 @@ def _extract_topical_context(
         for line in content.split("\n"):
             result.append(f"  {line}")
     return result
+
 
 logger = logging.getLogger("keshro.daemon")
 
@@ -132,9 +133,13 @@ class DaemonState:
     event_queue: deque = field(default_factory=lambda: deque(maxlen=MAX_QUEUE_SIZE))
     observations: deque = field(default_factory=lambda: deque(maxlen=MAX_OBSERVATIONS))
     files_in_progress: dict[str, str] = field(default_factory=dict)  # file -> task_id
-    files_touched: list[str] = field(default_factory=list)  # files edited in current task
+    files_touched: list[str] = field(
+        default_factory=list
+    )  # files edited in current task
     task_start_time: float = 0.0  # monotonic time when current task started
-    hook_completed_tasks: set = field(default_factory=set)  # task IDs completed via hook (dedup)
+    hook_completed_tasks: set = field(
+        default_factory=set
+    )  # task IDs completed via hook (dedup)
     started_at: str = ""
     last_heartbeat: str = ""
     events_processed: int = 0
@@ -244,16 +249,15 @@ class KeshroDaemon:
         token = get_token(self._token)
         if not token:
             logger.error("Not authenticated. Run: keshro auth login")
-            raise SystemExit(
-                "Not logged in to Keshro.\n"
-                "Run: keshro auth login\n"
-            )
+            raise SystemExit("Not logged in to Keshro.\n" "Run: keshro auth login\n")
 
         # Find repo root
         repo_root = _repo_root()
         if not repo_root:
             logger.error("Not in a git repository")
-            raise SystemExit("Not in a git repository. Run keshro watch from a git repo.")
+            raise SystemExit(
+                "Not in a git repository. Run keshro watch from a git repo."
+            )
         self.state.repo_root = repo_root
 
         # Check for stale daemon
@@ -302,7 +306,9 @@ class KeshroDaemon:
                         f"(current task: {self.state.current_task_id or 'none'})"
                     )
             except Exception as e:
-                logger.warning(f"Could not fetch plan: {e}. Running in observe-only mode.")
+                logger.warning(
+                    f"Could not fetch plan: {e}. Running in observe-only mode."
+                )
                 self.state.observe_only = True
         else:
             logger.info("No plan found for this repo. Running in observe-only mode.")
@@ -414,7 +420,9 @@ class KeshroDaemon:
             except Exception as e:
                 # Put it back for retry — warn if queue is full (appendleft drops newest)
                 if len(self.state.event_queue) >= MAX_QUEUE_SIZE:
-                    logger.warning("Event queue full during retry — newest event will be dropped")
+                    logger.warning(
+                        "Event queue full during retry — newest event will be dropped"
+                    )
                 self.state.event_queue.appendleft(event)
                 logger.debug(f"Event send failed, will retry: {e}")
                 break
@@ -439,7 +447,9 @@ class KeshroDaemon:
 
             self.state.last_heartbeat = datetime.now(timezone.utc).isoformat()
             if self.state.repo_root:
-                _heartbeat_file(self.state.repo_root).write_text(self.state.last_heartbeat)
+                _heartbeat_file(self.state.repo_root).write_text(
+                    self.state.last_heartbeat
+                )
             self._write_status_file()
         except Exception as e:
             logger.debug(f"Heartbeat failed: {e}")
@@ -478,15 +488,19 @@ class KeshroDaemon:
         if task_id:
             # Skip if hook already completed this task (avoid duplicate events)
             if task_id in self.state.hook_completed_tasks:
-                logger.debug(f"Skipping commit for {task_id} — already completed via hook")
+                logger.debug(
+                    f"Skipping commit for {task_id} — already completed via hook"
+                )
                 return
             # HIGH confidence: commit message contains task ID
             logger.info(f"High confidence: commit matches task {task_id}")
-            self.state.event_queue.append({
-                "task_id": task_id,
-                "event": "done",
-                "note": f"[daemon] Auto-completed: commit matched task ID in message",
-            })
+            self.state.event_queue.append(
+                {
+                    "task_id": task_id,
+                    "event": "done",
+                    "note": "[daemon] Auto-completed: commit matched task ID in message",
+                }
+            )
             self.state.tasks_completed += 1
             self._write_context()
         else:
@@ -499,7 +513,9 @@ class KeshroDaemon:
                     task_id=self.state.current_task_id,
                 )
                 self.state.observations.append(obs)
-                logger.info(f"Low confidence: commit during active task {self.state.current_task_id}")
+                logger.info(
+                    f"Low confidence: commit during active task {self.state.current_task_id}"
+                )
 
     def _handle_branch_switch(self, event: GitEvent) -> None:
         """Re-resolve plan when branch changes."""
@@ -541,12 +557,16 @@ class KeshroDaemon:
             cmd_type, task_id = keshro_cmd
             if cmd_type == "task_done":
                 # HIGH confidence: agent explicitly marked task done
-                logger.info(f"High confidence (hook): agent ran keshro task done {task_id}")
-                self.state.event_queue.append({
-                    "task_id": task_id,
-                    "event": "done",
-                    "note": f"[daemon] Auto-detected: agent ran keshro task done. Files touched: {len(set(self.state.files_touched))}",
-                })
+                logger.info(
+                    f"High confidence (hook): agent ran keshro task done {task_id}"
+                )
+                self.state.event_queue.append(
+                    {
+                        "task_id": task_id,
+                        "event": "done",
+                        "note": f"[daemon] Auto-detected: agent ran keshro task done. Files touched: {len(set(self.state.files_touched))}",
+                    }
+                )
                 self.state.hook_completed_tasks.add(task_id)
                 self._record_task_metrics(task_id)
                 self.state.tasks_completed += 1
@@ -555,7 +575,11 @@ class KeshroDaemon:
                 logger.info(f"Hook: agent ran keshro task note {task_id}")
 
         # Track bash commands for quality signals (test runs, lint, build)
-        bash_cmd = event.get("tool_input", {}).get("command", "") if tool_name == "Bash" else ""
+        bash_cmd = (
+            event.get("tool_input", {}).get("command", "")
+            if tool_name == "Bash"
+            else ""
+        )
         if bash_cmd:
             exit_code = event.get("tool_response", {}).get("exit_code")
             self._track_bash_signal(bash_cmd, exit_code)
@@ -564,31 +588,75 @@ class KeshroDaemon:
         """Track bash commands for execution quality signals."""
         cmd_lower = command.lower()
         # Detect test/lint/build commands
-        test_patterns = ["pytest", "npm test", "yarn test", "jest", "vitest", "cargo test", "go test", "rspec", "make test"]
-        lint_patterns = ["ruff", "eslint", "prettier", "mypy", "tsc", "cargo clippy", "flake8"]
-        build_patterns = ["npm run build", "yarn build", "cargo build", "make build", "next build"]
+        test_patterns = [
+            "pytest",
+            "npm test",
+            "yarn test",
+            "jest",
+            "vitest",
+            "cargo test",
+            "go test",
+            "rspec",
+            "make test",
+        ]
+        lint_patterns = [
+            "ruff",
+            "eslint",
+            "prettier",
+            "mypy",
+            "tsc",
+            "cargo clippy",
+            "flake8",
+        ]
+        build_patterns = [
+            "npm run build",
+            "yarn build",
+            "cargo build",
+            "make build",
+            "next build",
+        ]
 
         for pattern in test_patterns:
             if pattern in cmd_lower:
-                status = "pass" if exit_code == 0 else "fail" if exit_code is not None else "unknown"
+                status = (
+                    "pass"
+                    if exit_code == 0
+                    else "fail"
+                    if exit_code is not None
+                    else "unknown"
+                )
                 logger.info(f"Test run detected: {pattern} → {status}")
-                self.state.observations.append(Observation(
-                    timestamp=datetime.now(timezone.utc).isoformat(),
-                    signal_type="test_result",
-                    description=f"Test run ({pattern}): {status}",
-                    task_id=self.state.current_task_id,
-                ))
+                self.state.observations.append(
+                    Observation(
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        signal_type="test_result",
+                        description=f"Test run ({pattern}): {status}",
+                        task_id=self.state.current_task_id,
+                    )
+                )
                 return
 
         for pattern in lint_patterns:
             if pattern in cmd_lower:
-                status = "pass" if exit_code == 0 else "fail" if exit_code is not None else "unknown"
+                status = (
+                    "pass"
+                    if exit_code == 0
+                    else "fail"
+                    if exit_code is not None
+                    else "unknown"
+                )
                 logger.info(f"Lint detected: {pattern} → {status}")
                 return
 
         for pattern in build_patterns:
             if pattern in cmd_lower:
-                status = "pass" if exit_code == 0 else "fail" if exit_code is not None else "unknown"
+                status = (
+                    "pass"
+                    if exit_code == 0
+                    else "fail"
+                    if exit_code is not None
+                    else "unknown"
+                )
                 logger.info(f"Build detected: {pattern} → {status}")
                 return
 
@@ -644,7 +712,7 @@ class KeshroDaemon:
         context_file = claude_dir / "keshro-context.md"
 
         lines = ["# Keshro Execution Context", ""]
-        lines.append(f"> Auto-generated by `keshro watch`. Do not edit manually.")
+        lines.append("> Auto-generated by `keshro watch`. Do not edit manually.")
         lines.append("")
 
         if self.state.observe_only:
@@ -687,7 +755,9 @@ class KeshroDaemon:
                     topical = _extract_topical_context(task, steps)
                     if topical:
                         lines.append("## Relevant Learnings")
-                        lines.append("*From completed tasks that share tags with this task:*")
+                        lines.append(
+                            "*From completed tasks that share tags with this task:*"
+                        )
                         lines.append("")
                         lines.extend(topical)
                         lines.append("")
@@ -696,7 +766,9 @@ class KeshroDaemon:
             if self.state.observations:
                 recent = list(self.state.observations)[-5:]
                 lines.append("## Pending Observations")
-                lines.append("*These were detected but not auto-acted on. Review with `keshro watch status`.*")
+                lines.append(
+                    "*These were detected but not auto-acted on. Review with `keshro watch status`.*"
+                )
                 lines.append("")
                 for obs in recent:
                     lines.append(f"- [{obs.signal_type}] {obs.description}")
@@ -778,7 +850,9 @@ class KeshroDaemon:
         LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
         handler = logging.FileHandler(LOG_FILE, mode="a")
         handler.setFormatter(
-            logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+            logging.Formatter(
+                "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+            )
         )
         logger.addHandler(handler)
         logger.setLevel(logging.INFO)
@@ -796,7 +870,11 @@ class KeshroDaemon:
 
         obs_list = list(self.state.observations)
         recent_obs = [
-            {"type": o.signal_type, "description": o.description, "timestamp": o.timestamp}
+            {
+                "type": o.signal_type,
+                "description": o.description,
+                "timestamp": o.timestamp,
+            }
             for o in obs_list[-10:]
         ]
 
@@ -825,7 +903,9 @@ class KeshroDaemon:
         if not self.state.repo_root:
             return
         try:
-            _status_file(self.state.repo_root).write_text(json.dumps(self.get_status(), indent=2))
+            _status_file(self.state.repo_root).write_text(
+                json.dumps(self.get_status(), indent=2)
+            )
         except OSError:
             pass
 

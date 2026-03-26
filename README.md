@@ -26,7 +26,11 @@ keshro login                 # Reuse saved session
 keshro logout
 ```
 
-Auth state is stored in `~/.keshro/auth.json`. The CLI talks to `https://api.keshro.com` by default — override with `KESHRO_API_URL`.
+Auth state is stored in `~/.keshro/auth.json`. `keshro login` installs the global Claude Code slash command and global Codex instructions in `~/.codex/AGENTS.md`. If you also want Cursor integration, run `keshro setup` inside each repo where you want `.cursorrules` instructions.
+
+When you save or create a plan from a repo, Keshro stores that repo-to-plan link server-side so CLI commands can resolve the active plan from the current checkout.
+
+The CLI talks to `https://api.keshro.com` by default — override with `KESHRO_API_URL`.
 
 ## Commands
 
@@ -48,6 +52,8 @@ keshro setup-claude                                # Install global Claude Code 
 ### What happens when you run `keshro continue`
 
 By default, Keshro launches parallel Claude Code agents in isolated git worktrees — one per actionable task, respecting dependency order. When run inside a coding agent (piped stdout), it falls back to single-task mode automatically.
+
+Inside a coding agent, `keshro continue` prints a compact task brief instead of the full internal execution prompt. If the agent needs the extra task context, it can fetch it explicitly with `keshro task view <task-id> -p <plan-id>`. Users can monitor progress separately with `keshro status -p <plan-id> --watch` or `keshro status -p <plan-id> --tui`.
 
 **Intelligent execution features:**
 
@@ -82,7 +88,7 @@ keshro task note <task-id> -p <plan-id> -n "..."
 keshro task artifact <task-id> -p <plan-id> -l "<url>"
 keshro task block <task-id> -p <plan-id> -r "..."
 keshro task unblock <task-id> -p <plan-id>
-keshro task done <task-id> -p <plan-id>
+keshro task done <task-id> -p <plan-id> -n "Acceptance criteria met: ... Verification: ..."
 keshro task decide <task-id> -p <plan-id> --context "..." --choice "..." --reasoning "..."
 keshro explain <task-id> -p <plan-id>
 keshro rollback <task-id> -p <plan-id>
@@ -100,7 +106,7 @@ The execution engine (`keshro continue`) builds a structured prompt that include
 5. Git state since the last checkpoint
 6. Workspace configuration
 
-This prompt is printed to stdout for the coding agent (Claude Code) to follow.
+The CLI prints a compact execution brief to stdout for the coding agent to follow, with `keshro task view` available when the agent needs the fuller task context.
 
 ## Publishing
 

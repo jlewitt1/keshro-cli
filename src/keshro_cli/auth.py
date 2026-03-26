@@ -57,14 +57,18 @@ def cmd_auth_login(
     else:
         print(f"Successfully logged in to Keshro as {body['user']['email']}.")
 
-    # Auto-install agent integrations (Claude Code, Codex, Cursor)
+    # Auto-install the supported global integrations.
     try:
-        from .cli import _install_agent_integrations
+        from .cli import _install_claude_integration, _install_codex_integration
 
-        installed = _install_agent_integrations(silent=True)
-        if installed and not json_output:
-            for target in installed:
-                print(f"  ✓ {target}")
+        claude_target = _install_claude_integration()
+        codex_target = _install_codex_integration()
+        if not json_output:
+            print(f"  ✓ Claude Code: {claude_target}")
+            print(f"  ✓ Codex: {codex_target}")
+            print(
+                "  Run `keshro setup` inside a repo if you also want Cursor repo instructions there."
+            )
     except Exception:
         pass  # fail silently
 

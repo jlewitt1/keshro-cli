@@ -7,21 +7,12 @@ via socket → tracks files → detects commands → sends API calls → writes 
 
 import asyncio
 import json
-import os
 import time
-import uuid
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
-from keshro_cli.daemon import (
-    KeshroDaemon,
-    _find_current_task,
-    _pid_file,
-    _socket_path,
-    _status_file,
-)
+from keshro_cli.daemon import _socket_path, _status_file, KeshroDaemon
 from keshro_cli.hooks import HOOK_SCRIPT_NAME, install_hooks, uninstall_hooks
 from keshro_cli.watcher import GitEvent
 
@@ -34,13 +25,30 @@ SAMPLE_PLAN = {
     "id": "plan-e2e",
     "title": "E2E Test Plan",
     "plan_steps": [
-        {"id": "task-1", "title": "Setup", "status": "done", "depends_on": [],
-         "description": "Initial setup", "related_files": ["setup.py"]},
-        {"id": "task-2", "title": "Build API", "status": "in_progress", "depends_on": ["task-1"],
-         "description": "Implement endpoints", "acceptance_criteria": "All tests pass",
-         "related_files": ["api.py", "routes.py"]},
-        {"id": "task-3", "title": "Tests", "status": "todo", "depends_on": ["task-2"],
-         "description": "Write test suite"},
+        {
+            "id": "task-1",
+            "title": "Setup",
+            "status": "done",
+            "depends_on": [],
+            "description": "Initial setup",
+            "related_files": ["setup.py"],
+        },
+        {
+            "id": "task-2",
+            "title": "Build API",
+            "status": "in_progress",
+            "depends_on": ["task-1"],
+            "description": "Implement endpoints",
+            "acceptance_criteria": "All tests pass",
+            "related_files": ["api.py", "routes.py"],
+        },
+        {
+            "id": "task-3",
+            "title": "Tests",
+            "status": "todo",
+            "depends_on": ["task-2"],
+            "description": "Write test suite",
+        },
     ],
 }
 
@@ -69,7 +77,11 @@ class _FakeAsyncClient:
 
     async def get(self, path, **kwargs):
         self.calls.append(("GET", path, kwargs))
-        if "/v1/plans/" in path and "task-event" not in path and "heartbeat" not in path:
+        if (
+            "/v1/plans/" in path
+            and "task-event" not in path
+            and "heartbeat" not in path
+        ):
             return _FakeAsyncResponse(SAMPLE_PLAN)
         return _FakeAsyncResponse({})
 
@@ -155,18 +167,24 @@ class TestDaemonE2ELifecycle:
         daemon.state.task_start_time = time.monotonic() - 10
 
         # 1. Simulate file edits via hooks
-        daemon._on_hook_event({
-            "tool_name": "Write",
-            "tool_input": {"file_path": "/src/api.py"},
-        })
-        daemon._on_hook_event({
-            "tool_name": "Edit",
-            "tool_input": {"file_path": "/src/routes.py"},
-        })
-        daemon._on_hook_event({
-            "tool_name": "Bash",
-            "tool_input": {"command": "npm test"},
-        })
+        daemon._on_hook_event(
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": "/src/api.py"},
+            }
+        )
+        daemon._on_hook_event(
+            {
+                "tool_name": "Edit",
+                "tool_input": {"file_path": "/src/routes.py"},
+            }
+        )
+        daemon._on_hook_event(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": "npm test"},
+            }
+        )
 
         # 2. Verify tracking
         assert daemon.state.hook_events_received == 3
@@ -175,10 +193,12 @@ class TestDaemonE2ELifecycle:
         assert daemon.state.files_in_progress["/src/api.py"] == "task-2"
 
         # 3. Agent completes task via keshro command
-        daemon._on_hook_event({
-            "tool_name": "Bash",
-            "tool_input": {"command": "keshro task done task-2 -p plan-e2e"},
-        })
+        daemon._on_hook_event(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": "keshro task done task-2 -p plan-e2e"},
+            }
+        )
 
         # 4. Verify completion
         assert daemon.state.tasks_completed == 1
@@ -219,8 +239,13 @@ class TestDaemonE2ELifecycle:
             "plan_steps": [
                 {"id": "task-1", "status": "done", "depends_on": []},
                 {"id": "task-2", "status": "done", "depends_on": ["task-1"]},
-                {"id": "task-3", "status": "in_progress", "depends_on": ["task-2"],
-                 "title": "Tests", "description": "Write test suite"},
+                {
+                    "id": "task-3",
+                    "status": "in_progress",
+                    "depends_on": ["task-2"],
+                    "title": "Tests",
+                    "description": "Write test suite",
+                },
             ],
         }
         fake_client = _FakeAsyncClient()
@@ -233,13 +258,12 @@ class TestDaemonE2ELifecycle:
         daemon.state.current_task_id = "task-2"
         daemon.state.running = True
 
-        # Patch the plan on the fake client
-        original_get = fake_client.get
         async def patched_get(path, **kwargs):
             fake_client.calls.append(("GET", path, kwargs))
             if "/v1/plans/" in path:
                 return _FakeAsyncResponse(updated_plan)
             return _FakeAsyncResponse({})
+
         fake_client.get = patched_get
 
         async def _heartbeat():
@@ -277,32 +301,42 @@ class TestDaemonE2ELifecycle:
         daemon.state.task_start_time = time.monotonic() - 60
 
         # 1. Hook event: file edit
-        daemon._on_hook_event({
-            "tool_name": "Write",
-            "tool_input": {"file_path": "/src/api.py"},
-        })
+        daemon._on_hook_event(
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": "/src/api.py"},
+            }
+        )
         assert daemon.state.hook_events_received == 1
         assert len(daemon.state.files_touched) == 1
 
         # 2. Git commit: low confidence (no task ID)
-        daemon._handle_commit(GitEvent(
-            "commit", time.monotonic(),
-            {"sha": "aaa", "message": "wip: working on endpoints"},
-        ))
+        daemon._handle_commit(
+            GitEvent(
+                "commit",
+                time.monotonic(),
+                {"sha": "aaa", "message": "wip: working on endpoints"},
+            )
+        )
         assert len(daemon.state.observations) == 1
         assert len(daemon.state.event_queue) == 0  # Low confidence, no action
 
         # 3. More hook events
-        daemon._on_hook_event({
-            "tool_name": "Edit",
-            "tool_input": {"file_path": "/src/routes.py"},
-        })
+        daemon._on_hook_event(
+            {
+                "tool_name": "Edit",
+                "tool_input": {"file_path": "/src/routes.py"},
+            }
+        )
 
         # 4. Git commit: high confidence (has task ID)
-        daemon._handle_commit(GitEvent(
-            "commit", time.monotonic(),
-            {"sha": "bbb", "message": "task-2: complete API implementation"},
-        ))
+        daemon._handle_commit(
+            GitEvent(
+                "commit",
+                time.monotonic(),
+                {"sha": "bbb", "message": "task-2: complete API implementation"},
+            )
+        )
         assert daemon.state.tasks_completed == 1
         assert len(daemon.state.event_queue) == 1
 
@@ -326,10 +360,12 @@ class TestDaemonE2ELifecycle:
         daemon.state.running = True
 
         # Hook events are still processed
-        daemon._on_hook_event({
-            "tool_name": "Write",
-            "tool_input": {"file_path": "/src/main.py"},
-        })
+        daemon._on_hook_event(
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": "/src/main.py"},
+            }
+        )
 
         assert daemon.state.hook_events_received == 1
         assert "/src/main.py" in daemon.state.files_touched

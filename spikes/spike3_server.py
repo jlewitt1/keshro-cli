@@ -19,7 +19,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     try:
         data = await asyncio.wait_for(reader.read(65536), timeout=5.0)
         if data:
-            payload = json.loads(data.decode())
+            json.loads(data.decode())
             elapsed_ns = time.perf_counter_ns() - start
             elapsed_ms = elapsed_ns / 1_000_000
 

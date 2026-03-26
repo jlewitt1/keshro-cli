@@ -11,9 +11,7 @@ Linux support (systemd) is deferred to a future PR.
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -27,6 +25,7 @@ LAUNCHD_DIR = Path.home() / "Library" / "LaunchAgents"
 def _plist_path(repo_root: Path) -> Path:
     """Per-repo plist file path."""
     import hashlib
+
     repo_hash = hashlib.sha256(str(repo_root).encode()).hexdigest()[:12]
     return LAUNCHD_DIR / f"com.keshro.daemon.{repo_hash}.plist"
 
@@ -34,6 +33,7 @@ def _plist_path(repo_root: Path) -> Path:
 def _plist_content(repo_root: Path) -> str:
     """Generate launchd plist XML for the daemon."""
     import hashlib
+
     repo_hash = hashlib.sha256(str(repo_root).encode()).hexdigest()[:12]
     label = f"{PLIST_LABEL}.{repo_hash}"
     log_file = Path.home() / ".keshro" / "daemon.log"
@@ -89,7 +89,9 @@ def install_launchd(repo_root: Path) -> bool:
 
     # Load the plist
     try:
-        subprocess.run(["launchctl", "load", str(plist)], check=True, capture_output=True)
+        subprocess.run(
+            ["launchctl", "load", str(plist)], check=True, capture_output=True
+        )
         logger.info(f"Installed launchd agent: {plist.name}")
         return True
     except subprocess.CalledProcessError as e:
@@ -107,7 +109,9 @@ def uninstall_launchd(repo_root: Path) -> bool:
         return False
 
     try:
-        subprocess.run(["launchctl", "unload", str(plist)], check=True, capture_output=True)
+        subprocess.run(
+            ["launchctl", "unload", str(plist)], check=True, capture_output=True
+        )
     except subprocess.CalledProcessError:
         pass  # May already be unloaded
 

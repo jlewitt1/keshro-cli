@@ -246,7 +246,7 @@ class TestTaskGraph:
         w.plan_data = SAMPLE_PLAN
         text = w.render()
         lines = text.splitlines()
-        task_lines = [l for l in lines if "task-" in l]
+        task_lines = [line for line in lines if "task-" in line]
         ids = []
         for line in task_lines:
             for token in line.split():
@@ -318,7 +318,7 @@ class TestRecentEvents:
         w = RecentEvents()
         w.plan_data = SAMPLE_PLAN
         text = w.render()
-        lines = [l for l in text.splitlines() if "task_" in l]
+        lines = [line for line in text.splitlines() if "task_" in line]
         # Most recent event first
         assert "task_block" in lines[0]
 
@@ -335,7 +335,7 @@ class TestRecentEvents:
         w = RecentEvents()
         w.plan_data = plan
         text = w.render()
-        event_lines = [l for l in text.splitlines() if "task_note" in l]
+        event_lines = [el for el in text.splitlines() if "task_note" in el]
         assert len(event_lines) == 10
         # Should show the last 10 (indices 5-14)
         assert "Event 5" in text
@@ -392,7 +392,7 @@ class TestKeshroStatusApp:
             token="tok-123",
             plan_id="plan-abc",
         )
-        async with app.run_test() as pilot:
+        async with app.run_test():
             assert app.query_one("#overview", PlanOverview)
             assert app.query_one("#agents", ActiveAgents)
             assert app.query_one("#graph", TaskGraph)
@@ -430,7 +430,7 @@ class TestKeshroStatusApp:
             token="tok-123",
             plan_id="plan-abc",
         )
-        async with app.run_test() as pilot:
+        async with app.run_test():
             overview = app.query_one("#overview", PlanOverview)
             assert overview.plan_data is not None
             assert overview.plan_data["title"] == "AWS Batch to Airflow pilot"
@@ -460,7 +460,7 @@ class TestKeshroStatusApp:
             token="tok-123",
             plan_id="plan-abc",
         )
-        async with app.run_test() as pilot:
+        async with app.run_test():
             overview = app.query_one("#overview", PlanOverview)
             assert overview._error
             assert "Connection refused" in overview._error
@@ -496,7 +496,7 @@ class TestKeshroStatusApp:
             token="tok-123",
             plan_id="plan-abcdef123456",
         )
-        async with app.run_test() as pilot:
+        async with app.run_test():
             assert app.title == "KESHRO STATUS"
             assert "plan-abcdef12345" in app.sub_title
 

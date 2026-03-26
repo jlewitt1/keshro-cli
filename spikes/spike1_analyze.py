@@ -54,7 +54,9 @@ for i, entry in enumerate(entries):
     for key in ["stdout", "output", "content", "text", "result"]:
         if key in tool_response:
             val = str(tool_response[key])
-            print(f"  tool_response.{key}: {val[:200]}{'...' if len(val) > 200 else ''}")
+            print(
+                f"  tool_response.{key}: {val[:200]}{'...' if len(val) > 200 else ''}"
+            )
 
     # If we can't find stdout, dump all tool_response to see what's there
     known_keys = {"exit_code", "stdout", "output", "content", "text", "result"}
@@ -71,8 +73,10 @@ for i, entry in enumerate(entries):
 print("=" * 60)
 print("SPIKE 1 RESULT:")
 has_stdout = any(
-    any(k in entry.get("payload", {}).get("tool_response", {})
-        for k in ["stdout", "output", "content", "text", "result"])
+    any(
+        k in entry.get("payload", {}).get("tool_response", {})
+        for k in ["stdout", "output", "content", "text", "result"]
+    )
     for entry in entries
 )
 if has_stdout:
@@ -83,8 +87,7 @@ else:
     print("   → Need fallback: agent writes learnings to file, or use transcript_path")
     # Check if transcript_path is available
     has_transcript = any(
-        "transcript_path" in entry.get("payload", {})
-        for entry in entries
+        "transcript_path" in entry.get("payload", {}) for entry in entries
     )
     if has_transcript:
         tp = entries[0].get("payload", {}).get("transcript_path", "")

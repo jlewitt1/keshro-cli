@@ -95,11 +95,16 @@ class ActiveAgents(Static):
             if updated:
                 try:
                     from datetime import datetime, timezone
+
                     t = datetime.fromisoformat(updated.replace("Z", "+00:00"))
                     delta = datetime.now(timezone.utc) - t
                     mins = int(delta.total_seconds() // 60)
                     secs = int(delta.total_seconds() % 60)
-                    elapsed = f" [dim]{mins}m {secs}s[/dim]" if mins > 0 else f" [dim]{secs}s[/dim]"
+                    elapsed = (
+                        f" [dim]{mins}m {secs}s[/dim]"
+                        if mins > 0
+                        else f" [dim]{secs}s[/dim]"
+                    )
                 except Exception:
                     pass
             lines.append(f"  [yellow]▶[/yellow] {title}{session_label}{elapsed}")
@@ -107,7 +112,11 @@ class ActiveAgents(Static):
             # Show latest notes for this task (what the agent is doing)
             notes = (step.get("notes") or "").strip()
             if notes:
-                note_lines = [l.strip() for l in notes.split("\n") if l.strip()]
+                note_lines = [
+                    note_line.strip()
+                    for note_line in notes.split("\n")
+                    if note_line.strip()
+                ]
                 if self.show_full:
                     for nl in note_lines:
                         lines.append(f"    [dim]{nl}[/dim]")
@@ -116,7 +125,9 @@ class ActiveAgents(Static):
                         display = nl[:80] + "..." if len(nl) > 80 else nl
                         lines.append(f"    [dim]{display}[/dim]")
                     if len(note_lines) > 3:
-                        lines.append(f"    [dim]... {len(note_lines) - 3} more — press L for full logs[/dim]")
+                        lines.append(
+                            f"    [dim]... {len(note_lines) - 3} more — press L for full logs[/dim]"
+                        )
 
         return "\n".join(lines)
 
@@ -271,7 +282,11 @@ class KeshroStatusApp(App):
             self._sse_connected = False
             self._update_live_indicator(False)
             self._start_polling_fallback()
-            self.notify("Live updates unavailable — install httpx-sse for real-time: pip install httpx-sse", severity="warning", timeout=8)
+            self.notify(
+                "Live updates unavailable — install httpx-sse for real-time: pip install httpx-sse",
+                severity="warning",
+                timeout=8,
+            )
             return
 
         headers = {
