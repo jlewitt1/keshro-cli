@@ -218,12 +218,14 @@ class KeshroDaemon:
         poll_interval: float = 1.0,
         api_url: str | None = None,
         token: str | None = None,
+        enable_git_watcher: bool = True,
     ):
         self.state = DaemonState()
         self.state.plan_id = plan_id
         self._poll_interval = poll_interval
         self._api_url = api_url
         self._token = token
+        self._enable_git_watcher = enable_git_watcher
         self._watcher: GitWatcher | None = None
         self._hook_server: HookSocketServer | None = None
         self._shutdown_event = asyncio.Event()
@@ -308,17 +310,19 @@ class KeshroDaemon:
         self.state.running = True
         self.state.started_at = datetime.now(timezone.utc).isoformat()
 
-        # Start git watcher
-        self._watcher = GitWatcher(repo_root, self._on_git_event)
-        self._watcher.start()
-
-        # Start hook socket server
+        # Primary: Hook socket server + Claude Code hooks
         sock_path = _socket_path(repo_root)
         self._hook_server = HookSocketServer(sock_path, self._on_hook_event)
         await self._hook_server.start()
-
-        # Install Claude Code hooks
         install_hooks(repo_root, sock_path)
+
+        # Secondary: Git watcher (optional fallback for commits outside Claude Code)
+        if self._enable_git_watcher:
+            try:
+                self._watcher = GitWatcher(repo_root, self._on_git_event)
+                self._watcher.start()
+            except Exception as e:
+                logger.warning(f"Git watcher unavailable: {e}. Hooks are still active.")
 
         # Track task start time
         if self.state.current_task_id:
@@ -509,8 +513,15 @@ class KeshroDaemon:
     # ------------------------------------------------------------------
 
     def _on_hook_event(self, event: dict) -> None:
-        """Handle a Claude Code hook event received via the Unix socket."""
+        """Handle a Claude Code hook event received via the Unix socket.
+
+        This is the primary signal source. The daemon sees every tool call:
+        - Write/Edit → track which files the agent is touching
+        - Bash → detect keshro commands, test runs, build commands
+        - All → count activity for quality metrics
+        """
         self.state.hook_events_received += 1
+        tool_name = event.get("tool_name", "")
 
         # Track file edits
         files = extract_file_paths(event)
@@ -529,11 +540,51 @@ class KeshroDaemon:
                 self.state.event_queue.append({
                     "task_id": task_id,
                     "event": "done",
-                    "note": "[daemon] Auto-detected: agent ran keshro task done",
+                    "note": f"[daemon] Auto-detected: agent ran keshro task done. Files touched: {len(set(self.state.files_touched))}",
                 })
                 self._record_task_metrics(task_id)
                 self.state.tasks_completed += 1
                 self._write_context()
+            elif cmd_type == "task_note":
+                logger.info(f"Hook: agent ran keshro task note {task_id}")
+
+        # Track bash commands for quality signals (test runs, lint, build)
+        bash_cmd = event.get("tool_input", {}).get("command", "") if tool_name == "Bash" else ""
+        if bash_cmd:
+            exit_code = event.get("tool_response", {}).get("exit_code")
+            self._track_bash_signal(bash_cmd, exit_code)
+
+    def _track_bash_signal(self, command: str, exit_code: int | None) -> None:
+        """Track bash commands for execution quality signals."""
+        cmd_lower = command.lower()
+        # Detect test/lint/build commands
+        test_patterns = ["pytest", "npm test", "yarn test", "jest", "vitest", "cargo test", "go test", "rspec", "make test"]
+        lint_patterns = ["ruff", "eslint", "prettier", "mypy", "tsc", "cargo clippy", "flake8"]
+        build_patterns = ["npm run build", "yarn build", "cargo build", "make build", "next build"]
+
+        for pattern in test_patterns:
+            if pattern in cmd_lower:
+                status = "pass" if exit_code == 0 else "fail" if exit_code is not None else "unknown"
+                logger.info(f"Test run detected: {pattern} → {status}")
+                self.state.observations.append(Observation(
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    signal_type="test_result",
+                    description=f"Test run ({pattern}): {status}",
+                    task_id=self.state.current_task_id,
+                ))
+                return
+
+        for pattern in lint_patterns:
+            if pattern in cmd_lower:
+                status = "pass" if exit_code == 0 else "fail" if exit_code is not None else "unknown"
+                logger.info(f"Lint detected: {pattern} → {status}")
+                return
+
+        for pattern in build_patterns:
+            if pattern in cmd_lower:
+                status = "pass" if exit_code == 0 else "fail" if exit_code is not None else "unknown"
+                logger.info(f"Build detected: {pattern} → {status}")
+                return
 
     def _record_task_metrics(self, task_id: str) -> None:
         """Record execution quality metrics for a completed task."""

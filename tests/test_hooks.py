@@ -329,6 +329,43 @@ class TestDaemonHookIntegration:
         assert len(daemon.state.event_queue) == 0
         assert daemon.state.hook_events_received == 1
 
+    def test_bash_test_run_detected(self, daemon):
+        event = {
+            "tool_name": "Bash",
+            "tool_input": {"command": "python -m pytest tests/ -v"},
+            "tool_response": {"exit_code": 0},
+        }
+        daemon._on_hook_event(event)
+
+        assert daemon.state.hook_events_received == 1
+        # Should have a test_result observation
+        assert any(o.signal_type == "test_result" for o in daemon.state.observations)
+
+    def test_bash_test_failure_detected(self, daemon):
+        event = {
+            "tool_name": "Bash",
+            "tool_input": {"command": "npm test"},
+            "tool_response": {"exit_code": 1},
+        }
+        daemon._on_hook_event(event)
+
+        obs = [o for o in daemon.state.observations if o.signal_type == "test_result"]
+        assert len(obs) == 1
+        assert "fail" in obs[0].description
+
+    def test_daemon_works_without_git_watcher(self, daemon):
+        """Hooks-first: daemon should function purely from hook events."""
+        # Simulate a full task lifecycle via hooks only (no git)
+        daemon._on_hook_event({"tool_name": "Write", "tool_input": {"file_path": "/src/api.py"}})
+        daemon._on_hook_event({"tool_name": "Edit", "tool_input": {"file_path": "/src/routes.py"}})
+        daemon._on_hook_event({"tool_name": "Bash", "tool_input": {"command": "npm test"}, "tool_response": {"exit_code": 0}})
+        daemon._on_hook_event({"tool_name": "Bash", "tool_input": {"command": "keshro task done task-2 -p plan-1"}})
+
+        assert daemon.state.hook_events_received == 4
+        assert len(set(daemon.state.files_touched)) == 0  # Reset after completion
+        assert daemon.state.tasks_completed == 1
+        assert len(daemon.state.event_queue) == 1
+
     def test_task_metrics_recorded_on_completion(self, daemon):
         # Touch some files
         daemon.state.files_touched = ["/a.py", "/b.py", "/a.py"]

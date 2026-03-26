@@ -5076,10 +5076,14 @@ def _watch_start(
         bool,
         typer.Option("--foreground", "-f", help="Run in foreground instead of backgrounding."),
     ] = False,
+    no_git: Annotated[
+        bool,
+        typer.Option("--no-git", help="Disable git watcher. Rely on Claude Code hooks only."),
+    ] = False,
 ):
     """Start the Keshro background daemon.
 
-    Watches git activity and automatically tracks task progress.
+    Monitors your coding session via Claude Code hooks and optionally git.
     Auto-detects the plan from saved config or .keshro file.
     Runs in the background by default. Use --foreground to keep in terminal.
     """
@@ -5120,6 +5124,8 @@ def _watch_start(
             cmd.extend(["--plan-id", plan_id])
         if poll_interval != 1.0:
             cmd.extend(["--poll-interval", str(poll_interval)])
+        if no_git:
+            cmd.append("--no-git")
 
         # Redirect stdout/stderr to log file
         from .daemon import LOG_FILE
@@ -5156,6 +5162,7 @@ def _watch_start(
         poll_interval=poll_interval,
         api_url=_state.api_url or None,
         token=_state.token,
+        enable_git_watcher=not no_git,
     )
     daemon.state.repo_root = repo_root
     daemon.setup_repo()
