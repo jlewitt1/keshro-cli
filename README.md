@@ -26,20 +26,24 @@ keshro login                 # Reuse saved session
 keshro logout
 ```
 
-Auth state is stored in `~/.keshro/auth.json`. The CLI talks to `https://api.keshro.com` by default — override with `KESHRO_API_URL`.
+Auth state is stored in `~/.keshro/auth.json`. `keshro login` installs the global Claude Code slash command and global Codex instructions in `~/.codex/AGENTS.md`. If you also want Cursor integration, run `keshro setup` inside each repo where you want `.cursorrules` instructions.
+
+When you save or create a plan from a repo, Keshro stores that repo-to-plan link server-side so CLI commands can resolve the active plan from the current checkout.
+
+The CLI talks to `https://api.keshro.com` by default — override with `KESHRO_API_URL`.
 
 ## Commands
 
 ### Execution
 
 ```bash
-keshro continue -p <plan-id>                      # Resume next task
+keshro continue -p <plan-id>                      # Coordinator mode: launch parallel agents from your terminal
 keshro continue -p <plan-id> --confirm             # Approve and execute a draft plan
 keshro continue -p <plan-id> --all                 # Auto-continue through all tasks
 keshro continue -p <plan-id> --concurrency 10      # Up to 10 agents at once (default 5)
 keshro continue -p <plan-id> --dry-run             # Preview which tasks would launch
 keshro continue -p <plan-id> --dir /path/to/repo   # Point agent(s) at a different codebase
-keshro continue -p <plan-id> --no-parallel         # Single-task mode
+keshro continue -p <plan-id> --no-parallel         # Coordinator mode: force one task at a time
 keshro status -p <plan-id>                         # Live dashboard of all tasks and agents
 keshro status --watch                              # Auto-refresh every 10 seconds
 keshro setup-claude                                # Install global Claude Code slash command
@@ -47,7 +51,9 @@ keshro setup-claude                                # Install global Claude Code 
 
 ### What happens when you run `keshro continue`
 
-By default, Keshro launches parallel Claude Code agents in isolated git worktrees — one per actionable task, respecting dependency order. When run inside a coding agent (piped stdout), it falls back to single-task mode automatically.
+From your terminal, `keshro continue` acts as the coordinator: it can launch parallel Claude Code agents in isolated git worktrees, one per actionable task, respecting dependency order. When the same command runs inside a coding agent (piped stdout), it switches to worker mode automatically and resumes exactly one task instead of spawning more agents.
+
+Inside a coding agent, `keshro continue` prints a compact task brief instead of the full internal execution prompt. If the agent needs the extra task context, it can fetch it explicitly with `keshro task view <task-id> -p <plan-id>`. Users can monitor progress separately with `keshro status -p <plan-id> --watch` or `keshro status -p <plan-id> --tui`.
 
 **Intelligent execution features:**
 
@@ -82,7 +88,7 @@ keshro task note <task-id> -p <plan-id> -n "..."
 keshro task artifact <task-id> -p <plan-id> -l "<url>"
 keshro task block <task-id> -p <plan-id> -r "..."
 keshro task unblock <task-id> -p <plan-id>
-keshro task done <task-id> -p <plan-id>
+keshro task done <task-id> -p <plan-id> -n "Acceptance criteria met: ... Verification: ..."
 keshro task decide <task-id> -p <plan-id> --context "..." --choice "..." --reasoning "..."
 keshro explain <task-id> -p <plan-id>
 keshro rollback <task-id> -p <plan-id>
@@ -100,7 +106,7 @@ The execution engine (`keshro continue`) builds a structured prompt that include
 5. Git state since the last checkpoint
 6. Workspace configuration
 
-This prompt is printed to stdout for the coding agent (Claude Code) to follow.
+The CLI prints a compact execution brief to stdout for the coding agent to follow, with `keshro task view` available when the agent needs the fuller task context.
 
 ## Publishing
 

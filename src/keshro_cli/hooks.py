@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import shutil
 from pathlib import Path
 
 logger = logging.getLogger("keshro.daemon")
@@ -79,22 +78,23 @@ def install_hooks(repo_root: Path, socket_path: Path) -> None:
     post_hooks = hooks.setdefault("PostToolUse", [])
 
     # Remove any existing keshro hooks
-    post_hooks[:] = [
-        h for h in post_hooks
-        if not _is_keshro_hook(h)
-    ]
+    post_hooks[:] = [h for h in post_hooks if not _is_keshro_hook(h)]
 
     # Add hooks for each watched tool
     script_path = str(hook_script.resolve())
     for tool in WATCHED_TOOLS:
-        post_hooks.append({
-            "matcher": tool,
-            "hooks": [{
-                "type": "command",
-                "command": script_path,
-            }],
-            "_keshro": HOOK_MARKER,  # Marker for identification
-        })
+        post_hooks.append(
+            {
+                "matcher": tool,
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": script_path,
+                    }
+                ],
+                "_keshro": HOOK_MARKER,  # Marker for identification
+            }
+        )
 
     settings_file.write_text(json.dumps(settings, indent=2) + "\n")
     logger.info(f"Registered hooks for {WATCHED_TOOLS} in {settings_file}")
@@ -110,10 +110,7 @@ def uninstall_hooks(repo_root: Path) -> None:
             settings = json.loads(settings_file.read_text())
             hooks = settings.get("hooks", {})
             post_hooks = hooks.get("PostToolUse", [])
-            hooks["PostToolUse"] = [
-                h for h in post_hooks
-                if not _is_keshro_hook(h)
-            ]
+            hooks["PostToolUse"] = [h for h in post_hooks if not _is_keshro_hook(h)]
             settings_file.write_text(json.dumps(settings, indent=2) + "\n")
             logger.info("Removed keshro hooks from settings.json")
         except (json.JSONDecodeError, OSError) as e:

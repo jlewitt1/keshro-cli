@@ -236,13 +236,23 @@ class _FakeClient:
         if "/push" in path:
             return _FakeResponse({"created": 3, "updated": 1})
         if "/sync-pull" in path:
-            return _FakeResponse({
-                "synced": 2,
-                "changes": [
-                    {"external_key": "KES-101", "external_status": "completed", "current_status": "in_progress"},
-                    {"external_key": "KES-102", "external_status": "in_progress", "current_status": "todo"},
-                ],
-            })
+            return _FakeResponse(
+                {
+                    "synced": 2,
+                    "changes": [
+                        {
+                            "external_key": "KES-101",
+                            "external_status": "completed",
+                            "current_status": "in_progress",
+                        },
+                        {
+                            "external_key": "KES-102",
+                            "external_status": "in_progress",
+                            "current_status": "todo",
+                        },
+                    ],
+                }
+            )
         if path == "/v1/migrations/clarifiers":
             return _FakeResponse({"questions": []})
         if path == "/v1/migrations":
@@ -535,10 +545,13 @@ def test_continue_prints_prompt_with_task_context(fake_client, monkeypatch, caps
     out = capsys.readouterr().out
     assert "Task: Review EventBridge schedules" in out
     assert "Task ID: review-schedules" in out
-    assert "If this task is blocked, do not automatically move to the next task" in out
+    assert "Execution reminders:" in out
+    assert "keshro task start review-schedules -p plan-123" in out
 
 
-def test_continue_prompt_includes_mcp_warning(fake_client, monkeypatch, capsys):
+def test_continue_prompt_omits_full_skill_boilerplate_in_non_tty_mode(
+    fake_client, monkeypatch, capsys
+):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     _bypass_auth(monkeypatch)
@@ -546,10 +559,13 @@ def test_continue_prompt_includes_mcp_warning(fake_client, monkeypatch, capsys):
     cli.main(["continue"])
 
     out = capsys.readouterr().out
-    assert "Do NOT use Keshro MCP tools" in out
+    assert "Do NOT use Keshro MCP tools" not in out
+    assert "The current task and plan context are provided below" not in out
 
 
-def test_continue_prompt_includes_ask_before_continue(fake_client, monkeypatch, capsys):
+def test_continue_prompt_mentions_status_tracking_and_blocking_rule(
+    fake_client, monkeypatch, capsys
+):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     _bypass_auth(monkeypatch)
@@ -557,7 +573,56 @@ def test_continue_prompt_includes_ask_before_continue(fake_client, monkeypatch, 
     cli.main(["continue"])
 
     out = capsys.readouterr().out
-    assert "ask the user if they want to continue to the next task" in out
+    assert "keshro status -p plan-123 --watch" in out
+    assert "Only mark the task blocked if work cannot continue" in out
+
+
+def test_continue_in_agent_mode_resumes_in_progress_task_before_next_todo(
+    fake_client, monkeypatch, capsys
+):
+    monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
+    _bypass_auth(monkeypatch)
+
+    original_get = fake_client.get
+
+    def _get(path, params=None):
+        response = original_get(path, params=params)
+        if path != "/v1/plans/plan-123":
+            return response
+        plan = response.json()
+        plan["plan_steps"] = [
+            {
+                **plan["plan_steps"][0],
+                "id": "task-1",
+                "title": "Set up MWAA environment with Terraform",
+                "status": "in_progress",
+                "order": 1,
+            },
+            {
+                **plan["plan_steps"][1],
+                "id": "task-2",
+                "title": "Create and validate DAG files",
+                "status": "in_progress",
+                "order": 2,
+            },
+            {
+                "id": "task-3",
+                "order": 3,
+                "title": "Test DAGs locally with MWAA Docker",
+                "description": "Validate DAG parsing and dependency compatibility",
+                "status": "todo",
+            },
+        ]
+        return _FakeResponse(plan)
+
+    monkeypatch.setattr(fake_client, "get", _get)
+
+    cli.main(["continue"])
+
+    out = capsys.readouterr().out
+    assert "Task: Set up MWAA environment with Terraform" in out
+    assert "Task: Test DAGs locally with MWAA Docker" not in out
 
 
 def test_continue_prompt_includes_error_guidance(fake_client, monkeypatch, capsys):
@@ -636,7 +701,7 @@ def test_setup_claude_creates_slash_command(monkeypatch, tmp_path, capsys):
     assert target.exists()
     content = target.read_text()
     assert "keshro continue" in content
-    assert "Do not use Keshro MCP tools" in content
+    assert "Do NOT use Keshro MCP tools" in content
 
 
 def test_setup_claude_overwrites_existing(monkeypatch, tmp_path, capsys):
@@ -757,6 +822,7 @@ def test_migration_list_json_outputs_machine_readable_rows(fake_client, capsys):
 def test_plan_list_is_concise_by_default(fake_client, capsys, monkeypatch):
     monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: {})
     monkeypatch.setattr("keshro_cli.client.load_auth", lambda: {})
+    monkeypatch.setattr(cli, "_format_plan_timestamp", lambda value: "Today 10:30")
     cli.main(["plan", "list"])
     out = capsys.readouterr().out
     assert "ID" in out
@@ -766,17 +832,24 @@ def test_plan_list_is_concise_by_default(fake_client, capsys, monkeypatch):
     assert "plan-123" in out
     assert "AWS Batch to Airflow pilot" in out
     assert "AWS Batch -> Airflow" in out
-    assert "2026-03-11T15:30:00Z" in out
+    assert "Today 10:30" in out
+    assert "2026-03-11T15:30:00Z" not in out
     assert "Pilot plan for the first DAG migration." not in out
     assert "for org" not in out
 
 
-def test_plan_list_verbose_includes_summary_and_timestamp(fake_client, capsys):
+def test_plan_list_verbose_includes_summary_and_timestamp(
+    fake_client, capsys, monkeypatch
+):
+    monkeypatch.setattr(
+        cli, "_format_verbose_timestamp", lambda value: "2026-03-11 10:30 PDT"
+    )
     cli.main(["plan", "list", "--verbose"])
     out = capsys.readouterr().out
     assert "Pilot plan for the first DAG migration." in out
     assert "Updated:" in out
-    assert "2026-03-11T15:30:00Z" in out
+    assert "2026-03-11 10:30 PDT" in out
+    assert "2026-03-11T15:30:00Z" not in out
 
 
 def test_plan_list_latest_limits_rows(fake_client, capsys):
@@ -915,11 +988,108 @@ def test_config_set_can_save_default_plan(fake_client, monkeypatch, capsys):
         "keshro_cli.cli.update_auth",
         lambda payload: {"api_url": "http://localhost:8000", **payload},
     )
+    monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
+    monkeypatch.setattr(
+        "keshro_cli.cli._link_current_repo_to_plan", lambda *args, **kwargs: True
+    )
     code = cli.main(["config", "set", "-p", "plan-123"])
     out = capsys.readouterr().out
     assert code == 0
     assert "Saved default context: personal" in out
     assert "Saved default plan: AWS Batch to Airflow pilot" in out
+    assert "Linked the current repo to this plan in Keshro." in out
+
+
+def test_require_plan_context_can_resolve_repo_link(monkeypatch):
+    monkeypatch.setattr(
+        "keshro_cli.cli.load_auth",
+        lambda: {
+            "api_url": "http://localhost:8000",
+            "token": "jwt-123",
+        },
+    )
+    monkeypatch.setattr("keshro_cli.cli.update_auth", lambda payload: payload)
+
+    class _ResolveClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, path, params=None, headers=None, timeout=None):
+            if path == "/v1/plans/repo-link/resolve":
+                assert params["repo_root"] == "/tmp/demo"
+                return _FakeResponse({"plan_id": "plan-123"})
+            if path == "/v1/plans/plan-123":
+                return _FakeResponse(
+                    {"id": "plan-123", "title": "AWS Batch to Airflow pilot"}
+                )
+            raise AssertionError(path)
+
+    def _fake_run(cmd, cwd=None, capture_output=None, text=None, check=None):
+        if cmd == ["git", "rev-parse", "--show-toplevel"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="/tmp/demo\n", stderr="")
+        if cmd == ["git", "config", "--get", "remote.origin.url"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="git@github.com:acme/demo.git\n", stderr=""
+            )
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(
+        "keshro_cli.cli.make_client", lambda api_url=None, token=None: _ResolveClient()
+    )
+    monkeypatch.setattr("keshro_cli.cli.subprocess.run", _fake_run)
+
+    assert cli._require_plan_context(None) == "plan-123"
+
+
+def test_current_plan_id_prefers_cached_default_before_repo_resolution(monkeypatch):
+    monkeypatch.setattr(
+        "keshro_cli.cli.load_auth",
+        lambda: {
+            "default_plan_id": "plan-cached",
+            "default_plan_title": "Cached plan",
+        },
+    )
+
+    def _fail_resolve(*args, **kwargs):
+        raise AssertionError("repo resolution should not run when default plan is cached")
+
+    monkeypatch.setattr("keshro_cli.cli._resolve_repo_linked_plan", _fail_resolve)
+
+    assert cli._current_plan_id(None) == "plan-cached"
+
+
+def test_install_codex_integration_replaces_existing_managed_block(monkeypatch, tmp_path):
+    monkeypatch.setattr("keshro_cli.cli.CODEX_HOME_DIR", tmp_path)
+    target = tmp_path / "AGENTS.md"
+    old_block = (
+        "<!-- keshro-agent-instructions -->\n"
+        "# Keshro Integration\n\n"
+        "OLD CONTENT\n"
+        "<!-- keshro-agent-instructions -->\n"
+    )
+    target.write_text("Existing intro\n\n" + old_block + "\nExisting footer\n")
+
+    cli._install_codex_integration()
+
+    content = target.read_text()
+    assert "OLD CONTENT" not in content
+    assert "Existing intro" in content
+    assert "Existing footer" in content
+    assert content.count("<!-- keshro-agent-instructions -->") == 2
+
+
+def test_setup_all_reports_already_present_integrations(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "keshro_cli.cli._install_agent_integrations",
+        lambda silent=True: ([], ["Claude Code: /tmp/keshro.md", "Codex: /tmp/codex.md"]),
+    )
+
+    cli.main(["setup"])
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+    assert "All agent integrations already installed." in out
 
 
 def test_config_set_can_save_api_url(monkeypatch, capsys):
@@ -1614,10 +1784,24 @@ def test_auth_login_with_token_prints_human_text_by_default(monkeypatch, capsys)
     monkeypatch.setattr(
         "keshro_cli.auth.save_auth", lambda payload: saved.update(payload)
     )
+    monkeypatch.setattr(
+        "keshro_cli.cli._install_claude_integration",
+        lambda: Path("/tmp/keshro.md"),
+    )
+    monkeypatch.setattr(
+        "keshro_cli.cli._install_codex_integration",
+        lambda: Path("/tmp/codex-AGENTS.md"),
+    )
 
     cli.main(["login", "ksh_pat_test"])
-    out = capsys.readouterr().out.strip()
-    assert out == "Successfully logged in to Keshro as cli@example.com."
+    out = capsys.readouterr().out
+    assert "Successfully logged in to Keshro as cli@example.com." in out
+    assert "Claude Code: /tmp/keshro.md" in out
+    assert "Codex: /tmp/codex-AGENTS.md" in out
+    assert (
+        "Run `keshro setup` inside a repo if you also want Cursor repo instructions there."
+        in out
+    )
     assert saved["token"] == "ksh_pat_test"
 
 
@@ -1639,6 +1823,14 @@ def test_auth_login_with_token_validates_with_auth_me(monkeypatch, capsys):
     monkeypatch.setattr("keshro_cli.auth.httpx.Client", lambda **kwargs: _AuthClient())
     monkeypatch.setattr(
         "keshro_cli.auth.save_auth", lambda payload: saved.update(payload)
+    )
+    monkeypatch.setattr(
+        "keshro_cli.cli._install_claude_integration",
+        lambda: Path("/tmp/keshro.md"),
+    )
+    monkeypatch.setattr(
+        "keshro_cli.cli._install_codex_integration",
+        lambda: Path("/tmp/codex-AGENTS.md"),
     )
 
     cli.main(["--json", "login", "ksh_pat_test"])
@@ -1939,24 +2131,33 @@ def test_plan_generate_shows_enrichment(fake_client, capsys, monkeypatch):
     monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: _auth)
     monkeypatch.setattr("keshro_cli.client.load_auth", lambda: _auth)
     original_post = fake_client.post
+
     def _post_gen(path, json=None, timeout=None):
         if "/generate" in path:
-            return _FakeResponse({
-                "id": "plan-gen-1",
-                "title": "Auth Refactor",
-                "status": "draft",
-                "plan_steps": [
-                    {"order": 1, "title": "Update auth", "depends_on": [], "risk_level": "high"},
-                ],
-                "enrichment_sources": [
-                    {"name": "Greptile", "description": "Codebase analysis"},
-                ],
-                "decisions": {
-                    "confidence_score": 82,
-                    "risks": [{"severity": "high", "description": "Auth"}],
-                },
-            })
+            return _FakeResponse(
+                {
+                    "id": "plan-gen-1",
+                    "title": "Auth Refactor",
+                    "status": "draft",
+                    "plan_steps": [
+                        {
+                            "order": 1,
+                            "title": "Update auth",
+                            "depends_on": [],
+                            "risk_level": "high",
+                        },
+                    ],
+                    "enrichment_sources": [
+                        {"name": "Greptile", "description": "Codebase analysis"},
+                    ],
+                    "decisions": {
+                        "confidence_score": 82,
+                        "risks": [{"severity": "high", "description": "Auth"}],
+                    },
+                }
+            )
         return original_post(path, json=json, timeout=timeout)
+
     fake_client.post = _post_gen
     code = cli.main(["plan", "generate", "Refactor auth module"])
     captured = capsys.readouterr()
@@ -1972,28 +2173,42 @@ def test_status_shows_cost_summary(fake_client, capsys, monkeypatch):
     monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: _auth)
     monkeypatch.setattr("keshro_cli.client.load_auth", lambda: _auth)
     original_get = fake_client.get
+
     def _get_cost(path, params=None, timeout=None):
         if path == "/v1/plans/plan-123":
-            return _FakeResponse({
-                "id": "plan-123",
-                "title": "Auth Refactor",
-                "status": "in_progress",
-                "plan_steps": [
-                    {"id": "t1", "order": 1, "title": "Task 1", "status": "completed"},
-                ],
-                "task_feedback_events": [],
-                "agent_cost": {
-                    "total_cost_usd": 4.50,
-                    "total_tokens": 250000,
-                    "total_duration_seconds": 720,
-                    "tasks_tracked": 2,
-                    "by_model": {
-                        "claude-sonnet-4": {"tasks": 2, "cost_usd": 4.50, "tokens": 250000, "duration_seconds": 720},
+            return _FakeResponse(
+                {
+                    "id": "plan-123",
+                    "title": "Auth Refactor",
+                    "status": "in_progress",
+                    "plan_steps": [
+                        {
+                            "id": "t1",
+                            "order": 1,
+                            "title": "Task 1",
+                            "status": "completed",
+                        },
+                    ],
+                    "task_feedback_events": [],
+                    "agent_cost": {
+                        "total_cost_usd": 4.50,
+                        "total_tokens": 250000,
+                        "total_duration_seconds": 720,
+                        "tasks_tracked": 2,
+                        "by_model": {
+                            "claude-sonnet-4": {
+                                "tasks": 2,
+                                "cost_usd": 4.50,
+                                "tokens": 250000,
+                                "duration_seconds": 720,
+                            },
+                        },
                     },
-                },
-                "enrichment_sources": [{"name": "Greptile", "description": "x"}],
-            })
+                    "enrichment_sources": [{"name": "Greptile", "description": "x"}],
+                }
+            )
         return original_get(path, params=params)
+
     fake_client.get = _get_cost
     code = cli.main(["status", "-p", "plan-123"])
     captured = capsys.readouterr()

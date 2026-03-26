@@ -1,29 +1,21 @@
 """Tests for the keshro daemon (Phase 0.1)."""
 
-import asyncio
 import json
-import os
-import signal
 import time
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
 from keshro_cli.daemon import (
-    DaemonState,
+    _find_current_task,
+    _match_task_id_in_commit,
+    _socket_path,
     KeshroDaemon,
     MAX_QUEUE_SIZE,
     Observation,
-    _find_current_task,
-    _match_task_id_in_commit,
-    _pid_file,
-    _repo_root,
-    _socket_path,
-    is_daemon_running,
-    stop_daemon,
 )
-from keshro_cli.watcher import GitEvent, GitWatcher
+from keshro_cli.watcher import GitEvent
 
 
 # ---------------------------------------------------------------------------
@@ -49,9 +41,24 @@ def sample_plan():
         "title": "Test Plan",
         "plan_steps": [
             {"id": "task-1", "title": "Setup auth", "status": "done", "depends_on": []},
-            {"id": "task-2", "title": "Add API", "status": "in_progress", "depends_on": ["task-1"]},
-            {"id": "task-3", "title": "Write tests", "status": "todo", "depends_on": ["task-2"]},
-            {"id": "task-4", "title": "Update docs", "status": "todo", "depends_on": []},
+            {
+                "id": "task-2",
+                "title": "Add API",
+                "status": "in_progress",
+                "depends_on": ["task-1"],
+            },
+            {
+                "id": "task-3",
+                "title": "Write tests",
+                "status": "todo",
+                "depends_on": ["task-2"],
+            },
+            {
+                "id": "task-4",
+                "title": "Update docs",
+                "status": "todo",
+                "depends_on": [],
+            },
         ],
     }
 
@@ -72,7 +79,10 @@ def daemon(tmp_repo, sample_plan):
 
 class TestMatchTaskId:
     def test_exact_match_in_commit(self, sample_plan):
-        assert _match_task_id_in_commit("task-2: fix the API endpoint", sample_plan) == "task-2"
+        assert (
+            _match_task_id_in_commit("task-2: fix the API endpoint", sample_plan)
+            == "task-2"
+        )
 
     def test_no_match(self, sample_plan):
         assert _match_task_id_in_commit("fix some stuff", sample_plan) is None
@@ -217,6 +227,7 @@ class TestContextWriter:
         claude_dir = tmp_repo / ".claude"
         if claude_dir.exists():
             import shutil
+
             shutil.rmtree(claude_dir)
 
         daemon._write_context()
@@ -278,7 +289,9 @@ class TestAutoSetup:
 
 class TestPlanAutoDetect:
     def test_from_saved_config(self, daemon, tmp_repo):
-        with patch("keshro_cli.daemon.load_auth", return_value={"default_plan_id": "plan-99"}):
+        with patch(
+            "keshro_cli.daemon.load_auth", return_value={"default_plan_id": "plan-99"}
+        ):
             result = daemon._auto_detect_plan_id()
         assert result == "plan-99"
 
@@ -325,9 +338,7 @@ class TestDaemonStatus:
         daemon.state.running = True
         daemon.state.events_processed = 5
         daemon.state.tasks_completed = 2
-        daemon.state.observations.append(
-            Observation("2026-01-01", "test", "test obs")
-        )
+        daemon.state.observations.append(Observation("2026-01-01", "test", "test obs"))
 
         status = daemon.get_status()
         assert status["running"] is True
@@ -350,5 +361,3 @@ class TestQueueOverflow:
         assert len(daemon.state.event_queue) == MAX_QUEUE_SIZE
         # Oldest should be gone, newest should be present
         assert daemon.state.event_queue[-1]["task_id"] == f"task-{MAX_QUEUE_SIZE + 9}"
-
-

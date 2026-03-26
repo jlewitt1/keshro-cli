@@ -7,25 +7,12 @@ Uses a fake async HTTP client to capture API calls without a real backend.
 import asyncio
 import json
 import os
-import signal
 import time
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from keshro_cli.daemon import (
-    HEARTBEAT_INTERVAL,
-    KeshroDaemon,
-    DaemonState,
-    _find_current_task,
-    _heartbeat_file,
-    _pid_file,
-    _status_file,
-    is_daemon_running,
-    read_daemon_status,
-    stop_daemon,
-)
+from keshro_cli.daemon import _find_current_task, _pid_file, _status_file, KeshroDaemon
 from keshro_cli.watcher import GitEvent
 
 
@@ -47,7 +34,12 @@ SAMPLE_PLAN = {
             "acceptance_criteria": "All endpoints return 200",
             "related_files": ["api.py", "routes.py"],
         },
-        {"id": "task-3", "title": "Write tests", "status": "todo", "depends_on": ["task-2"]},
+        {
+            "id": "task-3",
+            "title": "Write tests",
+            "status": "todo",
+            "depends_on": ["task-2"],
+        },
     ],
 }
 
@@ -55,8 +47,18 @@ UPDATED_PLAN = {
     **SAMPLE_PLAN,
     "plan_steps": [
         {"id": "task-1", "title": "Setup auth", "status": "done", "depends_on": []},
-        {"id": "task-2", "title": "Add API", "status": "done", "depends_on": ["task-1"]},
-        {"id": "task-3", "title": "Write tests", "status": "in_progress", "depends_on": ["task-2"]},
+        {
+            "id": "task-2",
+            "title": "Add API",
+            "status": "done",
+            "depends_on": ["task-1"],
+        },
+        {
+            "id": "task-3",
+            "title": "Write tests",
+            "status": "in_progress",
+            "depends_on": ["task-2"],
+        },
     ],
 }
 
@@ -89,7 +91,11 @@ class _FakeAsyncClient:
 
     async def get(self, path, **kwargs):
         self.calls.append(("GET", path, kwargs))
-        if "/v1/plans/" in path and "task-event" not in path and "heartbeat" not in path:
+        if (
+            "/v1/plans/" in path
+            and "task-event" not in path
+            and "heartbeat" not in path
+        ):
             return _FakeAsyncResponse(self._plan)
         return _FakeAsyncResponse({})
 
@@ -120,7 +126,9 @@ def tmp_repo(tmp_path):
 @pytest.fixture
 def daemon(tmp_repo):
     """Create a daemon with mocked API client."""
-    d = KeshroDaemon(plan_id="plan-1", api_url="http://localhost:8000", token="test-token")
+    d = KeshroDaemon(
+        plan_id="plan-1", api_url="http://localhost:8000", token="test-token"
+    )
     d.state.repo_root = tmp_repo
     d.state.plan = SAMPLE_PLAN.copy()
     d.state.plan_id = "plan-1"
@@ -263,8 +271,12 @@ class TestHeartbeatIntegration:
 
     def test_heartbeat_survives_network_failure(self, daemon):
         """Heartbeat should silently handle API errors."""
+
         async def _failing_heartbeat():
-            with patch("keshro_cli.daemon.make_async_client", side_effect=Exception("network down")):
+            with patch(
+                "keshro_cli.daemon.make_async_client",
+                side_effect=Exception("network down"),
+            ):
                 await daemon._send_heartbeat()
 
         # Should not raise
@@ -286,7 +298,9 @@ class TestQueueResilience:
         failing_client = _FailingClient()
 
         async def _flush():
-            with patch("keshro_cli.daemon.make_async_client", return_value=failing_client):
+            with patch(
+                "keshro_cli.daemon.make_async_client", return_value=failing_client
+            ):
                 await daemon._flush_queue()
 
         asyncio.run(_flush())
@@ -297,7 +311,9 @@ class TestQueueResilience:
 
     def test_multiple_events_flush_in_order(self, daemon):
         """Events should be sent to API in FIFO order."""
-        daemon.state.event_queue.append({"task_id": "task-1", "event": "note", "note": "first"})
+        daemon.state.event_queue.append(
+            {"task_id": "task-1", "event": "note", "note": "first"}
+        )
         daemon.state.event_queue.append({"task_id": "task-2", "event": "done"})
 
         fake_client = _FakeAsyncClient()
@@ -352,10 +368,16 @@ class TestContextFileIntegration:
         from keshro_cli.daemon import Observation
 
         daemon.state.observations = [
-            Observation("2026-03-25T12:00:00Z", "possible_completion",
-                        "Commit during active task: refactor auth"),
-            Observation("2026-03-25T12:05:00Z", "possible_learning",
-                        "Error resolved: missing import for httpx"),
+            Observation(
+                "2026-03-25T12:00:00Z",
+                "possible_completion",
+                "Commit during active task: refactor auth",
+            ),
+            Observation(
+                "2026-03-25T12:05:00Z",
+                "possible_learning",
+                "Error resolved: missing import for httpx",
+            ),
         ]
         daemon._write_context()
         content = (tmp_repo / ".claude" / "keshro-context.md").read_text()
@@ -375,9 +397,13 @@ class TestDaemonLifecycle:
         fake_client = _FakeAsyncClient()
 
         async def _run_briefly():
-            with patch("keshro_cli.daemon.make_async_client", return_value=fake_client), \
-                 patch("keshro_cli.daemon._repo_root", return_value=tmp_repo), \
-                 patch.object(daemon, "_watcher", create=True) as mock_watcher:
+            with patch(
+                "keshro_cli.daemon.make_async_client", return_value=fake_client
+            ), patch(
+                "keshro_cli.daemon._repo_root", return_value=tmp_repo
+            ), patch.object(
+                daemon, "_watcher", create=True
+            ) as mock_watcher:
                 mock_watcher.start = MagicMock()
                 mock_watcher.stop = MagicMock()
 
@@ -419,6 +445,7 @@ class TestDaemonLifecycle:
         daemon = KeshroDaemon(plan_id="plan-1")
         daemon.state.repo_root = tmp_repo
         from keshro_cli.daemon import _socket_path
+
         sock_path = _socket_path(tmp_repo)
 
         # Create a stale socket file
@@ -556,8 +583,16 @@ class TestMultipleCommitsIntegration:
     def test_multiple_commits_complete_multiple_tasks(self, daemon):
         """Two commits matching different tasks should queue two events."""
         events = [
-            GitEvent("commit", time.monotonic(), {"sha": "aaa", "message": "task-2: done with API"}),
-            GitEvent("commit", time.monotonic() + 1, {"sha": "bbb", "message": "task-3: tests written"}),
+            GitEvent(
+                "commit",
+                time.monotonic(),
+                {"sha": "aaa", "message": "task-2: done with API"},
+            ),
+            GitEvent(
+                "commit",
+                time.monotonic() + 1,
+                {"sha": "bbb", "message": "task-3: tests written"},
+            ),
         ]
 
         # Need task-3 to be matchable
@@ -574,7 +609,11 @@ class TestMultipleCommitsIntegration:
     def test_duplicate_commit_for_same_task(self, daemon):
         """Two commits mentioning the same task should queue two events (idempotency is backend's job)."""
         for _ in range(2):
-            event = GitEvent("commit", time.monotonic(), {"sha": "aaa", "message": "task-2: more work"})
+            event = GitEvent(
+                "commit",
+                time.monotonic(),
+                {"sha": "aaa", "message": "task-2: more work"},
+            )
             daemon._handle_commit(event)
 
         # Both queued — backend handles idempotency

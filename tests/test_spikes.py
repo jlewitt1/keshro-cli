@@ -8,7 +8,6 @@ Spike 3: Tests Unix socket round-trip latency is under 100ms.
 import asyncio
 import json
 import subprocess
-import tempfile
 import time
 from pathlib import Path
 
@@ -117,12 +116,15 @@ class TestSpike1Analyzer:
         log_file.write_text(json.dumps(entry) + "\n")
 
         analyzer = Path(__file__).parent.parent / "spikes" / "spike1_analyze.py"
-        result = subprocess.run(
+        subprocess.run(
             ["python3", str(analyzer)],
             capture_output=True,
             text=True,
-            env={"LOG": str(log_file), "PATH": "/usr/bin:/bin",
-                 "HOME": str(Path.home())},
+            env={
+                "LOG": str(log_file),
+                "PATH": "/usr/bin:/bin",
+                "HOME": str(Path.home()),
+            },
             timeout=5,
         )
 
@@ -130,7 +132,11 @@ class TestSpike1Analyzer:
         # For testing, we need to patch the path. Let's just verify the
         # analyzer script is valid Python and can be imported.
         result2 = subprocess.run(
-            ["python3", "-c", "import ast; ast.parse(open('" + str(analyzer) + "').read())"],
+            [
+                "python3",
+                "-c",
+                "import ast; ast.parse(open('" + str(analyzer) + "').read())",
+            ],
             capture_output=True,
             text=True,
             timeout=5,
@@ -142,16 +148,20 @@ class TestSpike1Analyzer:
         log_file = tmp_path / "spike1.json"
         entries = []
         for i in range(3):
-            entries.append(json.dumps({
-                "timestamp": f"2026-03-26T00:0{i}:00Z",
-                "payload": {
-                    "hook_event_name": "PostToolUse",
-                    "tool_name": "Bash",
-                    "tool_input": {"command": f"cmd-{i}"},
-                    "tool_response": {"exit_code": 0},
-                    "session_id": "test-123",
-                },
-            }))
+            entries.append(
+                json.dumps(
+                    {
+                        "timestamp": f"2026-03-26T00:0{i}:00Z",
+                        "payload": {
+                            "hook_event_name": "PostToolUse",
+                            "tool_name": "Bash",
+                            "tool_input": {"command": f"cmd-{i}"},
+                            "tool_response": {"exit_code": 0},
+                            "session_id": "test-123",
+                        },
+                    }
+                )
+            )
         log_file.write_text("\n".join(entries) + "\n")
 
         # Parse each line to verify format
@@ -173,6 +183,7 @@ class TestSpike3SocketLatency:
     def socket_path(self):
         """Use /tmp for socket to avoid AF_UNIX path length limit."""
         import uuid
+
         path = Path(f"/tmp/keshro-test-{uuid.uuid4().hex[:8]}.sock")
         yield path
         path.unlink(missing_ok=True)
@@ -198,7 +209,9 @@ class TestSpike3SocketLatency:
                 for _ in range(10):
                     start = time.perf_counter_ns()
 
-                    reader, writer = await asyncio.open_unix_connection(str(socket_path))
+                    reader, writer = await asyncio.open_unix_connection(
+                        str(socket_path)
+                    )
                     payload = {
                         "hook_event_name": "PostToolUse",
                         "tool_name": "Bash",

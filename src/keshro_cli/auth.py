@@ -57,6 +57,21 @@ def cmd_auth_login(
     else:
         print(f"Successfully logged in to Keshro as {body['user']['email']}.")
 
+    # Auto-install the supported global integrations.
+    try:
+        from .cli import _install_claude_integration, _install_codex_integration
+
+        claude_target = _install_claude_integration()
+        codex_target = _install_codex_integration()
+        if not json_output:
+            print(f"  ✓ Claude Code: {claude_target}")
+            print(f"  ✓ Codex: {codex_target}")
+            print(
+                "  Run `keshro setup` inside a repo if you also want Cursor repo instructions there."
+            )
+    except Exception:
+        pass  # fail silently
+
 
 def cmd_auth_logout(json_output: bool = False):
     clear_auth()

@@ -5,22 +5,18 @@ import json
 import time
 import uuid
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 import pytest
 
 from keshro_cli.hooks import (
-    HOOK_MARKER,
-    HOOK_SCRIPT_NAME,
-    WATCHED_TOOLS,
-    HookSocketServer,
     detect_keshro_command,
-    extract_bash_command,
     extract_file_paths,
-    generate_hook_script,
+    HOOK_SCRIPT_NAME,
+    HookSocketServer,
     install_hooks,
     parse_hook_event,
     uninstall_hooks,
+    WATCHED_TOOLS,
 )
 
 
@@ -72,10 +68,14 @@ class TestInstallHooks:
 
     def test_preserves_existing_settings(self, tmp_repo):
         settings_file = tmp_repo / ".claude" / "settings.json"
-        settings_file.write_text(json.dumps({
-            "theme": "dark",
-            "hooks": {"PreToolUse": [{"matcher": "Write", "hooks": []}]}
-        }))
+        settings_file.write_text(
+            json.dumps(
+                {
+                    "theme": "dark",
+                    "hooks": {"PreToolUse": [{"matcher": "Write", "hooks": []}]},
+                }
+            )
+        )
 
         install_hooks(tmp_repo, Path("/tmp/test.sock"))
 
@@ -94,11 +94,22 @@ class TestInstallHooks:
 
     def test_preserves_non_keshro_hooks(self, tmp_repo):
         settings_file = tmp_repo / ".claude" / "settings.json"
-        settings_file.write_text(json.dumps({
-            "hooks": {"PostToolUse": [
-                {"matcher": "Write", "hooks": [{"type": "command", "command": "/usr/bin/prettier"}]}
-            ]}
-        }))
+        settings_file.write_text(
+            json.dumps(
+                {
+                    "hooks": {
+                        "PostToolUse": [
+                            {
+                                "matcher": "Write",
+                                "hooks": [
+                                    {"type": "command", "command": "/usr/bin/prettier"}
+                                ],
+                            }
+                        ]
+                    }
+                }
+            )
+        )
 
         install_hooks(tmp_repo, Path("/tmp/test.sock"))
 
@@ -121,11 +132,22 @@ class TestUninstallHooks:
 
     def test_preserves_other_hooks(self, tmp_repo):
         settings_file = tmp_repo / ".claude" / "settings.json"
-        settings_file.write_text(json.dumps({
-            "hooks": {"PostToolUse": [
-                {"matcher": "Write", "hooks": [{"type": "command", "command": "/usr/bin/prettier"}]}
-            ]}
-        }))
+        settings_file.write_text(
+            json.dumps(
+                {
+                    "hooks": {
+                        "PostToolUse": [
+                            {
+                                "matcher": "Write",
+                                "hooks": [
+                                    {"type": "command", "command": "/usr/bin/prettier"}
+                                ],
+                            }
+                        ]
+                    }
+                }
+            )
+        )
         install_hooks(tmp_repo, Path("/tmp/test.sock"))
         uninstall_hooks(tmp_repo)
 
@@ -148,7 +170,9 @@ class TestUninstallHooks:
 
 class TestParseHookEvent:
     def test_valid_json(self):
-        data = json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}}).encode()
+        data = json.dumps(
+            {"tool_name": "Bash", "tool_input": {"command": "ls"}}
+        ).encode()
         event = parse_hook_event(data)
         assert event["tool_name"] == "Bash"
 
@@ -179,17 +203,26 @@ class TestExtractFilePaths:
 
 class TestDetectKeshroCommand:
     def test_task_done(self):
-        event = {"tool_name": "Bash", "tool_input": {"command": "keshro task done task-123 -p plan-1"}}
+        event = {
+            "tool_name": "Bash",
+            "tool_input": {"command": "keshro task done task-123 -p plan-1"},
+        }
         result = detect_keshro_command(event)
         assert result == ("task_done", "task-123")
 
     def test_kr_alias(self):
-        event = {"tool_name": "Bash", "tool_input": {"command": "kr task done task-abc"}}
+        event = {
+            "tool_name": "Bash",
+            "tool_input": {"command": "kr task done task-abc"},
+        }
         result = detect_keshro_command(event)
         assert result == ("task_done", "task-abc")
 
     def test_task_note(self):
-        event = {"tool_name": "Bash", "tool_input": {"command": 'keshro task note task-123 "learned something"'}}
+        event = {
+            "tool_name": "Bash",
+            "tool_input": {"command": 'keshro task note task-123 "learned something"'},
+        }
         result = detect_keshro_command(event)
         assert result == ("task_note", "task-123")
 
@@ -217,7 +250,10 @@ class TestHookSocketServer:
 
             # Send an event
             reader, writer = await asyncio.open_unix_connection(str(socket_path))
-            payload = {"tool_name": "Write", "tool_input": {"file_path": "/src/main.py"}}
+            payload = {
+                "tool_name": "Write",
+                "tool_input": {"file_path": "/src/main.py"},
+            }
             writer.write(json.dumps(payload).encode())
             writer.write_eof()
             await asyncio.sleep(0.1)  # Let server process
@@ -285,6 +321,7 @@ class TestDaemonHookIntegration:
     @pytest.fixture
     def daemon(self, tmp_repo):
         from keshro_cli.daemon import KeshroDaemon
+
         d = KeshroDaemon(plan_id="plan-1")
         d.state.repo_root = tmp_repo
         d.state.plan_id = "plan-1"
@@ -356,17 +393,24 @@ class TestDaemonHookIntegration:
     def test_hook_completion_deduplicates_git_commit(self, daemon):
         """If hook already completed the task, git commit should not duplicate."""
         # Hook completes the task
-        daemon._on_hook_event({
-            "tool_name": "Bash",
-            "tool_input": {"command": "keshro task done task-2 -p plan-1"},
-        })
+        daemon._on_hook_event(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": "keshro task done task-2 -p plan-1"},
+            }
+        )
         assert len(daemon.state.event_queue) == 1
 
         # Git commit for same task should be skipped
         from keshro_cli.watcher import GitEvent
-        daemon._handle_commit(GitEvent(
-            "commit", 0, {"sha": "abc", "message": "task-2: done"},
-        ))
+
+        daemon._handle_commit(
+            GitEvent(
+                "commit",
+                0,
+                {"sha": "abc", "message": "task-2: done"},
+            )
+        )
         # Still only 1 event — not duplicated
         assert len(daemon.state.event_queue) == 1
         assert daemon.state.tasks_completed == 1
@@ -374,10 +418,25 @@ class TestDaemonHookIntegration:
     def test_daemon_works_without_git_watcher(self, daemon):
         """Hooks-first: daemon should function purely from hook events."""
         # Simulate a full task lifecycle via hooks only (no git)
-        daemon._on_hook_event({"tool_name": "Write", "tool_input": {"file_path": "/src/api.py"}})
-        daemon._on_hook_event({"tool_name": "Edit", "tool_input": {"file_path": "/src/routes.py"}})
-        daemon._on_hook_event({"tool_name": "Bash", "tool_input": {"command": "npm test"}, "tool_response": {"exit_code": 0}})
-        daemon._on_hook_event({"tool_name": "Bash", "tool_input": {"command": "keshro task done task-2 -p plan-1"}})
+        daemon._on_hook_event(
+            {"tool_name": "Write", "tool_input": {"file_path": "/src/api.py"}}
+        )
+        daemon._on_hook_event(
+            {"tool_name": "Edit", "tool_input": {"file_path": "/src/routes.py"}}
+        )
+        daemon._on_hook_event(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": "npm test"},
+                "tool_response": {"exit_code": 0},
+            }
+        )
+        daemon._on_hook_event(
+            {
+                "tool_name": "Bash",
+                "tool_input": {"command": "keshro task done task-2 -p plan-1"},
+            }
+        )
 
         assert daemon.state.hook_events_received == 4
         assert len(set(daemon.state.files_touched)) == 0  # Reset after completion

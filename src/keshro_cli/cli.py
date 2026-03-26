@@ -61,7 +61,7 @@ watch_app = typer.Typer(help="Background daemon for execution tracking")
 
 app.add_typer(plan_app, name="plan")
 app.add_typer(task_app, name="task")
-app.add_typer(watch_app, name="watch")
+app.add_typer(watch_app, name="watch", hidden=True)
 app.add_typer(migration_app, name="migration")
 app.add_typer(config_app, name="config")
 plan_app.add_typer(plan_task_app, name="task")
@@ -76,15 +76,163 @@ def _clean(value: str | None) -> str:
     return (value or "").strip()
 
 
+def _parse_timestamp(value: str | None) -> datetime | None:
+    raw = _clean(value)
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _format_plan_timestamp(value: str | None) -> str:
+    raw = _clean(value)
+    parsed = _parse_timestamp(raw)
+    if parsed is None:
+        return raw
+
+    local_time = parsed.astimezone()
+    now_local = datetime.now().astimezone()
+    if local_time.date() == now_local.date():
+        return local_time.strftime("Today %H:%M")
+    if local_time.year == now_local.year:
+        return local_time.strftime("%b %d")
+    return local_time.strftime("%Y-%m-%d")
+
+
+def _format_verbose_timestamp(value: str | None) -> str:
+    raw = _clean(value)
+    parsed = _parse_timestamp(raw)
+    if parsed is None:
+        return raw
+    return parsed.astimezone().strftime("%Y-%m-%d %H:%M %Z")
+
+
+def _discover_repo_root(work_dir: str | None = None) -> Path | None:
+    candidate = (
+        _clean(work_dir) or _clean(load_auth().get("default_work_dir")) or os.getcwd()
+    )
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=candidate,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        resolved = _clean(result.stdout)
+        return Path(resolved) if resolved else None
+    except Exception:
+        return None
+
+
+def _discover_git_remote_url(repo_root: Path | None) -> str | None:
+    if repo_root is None:
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "config", "--get", "remote.origin.url"],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except Exception:
+        return None
+    return _clean(result.stdout) or None
+
+
+def _resolve_repo_linked_plan(
+    work_dir: str | None = None,
+) -> tuple[str | None, str | None]:
+    repo_root = _discover_repo_root(work_dir)
+    if repo_root is None:
+        return None, None
+    git_remote_url = _discover_git_remote_url(repo_root)
+    try:
+        with make_client(_state.api_url, _state.token) as client:
+            res = client.get(
+                "/v1/plans/repo-link/resolve",
+                params={
+                    "repo_root": str(repo_root),
+                    "git_remote_url": git_remote_url,
+                },
+            )
+            res.raise_for_status()
+            body = res.json() or {}
+    except Exception:
+        return None, None
+
+    plan_id = _clean(body.get("plan_id"))
+    if not plan_id:
+        return None, None
+
+    plan_title = ""
+    try:
+        with make_client(_state.api_url, _state.token) as client:
+            res = client.get(f"/v1/plans/{plan_id}")
+            res.raise_for_status()
+            plan = res.json() or {}
+            plan_title = _clean(plan.get("title"))
+    except Exception:
+        pass
+    return plan_id, plan_title or plan_id
+
+
+def _link_current_repo_to_plan(
+    plan_id: str,
+    *,
+    plan_title: str | None = None,
+    work_dir: str | None = None,
+) -> bool:
+    repo_root = _discover_repo_root(work_dir)
+    if repo_root is None:
+        return False
+    try:
+        with make_client(_state.api_url, _state.token) as client:
+            res = client.put(
+                f"/v1/plans/{plan_id}/repo-link",
+                json={
+                    "repo_root": str(repo_root),
+                    "git_remote_url": _discover_git_remote_url(repo_root),
+                    "repo_name": repo_root.name,
+                },
+            )
+            res.raise_for_status()
+    except Exception:
+        return False
+
+    if plan_title:
+        update_auth({"default_plan_id": plan_id, "default_plan_title": plan_title})
+    return True
+
+
 def _current_org_id(org_id: str | None = None) -> str | None:
     resolved = _clean(get_default_org_id(org_id))
     return resolved or None
 
 
-def _current_plan_id(plan_id: str | None = None) -> str | None:
+def _current_plan_id(
+    plan_id: str | None = None, work_dir: str | None = None
+) -> str | None:
+    explicit = _clean(plan_id)
+    if explicit:
+        return explicit
     auth = load_auth()
-    resolved = _clean(plan_id or auth.get("default_plan_id"))
-    return resolved or None
+    cached_plan_id = _clean(auth.get("default_plan_id"))
+    if cached_plan_id:
+        return cached_plan_id
+    repo_plan_id, repo_plan_title = _resolve_repo_linked_plan(work_dir)
+    if repo_plan_id:
+        update_auth(
+            {"default_plan_id": repo_plan_id, "default_plan_title": repo_plan_title}
+        )
+        return repo_plan_id
+    return None
 
 
 def _current_context_label() -> str | None:
@@ -92,17 +240,22 @@ def _current_context_label() -> str | None:
     return _clean(auth.get("default_org_name") or auth.get("default_org_id")) or None
 
 
-def _current_plan_label() -> str | None:
+def _current_plan_label(work_dir: str | None = None) -> str | None:
+    repo_plan_id, repo_plan_title = _resolve_repo_linked_plan(work_dir)
+    if repo_plan_id:
+        return repo_plan_title
     auth = load_auth()
     return _clean(auth.get("default_plan_title") or auth.get("default_plan_id")) or None
 
 
-def _require_plan_context(plan_id: str | None = None) -> str:
-    resolved = _current_plan_id(plan_id)
+def _require_plan_context(
+    plan_id: str | None = None, work_dir: str | None = None
+) -> str:
+    resolved = _current_plan_id(plan_id, work_dir=work_dir)
     if resolved:
         return resolved
     raise SystemExit(
-        "Plan ID required. Pass <plan-id> or save one with `keshro config set --plan-id <plan-id>`."
+        "Plan ID required. Pass <plan-id> or run `keshro config set --plan-id <plan-id>` from the repo you want to link."
     )
 
 
@@ -117,6 +270,7 @@ def _set_default_plan_after_create(plan: dict) -> None:
     if current_plan_id == plan_id:
         return
     update_auth({"default_plan_id": plan_id, "default_plan_title": plan_title})
+    _link_current_repo_to_plan(plan_id, plan_title=plan_title)
     print(f"Saved default plan: {plan_title}")
 
 
@@ -264,7 +418,9 @@ def _print_plan_summary(
         if plan.get("org_id"):
             print(f"  {DIM}Org:{RESET} {plan['org_id']}")
         if plan.get("updated_at"):
-            print(f"  {DIM}Updated:{RESET} {plan['updated_at']}")
+            print(
+                f"  {DIM}Updated:{RESET} {_format_verbose_timestamp(plan.get('updated_at'))}"
+            )
 
 
 def _print_plan_detail(plan: dict, context_label: str | None = None) -> None:
@@ -844,15 +1000,16 @@ Treat Keshro as the live execution record. When meaningful task progress happens
 
 During execution:
 - run `keshro task start <task-id> -p {resolved_plan_id}` as soon as work begins
-- use `keshro task note <task-id> -p {resolved_plan_id} -n "..."` for meaningful discoveries, decisions, or validation findings
+- IMPORTANT: write progress notes frequently — at minimum after reading code, after each significant change, and before completion. The user is watching these notes in real time.
+  Use: `keshro task note <task-id> -p {resolved_plan_id} -n "..."` for: what you found, what you changed, what you decided, what files you touched
 - use `keshro task artifact <task-id> -p {resolved_plan_id} -l "<url>"` for PRs, commits, dashboards, issues, and runbooks
-- use `keshro task block <task-id> -p {resolved_plan_id} -r "..."` the moment a real blocker appears
+- use `keshro task block <task-id> -p {resolved_plan_id} -r "..."` the moment a real blocker appears that prevents further progress on the task
+- if an external system is unavailable but you can still continue from local code, checked-in config, or documented context, record that in a note instead of blocking the task
 - use `keshro task unblock <task-id> -p {resolved_plan_id}` when that blocker is cleared
 - use `keshro plan replan-notes {resolved_plan_id} "..."` only when the plan itself changed materially
-- when you create or modify files, record them with `keshro task note` — list the specific files and what changed
 
 When a task is done:
-- record a completion note using this format: `keshro task note <task-id> -p {resolved_plan_id} -n "Files created: ... | Files modified: ... | Key decisions: ... | Acceptance criteria met: ... | Verification: ... | Next task should know: ..."`
+- record a concise completion note. It must include `Acceptance criteria met:` and `Verification:`. Add `Next task should know:` only when it helps the next task.
 - ask the user to confirm the task is complete before running `keshro task done`
 - when marking done, report your session cost if available: `keshro task done <task-id> -p {resolved_plan_id} --cost <usd_amount> --tokens <token_count> --model <model_name>` (check your session stats for cost/token info)
 - after `keshro task done`, summarize what was accomplished and ask the user if they want to continue to the next task
@@ -869,8 +1026,86 @@ Rules:
 - Keep updates concise, factual, and specific.
 - Do not silently work around blockers or plan drift.
 - Do not assume Keshro is current unless you updated it.
+- If the user asks how to monitor progress, point them to `keshro status -p {resolved_plan_id} --watch` or `keshro status -p {resolved_plan_id} --tui`.
 - If you need the full plan for context, use `keshro plan view {resolved_plan_id}`.
 - If you need more detail on any task, use `keshro task view <task-id> -p {resolved_plan_id}`."""
+
+
+def _strip_injected_task_lines(text: str | None) -> tuple[str, list[str]]:
+    cleaned = _clean(text)
+    if not cleaned:
+        return "", []
+    summary_lines: list[str] = []
+    hidden_lines: list[str] = []
+    for raw_line in cleaned.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("RISK:") or line.startswith("INVESTIGATE:"):
+            hidden_lines.append(line)
+            continue
+        summary_lines.append(line)
+    return " ".join(summary_lines).strip(), hidden_lines
+
+
+def _build_continue_brief(
+    plan: dict,
+    task: dict,
+    work_dir: str | None = None,
+    session_id: str = "",
+) -> str:
+    resolved_plan_id = _clean(plan.get("id")) or "<plan-id>"
+    task_id = _clean(task.get("id")) or "<task-id>"
+    task_title = _clean(task.get("title")) or "Untitled task"
+    task_description, hidden_lines = _strip_injected_task_lines(task.get("description"))
+    task_status = _clean(task.get("status") or "todo")
+    blocked_reason = _clean(task.get("blocked_reason"))
+    notes = _clean(task.get("notes"))
+    related_files = [
+        str(item).strip()
+        for item in (task.get("related_files") or [])
+        if str(item).strip()
+    ]
+    acceptance = [
+        str(item).strip()
+        for item in (task.get("acceptance_criteria") or [])
+        if str(item).strip()
+    ]
+
+    lines = [
+        f"Task: {task_title}",
+        f"Description: {task_description or 'No description provided.'}",
+        f"Status: {task_status}",
+        f"Plan: {resolved_plan_id} | Task ID: {task_id} | Session: {session_id}",
+    ]
+    if work_dir:
+        lines.append(f"Project directory: {work_dir}")
+    if blocked_reason:
+        lines.append(f"Blocker: {blocked_reason}")
+    if notes:
+        lines.append(f"Current notes: {notes}")
+    if related_files:
+        lines.append(f"Related files: {', '.join(related_files)}")
+    if acceptance:
+        lines.append("Acceptance criteria:")
+        for item in acceptance:
+            lines.append(f"  - {item}")
+    if hidden_lines:
+        lines.append(
+            f"Additional task context is available via: keshro task view {task_id} -p {resolved_plan_id}"
+        )
+    lines.extend(
+        [
+            "",
+            "Execution reminders:",
+            f'- Start work with: `keshro task start {task_id} -p {resolved_plan_id} --reason "session:{session_id}"`',
+            f'- Record concise progress notes with: `keshro task note {task_id} -p {resolved_plan_id} -n "..."`',
+            "- Only mark the task blocked if work cannot continue. If local sources let you proceed, note the limitation instead.",
+            "- Before `keshro task done`, include `Acceptance criteria met:` and `Verification:` in the completion note.",
+            f"- The user can monitor progress with `keshro status -p {resolved_plan_id} --watch` or `keshro status -p {resolved_plan_id} --tui`.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def _get_git_state_summary(work_dir: str | None = None) -> str:
@@ -1143,7 +1378,9 @@ def _build_continue_prompt(
     risk_level = task.get("risk_level") or ""
     risk_reason = task.get("risk_reason") or ""
     if risk_level in ("high", "medium"):
-        task_block.append(f"Risk: {risk_level}" + (f" — {risk_reason}" if risk_reason else ""))
+        task_block.append(
+            f"Risk: {risk_level}" + (f" — {risk_reason}" if risk_reason else "")
+        )
 
     # Related files
     related_files = task.get("related_files") or []
@@ -1277,8 +1514,8 @@ async def _mark_task_status_async(
     try:
         res = await client.patch(f"/v1/plans/{plan_id}/tasks/{task_id}", json=body)
         res.raise_for_status()
-    except Exception:
-        pass  # don't crash agents over API errors
+    except Exception as exc:
+        print(f"  {DIM}[warn] status update failed: {exc}{RESET}", file=sys.stderr)
 
 
 async def _launch_single_agent(
@@ -1497,6 +1734,26 @@ async def _run_parallel(
     resolved_dir = str(Path(work_dir).resolve()) if work_dir else os.getcwd()
     session_id = f"agent-{_uuid.uuid4().hex[:8]}"
 
+    # Check for running daemon — they conflict
+    try:
+        from .daemon import is_daemon_running
+
+        if is_daemon_running(Path(resolved_dir)):
+            print(f"\n{RED}{'━' * 60}{RESET}")
+            print(f"{RED}WARNING: Keshro daemon is running in this directory.{RESET}")
+            print()
+            print("  The daemon and `keshro continue` both manage task status.")
+            print("  Running them together will cause conflicts and duplicate updates.")
+            print()
+            print("  Either stop the daemon first:")
+            print(f"    {CYAN}keshro watch stop{RESET}")
+            print()
+            print("  Or use the daemon alone (it tracks your work automatically).")
+            print(f"{RED}{'━' * 60}{RESET}\n")
+            raise SystemExit(1)
+    except ImportError:
+        pass
+
     claude_bin = shutil.which("claude")
     if not claude_bin:
         raise SystemExit("claude binary not found. Install Claude Code first.")
@@ -1546,8 +1803,12 @@ async def _run_parallel(
 
         if wave > 1:
             print(f"\n{'─' * 40}")
+        blocked_steps = [
+            s for s in steps if _clean(s.get("status") or "").lower() == "blocked"
+        ]
+
         print(
-            f"\n{CYAN}Wave {wave}{RESET} — {len(actionable)} task(s) actionable [{done_count}/{total_count} done]"
+            f"\n{done_count}/{total_count} done — {len(actionable)} task(s) ready to execute:"
         )
 
         for task in actionable:
@@ -1555,7 +1816,20 @@ async def _run_parallel(
             order = task.get("order", 0)
             deps = task.get("depends_on") or []
             dep_str = f" {DIM}← {', '.join(deps[:3])}{RESET}" if deps else ""
-            print(f"  {order:2d}. {title}{dep_str}")
+            print(f"  Task #{order}: {title}{dep_str}")
+
+        if blocked_steps:
+            print(f"\n  {YELLOW}⚠ {len(blocked_steps)} blocked (skipped):{RESET}")
+            for bs in blocked_steps:
+                tid = _clean(bs.get("id")) or "?"
+                order = bs.get("order", 0)
+                reason = _clean(bs.get("blocked_reason")) or "no reason"
+                print(f"    {RED}✗{RESET} (#{order}) {_clean(bs.get('title'))}")
+                print(f"      {DIM}{reason}{RESET}")
+                print(
+                    f"      {DIM}→ keshro task unblock {tid} -p {resolved_plan_id}{RESET}"
+                )
+            print()
 
         # File conflict detection — warn if parallel tasks touch same files
         _file_conflict_warnings = []
@@ -1619,6 +1893,96 @@ async def _run_parallel(
                 )
                 for task in actionable
             ]
+
+            # Background poller — prints new notes/status as agents work
+            # Seed with existing note counts so we only show genuinely new notes
+            _seen_notes: dict[str, int] = {}
+            for _t in actionable:
+                _tid = _t.get("id", "")
+                _existing_notes = (_t.get("notes") or "").strip()
+                if _existing_notes:
+                    _seen_notes[_tid] = len(
+                        [
+                            note_line
+                            for note_line in _existing_notes.split("\n")
+                            if note_line.strip()
+                        ]
+                    )
+            _poller_done = False
+
+            async def _poll_progress():
+                import time as _poll_time
+
+                _start_time = _poll_time.monotonic()
+                _last_heartbeat = 0  # seconds since last heartbeat message
+                try:
+                    while not _poller_done:
+                        await asyncio.sleep(5)
+                        if _poller_done:
+                            break
+                        elapsed = _poll_time.monotonic() - _start_time
+                        try:
+                            async with make_async_client(
+                                _state.api_url, _state.token
+                            ) as poll_client:
+                                resp = await poll_client.get(
+                                    f"/v1/plans/{resolved_plan_id}"
+                                )
+                            if not resp.is_success:
+                                # Heartbeat even if poll fails
+                                if elapsed - _last_heartbeat >= 30:
+                                    mins = int(elapsed // 60)
+                                    secs = int(elapsed % 60)
+                                    time_str = (
+                                        f"{mins}m {secs}s" if mins > 0 else f"{secs}s"
+                                    )
+                                    print(
+                                        f"  {DIM}⋯ agents still working ({time_str} elapsed){RESET}"
+                                    )
+                                    _last_heartbeat = elapsed
+                                continue
+                            fresh = resp.json()
+                            for s in fresh.get("plan_steps", []):
+                                sid = s.get("id", "")
+                                status = (s.get("status") or "").lower()
+                                if status != "in_progress":
+                                    continue
+                                notes = (s.get("notes") or "").strip()
+                                if not notes:
+                                    continue
+                                note_lines = [
+                                    note_line.strip()
+                                    for note_line in notes.split("\n")
+                                    if note_line.strip()
+                                ]
+                                prev_count = _seen_notes.get(sid, 0)
+                                if len(note_lines) > prev_count:
+                                    new_lines = note_lines[prev_count:]
+                                    title = _clean(s.get("title")) or "?"
+                                    for nl in new_lines:
+                                        print(f"  {DIM}[{title}]{RESET} {nl}")
+                                    _last_heartbeat = (
+                                        _poll_time.monotonic() - _start_time
+                                    )
+                                    _seen_notes[sid] = len(note_lines)
+                            # Heartbeat after notes — only if no new notes appeared this cycle
+                            if elapsed - _last_heartbeat >= 30:
+                                mins = int(elapsed // 60)
+                                secs = int(elapsed % 60)
+                                time_str = (
+                                    f"{mins}m {secs}s" if mins > 0 else f"{secs}s"
+                                )
+                                print(
+                                    f"  {DIM}⋯ agents still working ({time_str} elapsed){RESET}"
+                                )
+                                _last_heartbeat = elapsed
+                        except Exception:
+                            pass
+                except asyncio.CancelledError:
+                    pass
+
+            poller_task = asyncio.create_task(_poll_progress())
+
             # Stream results as each agent completes
             results: list[AgentResult | Exception] = []
             completed_count = 0
@@ -1628,41 +1992,73 @@ async def _run_parallel(
                     r = await coro
                     results.append(r)
                     completed_count += 1
-                    status = f"{GREEN}done{RESET}" if r.exit_code == 0 else f"{RED}blocked{RESET}"
+                    status = (
+                        f"{GREEN}done{RESET}"
+                        if r.exit_code == 0
+                        else f"{RED}blocked{RESET}"
+                    )
                     dur = f"{r.duration_seconds:.0f}s" if r.duration_seconds else ""
                     cost = f" ${r.cost_usd:.2f}" if r.cost_usd > 0 else ""
-                    print(f"  [{completed_count}/{total_agents}] {status}  {r.task_title}{DIM} {dur}{cost}{RESET}")
+                    print(
+                        f"  [{completed_count}/{total_agents}] {status}  {r.task_title}{DIM} {dur}{cost}{RESET}"
+                    )
                 except Exception as exc:
                     results.append(exc)
                     completed_count += 1
-                    print(f"  [{completed_count}/{total_agents}] {RED}error{RESET}  {exc}")
+                    print(
+                        f"  [{completed_count}/{total_agents}] {RED}error{RESET}  {exc}"
+                    )
 
-        succeeded = sum(1 for r in results if not isinstance(r, Exception) and r.exit_code == 0)
+            _poller_done = True
+            poller_task.cancel()
+            try:
+                await poller_task
+            except asyncio.CancelledError:
+                pass
+
+        succeeded = sum(
+            1 for r in results if not isinstance(r, Exception) and r.exit_code == 0
+        )
         failed = len(results) - succeeded
         wave_cost = sum(r.cost_usd for r in results if not isinstance(r, Exception))
-        wave_tokens = sum(r.tokens_used for r in results if not isinstance(r, Exception))
+        wave_tokens = sum(
+            r.tokens_used for r in results if not isinstance(r, Exception)
+        )
 
-        cost_summary = f"  cost: ${wave_cost:.2f} ({wave_tokens:,} tokens)" if wave_cost > 0 else ""
-        print(f"\nWave {wave} complete: {GREEN}{succeeded} succeeded{RESET}, {RED}{failed} failed{RESET}{cost_summary}")
+        cost_summary = (
+            f"  cost: ${wave_cost:.2f} ({wave_tokens:,} tokens)"
+            if wave_cost > 0
+            else ""
+        )
+        print(
+            f"\n{GREEN}{succeeded} succeeded{RESET}, {RED}{failed} failed{RESET}{cost_summary}"
+        )
 
         # Check for blocked tasks and tell the user exactly what to do
         with make_client(_state.api_url, _state.token) as refresh_client:
             refreshed = refresh_client.get(f"/v1/plans/{resolved_plan_id}").json()
         refreshed_steps = refreshed.get("plan_steps") or []
-        blocked_steps = [s for s in refreshed_steps if _clean(s.get("status")).lower() == "blocked"]
-        remaining_steps = [s for s in refreshed_steps if _clean(s.get("status")).lower() == "todo"]
+        blocked_steps = [
+            s for s in refreshed_steps if _clean(s.get("status")).lower() == "blocked"
+        ]
 
         if blocked_steps:
             print(f"\n{RED}{'─' * 50}{RESET}")
-            print(f"{RED}{len(blocked_steps)} task(s) blocked — needs your attention:{RESET}\n")
+            print(
+                f"{RED}{len(blocked_steps)} task(s) blocked — needs your attention:{RESET}\n"
+            )
             for s in blocked_steps:
                 tid = _clean(s.get("id")) or "?"
                 title = _clean(s.get("title")) or "Untitled"
                 reason = _clean(s.get("blocked_reason")) or "no reason given"
                 print(f"  {RED}✗{RESET} {title}")
                 print(f"    {DIM}Reason: {reason}{RESET}")
-                print(f"    {DIM}Unblock: keshro task unblock {tid} -p {resolved_plan_id}{RESET}")
-            print(f"\n{DIM}After unblocking, run: keshro continue -p {resolved_plan_id}{RESET}")
+                print(
+                    f"    {DIM}Unblock: keshro task unblock {tid} -p {resolved_plan_id}{RESET}"
+                )
+            print(
+                f"\n{DIM}After unblocking, run: keshro continue -p {resolved_plan_id}{RESET}"
+            )
             print(f"{RED}{'─' * 50}{RESET}")
 
         if not run_all:
@@ -1813,7 +2209,14 @@ def _continue_with_claude(
             "Run this in your coding agent's terminal for your agent to pick up the task."
         )
     else:
-        print(prompt)
+        print(
+            _build_continue_brief(
+                plan,
+                task,
+                work_dir=work_dir,
+                session_id=session_id,
+            )
+        )
 
 
 def _view_task(plan_id: str | None, task_id: str) -> None:
@@ -2099,7 +2502,7 @@ def _app_callback(
     json_output: Annotated[bool, typer.Option("--json", help="JSON output.")] = False,
 ):
     _state.api_url = api_url or load_auth().get("api_url", DEFAULT_API_URL)
-    _state.token = token
+    _state.token = token or load_auth().get("token") or None
     _state.json = json_output
     if version:
         print(__version__)
@@ -2477,6 +2880,7 @@ def _migration_delete(
 
 def _config_show():
     auth = load_auth()
+    repo_plan_id, repo_plan_title = _resolve_repo_linked_plan()
     orgs: list[dict] = []
     authenticated = False
     if auth.get("token"):
@@ -2499,6 +2903,8 @@ def _config_show():
         "default_org_name": auth.get("default_org_name"),
         "default_plan_id": auth.get("default_plan_id"),
         "default_plan_title": auth.get("default_plan_title"),
+        "repo_plan_id": repo_plan_id,
+        "repo_plan_title": repo_plan_title,
         "user": auth.get("user") or {},
         "orgs": orgs,
     }
@@ -2515,9 +2921,22 @@ def _config_show():
         payload["default_org_name"] or payload["default_org_id"] or "personal"
     )
     print(f"{DIM}Default context:{RESET} " f"{YELLOW}{default_context}{RESET}")
+    repo_plan = payload["repo_plan_title"] or payload["repo_plan_id"]
     default_plan = payload["default_plan_title"] or payload["default_plan_id"]
+    repo_plan_id = payload.get("repo_plan_id") or ""
+    plan_id = payload.get("default_plan_id") or ""
+    if repo_plan:
+        app_url = _app_url_from_api_url(payload["api_url"])
+        repo_plan_url = f"{app_url}/plans/{repo_plan_id}" if repo_plan_id else ""
+        print(f"{DIM}Current repo plan:{RESET} {YELLOW}{repo_plan}{RESET}")
+        if repo_plan_url:
+            print(f"{DIM}Plan URL:{RESET} {CYAN}{repo_plan_url}{RESET}")
     if default_plan:
-        print(f"{DIM}Default plan:{RESET} " f"{YELLOW}{default_plan}{RESET}")
+        app_url = _app_url_from_api_url(payload["api_url"])
+        plan_url = f"{app_url}/plans/{plan_id}" if plan_id else ""
+        print(f"{DIM}Default plan:{RESET} {YELLOW}{default_plan}{RESET}")
+        if plan_url:
+            print(f"{DIM}Plan URL:{RESET} {CYAN}{plan_url}{RESET}")
     if user.get("email"):
         print(f"{DIM}User:{RESET} {CYAN}{user['email']}{RESET}")
     if user.get("name"):
@@ -2559,6 +2978,7 @@ def _config_set(
 ):
     """Set default workspace context."""
     updates: dict = {}
+    linked_repo = False
     if work_dir is not None:
         updates["default_work_dir"] = (
             str(Path(work_dir).resolve()) if work_dir else None
@@ -2576,10 +2996,17 @@ def _config_set(
         updates["default_plan_id"] = None
         updates["default_plan_title"] = None
     elif plan_id is not None:
+        _ensure_authenticated()
         resolved_plan_id, resolved_plan_title = _resolve_plan_context(plan_id)
         updates["default_plan_id"] = resolved_plan_id
         updates["default_plan_title"] = resolved_plan_title
     auth = update_auth(updates)
+    if not clear_plan and plan_id is not None:
+        linked_repo = _link_current_repo_to_plan(
+            auth.get("default_plan_id") or "",
+            plan_title=auth.get("default_plan_title"),
+            work_dir=auth.get("default_work_dir"),
+        )
     payload = {
         "api_url": auth.get("api_url") or DEFAULT_API_URL,
         "default_org_id": auth.get("default_org_id"),
@@ -2597,6 +3024,8 @@ def _config_set(
     plan_label = auth.get("default_plan_title") or auth.get("default_plan_id")
     if plan_label:
         print(f"Saved default plan: {plan_label}")
+        if linked_repo:
+            print("Linked the current repo to this plan in Keshro.")
     elif clear_plan:
         print("Cleared default plan context.")
 
@@ -2740,7 +3169,7 @@ def _continue_command(
         ),
     ] = False,
 ):
-    """Resume execution of a plan. Launches parallel agents by default."""
+    """Resume execution of a plan. In the shell this is coordinator mode; in an agent it resumes one task."""
     # Inside a coding agent (piped stdout), always single-task mode.
     # In user's terminal, default to parallel unless --no-parallel is passed.
     use_parallel = not no_parallel and (sys.stdout.isatty() or dry_run)
@@ -2749,7 +3178,7 @@ def _continue_command(
             plan_id,
             work_dir=work_dir,
             auto_continue=auto_continue,
-            parallel=not no_parallel,
+            parallel=False,
             confirm=confirm,
         )
     else:
@@ -2767,34 +3196,247 @@ def _continue_command(
 
 
 CLAUDE_COMMANDS_DIR = Path.home() / ".claude" / "commands"
+CODEX_HOME_DIR = Path.home() / ".codex"
 
 KESHRO_SLASH_COMMAND = """\
-When the user asks you to run keshro commands, run them as bash commands in the terminal.
+You are integrated with Keshro — the intelligent execution layer for coding agents. Run all keshro commands via Bash.
 
-The `keshro` CLI manages migration execution plans. Common commands:
+## What you can do
 
-- `keshro continue -p <plan-id>` — resume the next task from a migration plan (start here)
-- `keshro task start <task-id> -p <plan-id>` — mark a task as in progress
-- `keshro task done <task-id> -p <plan-id>` — mark a task as complete
-- `keshro task note <task-id> -p <plan-id> "note"` — add a note to a task
-- `keshro task block <task-id> -p <plan-id> "reason"` — flag a blocker
-- `keshro plan view <plan-id>` — view the full execution plan
+When the user says things like "plan this", "run this project", "execute", "use Keshro", or "keshro":
 
-Run `keshro` commands via Bash, not as chat messages. Do not use Keshro MCP tools.
+### 1. Create a plan from a description
+```bash
+keshro plan generate "Refactor the auth module to support API keys and rate limiting"
+```
+This generates a dependency-aware task graph with AI enrichment. Returns a plan ID.
+
+### 2. Import from Linear, Jira, or GitHub
+```bash
+keshro plan import linear --project <project-key>
+keshro plan import github --project <owner/repo>
+keshro plan import jira --project <project-key>
+```
+Imports issues, enriches with codebase context, generates an execution plan.
+
+### 3. Execute a plan
+```bash
+keshro continue -p <plan-id>
+```
+This prints your next task with full context. Follow the instructions — start the task, write notes as you work, mark it done when finished.
+
+### 4. Check status
+```bash
+keshro status -p <plan-id>
+```
+
+### 5. During task execution
+As you work on a task, keep Keshro updated:
+```bash
+keshro task start <task-id> -p <plan-id>
+keshro task note <task-id> -p <plan-id> -n "what you found or changed"
+keshro task done <task-id> -p <plan-id>
+keshro task block <task-id> -p <plan-id> -r "reason"
+```
+
+### 6. If a task is blocked
+```bash
+keshro task unblock <task-id> -p <plan-id>
+```
+
+### 7. Review decisions and rollback
+```bash
+keshro explain <task-id> -p <plan-id>
+keshro rollback <task-id> -p <plan-id>
+```
+
+## Plan context
+Keshro remembers your active plan. After creating or continuing a plan, it becomes the default.
+- `keshro continue` (no -p) resumes the active plan
+- `keshro status` (no -p) shows the active plan
+- `keshro config` shows the current active plan and auth status
+- To switch plans: `keshro config set --plan-id <plan-id>`
+
+To find which plan to use, run `keshro config` first. If no plan is set, run `keshro plan list` to see available plans.
+
+## Quick flow
+If user says "plan and run this project":
+1. Run `keshro plan generate "<their description>"` — creates a plan and sets it as active
+2. Run `keshro status` — show the user what the plan looks like before starting
+3. Run `keshro continue` — gets the first task
+4. Execute the task, writing notes along the way
+5. Run `keshro task done <task-id>` when complete
+6. Run `keshro status` — show updated progress after each task
+7. Run `keshro continue` again for the next task
+
+If user says "continue" or "keep going":
+1. Run `keshro status` first — show where things stand
+2. Run `keshro continue` — picks up where you left off
+
+If user says "what's happening" or "status":
+1. Run `keshro status`
+
+Always run `keshro status` after completing a task so the user sees the updated plan progress.
+
+## Rules
+- Run keshro commands via Bash, never as chat messages
+- Do NOT use Keshro MCP tools — always use the CLI
+- Write progress notes frequently with `keshro task note` — the user monitors these in real time
+- Always run `keshro config` first if you're unsure which plan is active
+- When showing plan info to the user, include the plan URL from `keshro config` output so they can click through to the dashboard
+- In Claude Code, the user may invoke this via `/keshro`; in Codex, the user will usually ask in natural language instead of using a slash command
 """
+
+
+def _install_claude_integration() -> Path:
+    CLAUDE_COMMANDS_DIR.mkdir(parents=True, exist_ok=True)
+    target = CLAUDE_COMMANDS_DIR / "keshro.md"
+    target.write_text(KESHRO_SLASH_COMMAND)
+    return target
+
+
+def _install_codex_integration() -> Path:
+    CODEX_HOME_DIR.mkdir(parents=True, exist_ok=True)
+    target = CODEX_HOME_DIR / "AGENTS.md"
+    marker = "<!-- keshro-agent-instructions -->"
+    keshro_block = f"{marker}\n# Keshro Integration\n\n{KESHRO_SLASH_COMMAND}\n{marker}"
+    if target.exists():
+        content = target.read_text()
+        marker_re = re.compile(
+            rf"{re.escape(marker)}[\s\S]*?{re.escape(marker)}\n?",
+            re.MULTILINE,
+        )
+        if marker in content:
+            next_content = marker_re.sub(keshro_block + "\n", content, count=1).rstrip()
+            target.write_text(next_content + "\n")
+        else:
+            target.write_text(content.rstrip() + "\n\n" + keshro_block + "\n")
+    else:
+        target.write_text(keshro_block + "\n")
+    return target
+
+
+def _install_agent_integrations(silent: bool = False) -> tuple[list[str], list[str]]:
+    """Install keshro instructions for all supported agents.
+
+    Returns `(installed_targets, already_present_targets)`.
+    """
+    installed: list[str] = []
+    already_present: list[str] = []
+
+    # Claude Code — ~/.claude/commands/keshro.md
+    try:
+        target_path = CLAUDE_COMMANDS_DIR / "keshro.md"
+        existing = target_path.read_text() if target_path.exists() else None
+        target = _install_claude_integration()
+        label = f"Claude Code: {target}"
+        current = target.read_text() if target.exists() else None
+        if existing == current:
+            already_present.append(label)
+        else:
+            installed.append(label)
+    except Exception:
+        if not silent:
+            raise
+
+    # Codex — ~/.codex/AGENTS.md (global)
+    try:
+        target_path = CODEX_HOME_DIR / "AGENTS.md"
+        existing = target_path.read_text() if target_path.exists() else None
+        target = _install_codex_integration()
+        label = f"Codex: {target}"
+        current = target.read_text() if target.exists() else None
+        if existing == current:
+            already_present.append(label)
+        else:
+            installed.append(label)
+    except Exception:
+        if not silent:
+            raise
+
+    # Cursor — .cursorrules in current directory (project-level)
+    try:
+        cwd = Path.cwd()
+        cursor_file = cwd / ".cursorrules"
+        marker = "# keshro-agent-instructions"
+        keshro_block = f"{marker}\n{KESHRO_SLASH_COMMAND}\n# end-keshro"
+        if cursor_file.exists():
+            content = cursor_file.read_text()
+            if marker not in content:
+                cursor_file.write_text(content.rstrip() + "\n\n" + keshro_block + "\n")
+                installed.append(f"Cursor: {cursor_file}")
+            else:
+                already_present.append(f"Cursor: {cursor_file}")
+        else:
+            cursor_file.write_text(keshro_block + "\n")
+            installed.append(f"Cursor: {cursor_file}")
+    except Exception:
+        if not silent:
+            raise
+
+    return installed, already_present
 
 
 @app.command("setup-claude")
 def _setup_claude():
     """Install a global Claude Code slash command for Keshro"""
-    CLAUDE_COMMANDS_DIR.mkdir(parents=True, exist_ok=True)
-    target = CLAUDE_COMMANDS_DIR / "keshro.md"
-    target.write_text(KESHRO_SLASH_COMMAND)
+    target = _install_claude_integration()
     if _state.json:
         print_output({"status": "ok", "path": str(target)}, True)
     else:
         print(f"Installed Claude Code slash command at {target}")
         print("You can now use /keshro in any Claude Code session.")
+
+
+@app.command("setup-codex")
+def _setup_codex():
+    """Install global Keshro instructions for Codex"""
+    try:
+        target = _install_codex_integration()
+        print(f"Installed Codex instructions: {target}")
+    except Exception as exc:
+        print(f"{RED}Failed: {exc}{RESET}", file=sys.stderr)
+        raise typer.Exit(1) from exc
+
+
+@app.command("setup-cursor")
+def _setup_cursor():
+    """Install Keshro instructions in .cursorrules for Cursor"""
+    try:
+        cwd = Path.cwd()
+        cursor_file = cwd / ".cursorrules"
+        marker = "# keshro-agent-instructions"
+        keshro_block = f"{marker}\n{KESHRO_SLASH_COMMAND}\n# end-keshro"
+        if cursor_file.exists():
+            content = cursor_file.read_text()
+            if marker in content:
+                print(".cursorrules already has Keshro instructions.")
+                return
+            cursor_file.write_text(content.rstrip() + "\n\n" + keshro_block + "\n")
+        else:
+            cursor_file.write_text(keshro_block + "\n")
+        print(f"Installed Keshro instructions: {cursor_file}")
+    except Exception as exc:
+        print(f"{RED}Failed: {exc}{RESET}", file=sys.stderr)
+        raise typer.Exit(1) from exc
+
+
+@app.command("setup")
+def _setup_all():
+    """Install Keshro instructions for all supported agents (Claude Code, Codex, Cursor)"""
+    installed, already_present = _install_agent_integrations(silent=True)
+    if installed:
+        print("Installed Keshro agent instructions:")
+        for target in installed:
+            print(f"  {GREEN}✓{RESET} {target}")
+        if already_present:
+            print("Already present:")
+            for target in already_present:
+                print(f"  {DIM}•{RESET} {target}")
+    elif already_present:
+        print("All agent integrations already installed.")
+    else:
+        print("No agent integrations were installed.")
 
 
 # ---------------------------------------------------------------------------
@@ -2934,7 +3576,7 @@ def _plan_list(
                 _clean(plan.get("title")) or "Untitled plan",
                 _clean(plan.get("status") or "draft") or "draft",
                 f"{plan.get('source_type') or 'Unknown source'} -> {plan.get('target_type') or 'Unknown target'}",
-                _clean(plan.get("updated_at")),
+                _format_plan_timestamp(plan.get("updated_at")),
             ]
             for plan in plans
         ]
@@ -3121,7 +3763,9 @@ def _print_plan_status(plan: dict) -> None:
                 m_tasks = data.get("tasks", 0)
                 m_cost = data.get("cost_usd", 0)
                 m_tokens = data.get("tokens", 0)
-                print(f"    {DIM}{model}: {m_tasks} task{'s' if m_tasks != 1 else ''} · {m_tokens:,} tok · ${m_cost:.2f}{RESET}")
+                print(
+                    f"    {DIM}{model}: {m_tasks} task{'s' if m_tasks != 1 else ''} · {m_tokens:,} tok · ${m_cost:.2f}{RESET}"
+                )
 
     # Enrichment sources
     sources = plan.get("enrichment_sources") or []
@@ -3131,8 +3775,6 @@ def _print_plan_status(plan: dict) -> None:
             print(f"  {DIM}Informed by: {', '.join(names)}{RESET}")
 
     print()
-
-
 
 
 def _watch_via_sse(plan_id: str) -> None:
@@ -3178,16 +3820,13 @@ def _watch_via_polling(plan_id: str) -> None:
             print("\033[2J\033[H", end="")
             plan = _get_plan_or_exit(plan_id)
             _print_plan_status(plan)
-            print(
-                f"  {YELLOW}● polling{RESET} · refreshes every 10s · Ctrl+C to stop"
-            )
+            print(f"  {YELLOW}● polling{RESET} · refreshes every 10s · Ctrl+C to stop")
             _time.sleep(10)
     except KeyboardInterrupt:
         print("\nStopped watching.")
 
 
 def _run_status(plan_id: str | None, watch: bool = False, tui: bool = False) -> None:
-    import time as _time
 
     resolved_plan_id = _current_plan_id(plan_id)
     if not resolved_plan_id:
@@ -4702,9 +5341,7 @@ def _plan_import(
         preview_payload["project_id"] = project_id
 
     try:
-        resp = client.post(
-            "/v1/plans/import/preview", json=preview_payload, timeout=60
-        )
+        resp = client.post("/v1/plans/import/preview", json=preview_payload, timeout=60)
         resp.raise_for_status()
     except httpx.HTTPStatusError as exc:
         _print_http_error(exc)
@@ -4842,7 +5479,10 @@ def _plan_push(
     ] = None,
     sync_mode: Annotated[
         str,
-        typer.Option("--mode", help="'standalone' (individual issues) or 'grouped' (with parent)."),
+        typer.Option(
+            "--mode",
+            help="'standalone' (individual issues) or 'grouped' (with parent).",
+        ),
     ] = "standalone",
 ):
     """Push plan tasks to Linear, Jira, or GitHub as issues."""
@@ -5094,11 +5734,15 @@ def _watch_start(
     ] = 1.0,
     foreground: Annotated[
         bool,
-        typer.Option("--foreground", "-f", help="Run in foreground instead of backgrounding."),
+        typer.Option(
+            "--foreground", "-f", help="Run in foreground instead of backgrounding."
+        ),
     ] = False,
     no_git: Annotated[
         bool,
-        typer.Option("--no-git", help="Disable git watcher. Rely on Claude Code hooks only."),
+        typer.Option(
+            "--no-git", help="Disable git watcher. Rely on Claude Code hooks only."
+        ),
     ] = False,
 ):
     """Start the Keshro background daemon.
@@ -5110,10 +5754,12 @@ def _watch_start(
     if ctx.invoked_subcommand is not None:
         return
 
-    from .daemon import KeshroDaemon, is_daemon_running
+    from .daemon import is_daemon_running, KeshroDaemon
 
     if is_daemon_running():
-        print(f"{YELLOW}Daemon is already running. Use `keshro watch stop` to stop it.{RESET}")
+        print(
+            f"{YELLOW}Daemon is already running. Use `keshro watch stop` to stop it.{RESET}"
+        )
         raise typer.Exit(0)
 
     _ensure_authenticated()
@@ -5122,7 +5768,13 @@ def _watch_start(
     repo_root = Path.cwd()
     try:
         import subprocess as _sp
-        result = _sp.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, timeout=5)
+
+        result = _sp.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
         if result.returncode == 0:
             repo_root = Path(result.stdout.strip())
     except Exception:
@@ -5133,6 +5785,7 @@ def _watch_start(
     if not foreground:
         # Background: spawn a detached subprocess running this command with --foreground
         import subprocess as _sp
+
         cmd = [sys.executable, "-m", "keshro_cli.cli"]
         # Reconstruct args — forward auth and api-url so subprocess authenticates
         if _state.api_url:
@@ -5149,6 +5802,7 @@ def _watch_start(
 
         # Redirect stdout/stderr to log file
         from .daemon import LOG_FILE
+
         LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
         log_fh = open(LOG_FILE, "a")
 
@@ -5164,6 +5818,7 @@ def _watch_start(
 
         # Wait briefly to check it didn't immediately crash
         import time as _time
+
         _time.sleep(0.5)
         if proc.poll() is not None:
             print(f"{RED}Daemon failed to start. Check ~/.keshro/daemon.log{RESET}")
@@ -5172,8 +5827,8 @@ def _watch_start(
         print(f"{GREEN}Keshro daemon started{RESET} (PID {proc.pid})")
         print(f"  Plan: {plan_label}")
         print(f"  Repo: {repo_root}")
-        print(f"  Log:  ~/.keshro/daemon.log")
-        print(f"  Stop: keshro watch stop")
+        print("  Log:  ~/.keshro/daemon.log")
+        print("  Stop: keshro watch stop")
         return
 
     # Foreground mode: run the daemon in this process
@@ -5190,8 +5845,8 @@ def _watch_start(
     print(f"{GREEN}Starting keshro daemon (foreground)...{RESET}")
     print(f"  Plan: {plan_label}")
     print(f"  Repo: {repo_root}")
-    print(f"  Log:  ~/.keshro/daemon.log")
-    print(f"  Stop: Ctrl+C")
+    print("  Log:  ~/.keshro/daemon.log")
+    print("  Stop: Ctrl+C")
     print()
 
     asyncio.run(daemon.start())
@@ -5200,7 +5855,7 @@ def _watch_start(
 @watch_app.command("stop")
 def _watch_stop():
     """Stop the running daemon."""
-    from .daemon import stop_daemon, is_daemon_running
+    from .daemon import is_daemon_running, stop_daemon
 
     if not is_daemon_running():
         print(f"{YELLOW}No daemon is running.{RESET}")
@@ -5217,11 +5872,11 @@ def _watch_stop():
 @watch_app.command("status")
 def _watch_status():
     """Show daemon status and pending observations."""
-    from .daemon import read_daemon_status, is_daemon_running, LOG_FILE
+    from .daemon import is_daemon_running, LOG_FILE, read_daemon_status
 
     if not is_daemon_running():
         print(f"{DIM}Daemon is not running.{RESET}")
-        print(f"Start with: keshro watch")
+        print("Start with: keshro watch")
         raise typer.Exit(0)
 
     status = read_daemon_status()
@@ -5310,7 +5965,10 @@ def _watch_logs(
         os.execvp("tail", ["tail", "-f", "-n", str(lines), str(LOG_FILE)])
     else:
         import subprocess as _sp
-        result = _sp.run(["tail", "-n", str(lines), str(LOG_FILE)], text=True, capture_output=True)
+
+        result = _sp.run(
+            ["tail", "-n", str(lines), str(LOG_FILE)], text=True, capture_output=True
+        )
         print(result.stdout, end="")
 
 
@@ -5321,7 +5979,7 @@ def _watch_install():
 
     if not is_macos():
         print(f"{YELLOW}Auto-restart is currently macOS only (launchd).{RESET}")
-        print(f"Linux systemd support coming soon.")
+        print("Linux systemd support coming soon.")
         raise typer.Exit(1)
 
     _ensure_authenticated()
@@ -5329,7 +5987,13 @@ def _watch_install():
     repo_root = Path.cwd()
     try:
         import subprocess as _sp
-        result = _sp.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, timeout=5)
+
+        result = _sp.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
         if result.returncode == 0:
             repo_root = Path(result.stdout.strip())
     except Exception:
@@ -5337,9 +6001,9 @@ def _watch_install():
 
     if install_launchd(repo_root):
         print(f"{GREEN}Auto-restart installed{RESET}")
-        print(f"  The daemon will restart automatically on crash or login.")
+        print("  The daemon will restart automatically on crash or login.")
         print(f"  Repo: {repo_root}")
-        print(f"  Remove with: keshro watch uninstall")
+        print("  Remove with: keshro watch uninstall")
     else:
         print(f"{RED}Failed to install auto-restart.{RESET}")
         raise typer.Exit(1)
@@ -5348,7 +6012,7 @@ def _watch_install():
 @watch_app.command("uninstall")
 def _watch_uninstall():
     """Remove auto-restart (uninstall launchd agent)."""
-    from .launchd import uninstall_launchd, is_macos
+    from .launchd import is_macos, uninstall_launchd
 
     if not is_macos():
         raise typer.Exit(0)
@@ -5356,7 +6020,13 @@ def _watch_uninstall():
     repo_root = Path.cwd()
     try:
         import subprocess as _sp
-        result = _sp.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, timeout=5)
+
+        result = _sp.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
         if result.returncode == 0:
             repo_root = Path(result.stdout.strip())
     except Exception:
