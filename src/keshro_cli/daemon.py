@@ -36,6 +36,13 @@ from typing import Any
 
 from .client import get_api_url, get_token, make_async_client
 from .config import load_auth
+from .hooks import (
+    HookSocketServer,
+    detect_keshro_command,
+    extract_file_paths,
+    install_hooks,
+    uninstall_hooks,
+)
 from .watcher import GitWatcher, GitEvent
 
 logger = logging.getLogger("keshro.daemon")
@@ -87,10 +94,13 @@ class DaemonState:
     event_queue: deque = field(default_factory=lambda: deque(maxlen=MAX_QUEUE_SIZE))
     observations: deque = field(default_factory=lambda: deque(maxlen=MAX_OBSERVATIONS))
     files_in_progress: dict[str, str] = field(default_factory=dict)  # file -> task_id
+    files_touched: list[str] = field(default_factory=list)  # files edited in current task
+    task_start_time: float = 0.0  # monotonic time when current task started
     started_at: str = ""
     last_heartbeat: str = ""
     events_processed: int = 0
     tasks_completed: int = 0
+    hook_events_received: int = 0
 
 
 def _repo_root() -> Path | None:
@@ -177,6 +187,7 @@ class KeshroDaemon:
         self._api_url = api_url
         self._token = token
         self._watcher: GitWatcher | None = None
+        self._hook_server: HookSocketServer | None = None
         self._shutdown_event = asyncio.Event()
 
     # ------------------------------------------------------------------
@@ -263,6 +274,18 @@ class KeshroDaemon:
         self._watcher = GitWatcher(repo_root, self._on_git_event)
         self._watcher.start()
 
+        # Start hook socket server
+        sock_path = _socket_path(repo_root)
+        self._hook_server = HookSocketServer(sock_path, self._on_hook_event)
+        await self._hook_server.start()
+
+        # Install Claude Code hooks
+        install_hooks(repo_root, sock_path)
+
+        # Track task start time
+        if self.state.current_task_id:
+            self.state.task_start_time = time.monotonic()
+
         # Write initial context file
         self._write_context()
 
@@ -289,15 +312,17 @@ class KeshroDaemon:
         self.state.running = False
         if self._watcher:
             self._watcher.stop()
+        if self._hook_server:
+            await self._hook_server.stop()
 
         # Flush remaining events
         await self._flush_queue()
 
-        # Cleanup files
+        # Uninstall hooks and cleanup files
         repo_root = self.state.repo_root
         if repo_root:
+            uninstall_hooks(repo_root)
             _pid_file(repo_root).unlink(missing_ok=True)
-            _socket_path(repo_root).unlink(missing_ok=True)
             _status_file(repo_root).unlink(missing_ok=True)
         logger.info("Daemon stopped")
 
@@ -442,6 +467,50 @@ class KeshroDaemon:
             logger.info(f"Switched to plan {new_plan_id}")
 
     # ------------------------------------------------------------------
+    # Hook event handling (Phase 0.2)
+    # ------------------------------------------------------------------
+
+    def _on_hook_event(self, event: dict) -> None:
+        """Handle a Claude Code hook event received via the Unix socket."""
+        self.state.hook_events_received += 1
+
+        # Track file edits
+        files = extract_file_paths(event)
+        for f in files:
+            self.state.files_touched.append(f)
+            if self.state.current_task_id:
+                self.state.files_in_progress[f] = self.state.current_task_id
+
+        # Detect keshro CLI commands run by the agent
+        keshro_cmd = detect_keshro_command(event)
+        if keshro_cmd:
+            cmd_type, task_id = keshro_cmd
+            if cmd_type == "task_done":
+                # HIGH confidence: agent explicitly marked task done
+                logger.info(f"High confidence (hook): agent ran keshro task done {task_id}")
+                self.state.event_queue.append({
+                    "task_id": task_id,
+                    "event": "done",
+                    "note": "[daemon] Auto-detected: agent ran keshro task done",
+                })
+                self._record_task_metrics(task_id)
+                self.state.tasks_completed += 1
+                self._write_context()
+
+    def _record_task_metrics(self, task_id: str) -> None:
+        """Record execution quality metrics for a completed task."""
+        elapsed = 0.0
+        if self.state.task_start_time > 0:
+            elapsed = time.monotonic() - self.state.task_start_time
+        files_count = len(set(self.state.files_touched))
+        logger.info(
+            f"Task {task_id} metrics: {elapsed:.0f}s elapsed, {files_count} files touched"
+        )
+        # Reset per-task tracking
+        self.state.files_touched = []
+        self.state.task_start_time = time.monotonic()
+
+    # ------------------------------------------------------------------
     # Plan auto-detection
     # ------------------------------------------------------------------
 
@@ -547,7 +616,7 @@ class KeshroDaemon:
     # ------------------------------------------------------------------
 
     def setup_repo(self) -> None:
-        """First-run setup: create context file, update .gitignore."""
+        """First-run setup: create context file, update .gitignore, install hooks."""
         if not self.state.repo_root:
             return
 
@@ -555,20 +624,24 @@ class KeshroDaemon:
         claude_dir = self.state.repo_root / ".claude"
         claude_dir.mkdir(exist_ok=True)
 
-        # Update .gitignore
+        # Update .gitignore with daemon-generated files
         gitignore = self.state.repo_root / ".gitignore"
-        entry = ".claude/keshro-context.md"
+        daemon_entries = [".claude/keshro-context.md", ".claude/keshro-hook.sh"]
         if gitignore.exists():
             content = gitignore.read_text()
-            if entry not in content:
+            missing = [e for e in daemon_entries if e not in content]
+            if missing:
                 with open(gitignore, "a") as f:
                     if not content.endswith("\n"):
                         f.write("\n")
-                    f.write(f"\n# Keshro daemon context (auto-generated)\n{entry}\n")
-                logger.info(f"Added {entry} to .gitignore")
+                    f.write("\n# Keshro daemon (auto-generated)\n")
+                    for entry in missing:
+                        f.write(f"{entry}\n")
+                logger.info(f"Added {missing} to .gitignore")
         else:
-            gitignore.write_text(f"# Keshro daemon context (auto-generated)\n{entry}\n")
-            logger.info(f"Created .gitignore with {entry}")
+            lines = ["# Keshro daemon (auto-generated)"] + daemon_entries
+            gitignore.write_text("\n".join(lines) + "\n")
+            logger.info("Created .gitignore with keshro entries")
 
     # ------------------------------------------------------------------
     # Utilities
@@ -637,6 +710,8 @@ class KeshroDaemon:
             "pending_observations": len(self.state.observations),
             "recent_observations": recent_obs,
             "queue_size": len(self.state.event_queue),
+            "hook_events_received": self.state.hook_events_received,
+            "files_touched_current_task": len(set(self.state.files_touched)),
             "repo": str(self.state.repo_root or ""),
         }
 
