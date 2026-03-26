@@ -56,7 +56,10 @@ def _plist_content(repo_root: Path) -> str:
     <key>WorkingDirectory</key>
     <string>{repo_root}</string>
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
     <key>StandardOutPath</key>
     <string>{log_file}</string>
     <key>StandardErrorPath</key>

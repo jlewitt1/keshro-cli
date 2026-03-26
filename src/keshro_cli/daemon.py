@@ -134,6 +134,7 @@ class DaemonState:
     files_in_progress: dict[str, str] = field(default_factory=dict)  # file -> task_id
     files_touched: list[str] = field(default_factory=list)  # files edited in current task
     task_start_time: float = 0.0  # monotonic time when current task started
+    hook_completed_tasks: set = field(default_factory=set)  # task IDs completed via hook (dedup)
     started_at: str = ""
     last_heartbeat: str = ""
     events_processed: int = 0
@@ -475,6 +476,10 @@ class KeshroDaemon:
         task_id = _match_task_id_in_commit(message, self.state.plan)
 
         if task_id:
+            # Skip if hook already completed this task (avoid duplicate events)
+            if task_id in self.state.hook_completed_tasks:
+                logger.debug(f"Skipping commit for {task_id} — already completed via hook")
+                return
             # HIGH confidence: commit message contains task ID
             logger.info(f"High confidence: commit matches task {task_id}")
             self.state.event_queue.append({
@@ -542,6 +547,7 @@ class KeshroDaemon:
                     "event": "done",
                     "note": f"[daemon] Auto-detected: agent ran keshro task done. Files touched: {len(set(self.state.files_touched))}",
                 })
+                self.state.hook_completed_tasks.add(task_id)
                 self._record_task_metrics(task_id)
                 self.state.tasks_completed += 1
                 self._write_context()

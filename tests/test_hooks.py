@@ -353,6 +353,24 @@ class TestDaemonHookIntegration:
         assert len(obs) == 1
         assert "fail" in obs[0].description
 
+    def test_hook_completion_deduplicates_git_commit(self, daemon):
+        """If hook already completed the task, git commit should not duplicate."""
+        # Hook completes the task
+        daemon._on_hook_event({
+            "tool_name": "Bash",
+            "tool_input": {"command": "keshro task done task-2 -p plan-1"},
+        })
+        assert len(daemon.state.event_queue) == 1
+
+        # Git commit for same task should be skipped
+        from keshro_cli.watcher import GitEvent
+        daemon._handle_commit(GitEvent(
+            "commit", 0, {"sha": "abc", "message": "task-2: done"},
+        ))
+        # Still only 1 event — not duplicated
+        assert len(daemon.state.event_queue) == 1
+        assert daemon.state.tasks_completed == 1
+
     def test_daemon_works_without_git_watcher(self, daemon):
         """Hooks-first: daemon should function purely from hook events."""
         # Simulate a full task lifecycle via hooks only (no git)
