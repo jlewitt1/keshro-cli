@@ -5,6 +5,8 @@ Connects via SSE for real-time updates, falls back to polling.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import httpx
 from textual.app import App, ComposeResult
 from textual.reactive import reactive
@@ -94,8 +96,6 @@ class ActiveAgents(Static):
             updated = step.get("last_updated_at", "")
             if updated:
                 try:
-                    from datetime import datetime, timezone
-
                     t = datetime.fromisoformat(updated.replace("Z", "+00:00"))
                     delta = datetime.now(timezone.utc) - t
                     mins = int(delta.total_seconds() // 60)

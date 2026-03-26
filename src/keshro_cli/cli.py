@@ -3316,22 +3316,40 @@ def _install_codex_integration() -> Path:
     return target
 
 
-def _install_agent_integrations(silent: bool = False) -> list[str]:
-    """Install keshro instructions for all supported agents. Returns list of installed targets."""
-    installed = []
+def _install_agent_integrations(silent: bool = False) -> tuple[list[str], list[str]]:
+    """Install keshro instructions for all supported agents.
+
+    Returns `(installed_targets, already_present_targets)`.
+    """
+    installed: list[str] = []
+    already_present: list[str] = []
 
     # Claude Code — ~/.claude/commands/keshro.md
     try:
+        target_path = CLAUDE_COMMANDS_DIR / "keshro.md"
+        existing = target_path.read_text() if target_path.exists() else None
         target = _install_claude_integration()
-        installed.append(f"Claude Code: {target}")
+        label = f"Claude Code: {target}"
+        current = target.read_text() if target.exists() else None
+        if existing == current:
+            already_present.append(label)
+        else:
+            installed.append(label)
     except Exception:
         if not silent:
             raise
 
     # Codex — ~/.codex/AGENTS.md (global)
     try:
+        target_path = CODEX_HOME_DIR / "AGENTS.md"
+        existing = target_path.read_text() if target_path.exists() else None
         target = _install_codex_integration()
-        installed.append(f"Codex: {target}")
+        label = f"Codex: {target}"
+        current = target.read_text() if target.exists() else None
+        if existing == current:
+            already_present.append(label)
+        else:
+            installed.append(label)
     except Exception:
         if not silent:
             raise
@@ -3347,6 +3365,8 @@ def _install_agent_integrations(silent: bool = False) -> list[str]:
             if marker not in content:
                 cursor_file.write_text(content.rstrip() + "\n\n" + keshro_block + "\n")
                 installed.append(f"Cursor: {cursor_file}")
+            else:
+                already_present.append(f"Cursor: {cursor_file}")
         else:
             cursor_file.write_text(keshro_block + "\n")
             installed.append(f"Cursor: {cursor_file}")
@@ -3354,7 +3374,7 @@ def _install_agent_integrations(silent: bool = False) -> list[str]:
         if not silent:
             raise
 
-    return installed
+    return installed, already_present
 
 
 @app.command("setup-claude")
@@ -3404,13 +3424,19 @@ def _setup_cursor():
 @app.command("setup")
 def _setup_all():
     """Install Keshro instructions for all supported agents (Claude Code, Codex, Cursor)"""
-    installed = _install_agent_integrations(silent=True)
+    installed, already_present = _install_agent_integrations(silent=True)
     if installed:
         print("Installed Keshro agent instructions:")
         for target in installed:
             print(f"  {GREEN}✓{RESET} {target}")
-    else:
+        if already_present:
+            print("Already present:")
+            for target in already_present:
+                print(f"  {DIM}•{RESET} {target}")
+    elif already_present:
         print("All agent integrations already installed.")
+    else:
+        print("No agent integrations were installed.")
 
 
 # ---------------------------------------------------------------------------

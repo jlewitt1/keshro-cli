@@ -1081,6 +1081,17 @@ def test_install_codex_integration_replaces_existing_managed_block(monkeypatch, 
     assert content.count("<!-- keshro-agent-instructions -->") == 2
 
 
+def test_setup_all_reports_already_present_integrations(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "keshro_cli.cli._install_agent_integrations",
+        lambda silent=True: ([], ["Claude Code: /tmp/keshro.md", "Codex: /tmp/codex.md"]),
+    )
+
+    cli.main(["setup"])
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+    assert "All agent integrations already installed." in out
+
+
 def test_config_set_can_save_api_url(monkeypatch, capsys):
     monkeypatch.setattr(
         "keshro_cli.cli.update_auth",
