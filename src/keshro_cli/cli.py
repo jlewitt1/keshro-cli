@@ -5110,9 +5110,11 @@ def _watch_start(
         # Background: spawn a detached subprocess running this command with --foreground
         import subprocess as _sp
         cmd = [sys.executable, "-m", "keshro_cli.cli"]
-        # Reconstruct args
+        # Reconstruct args — forward auth and api-url so subprocess authenticates
         if _state.api_url:
             cmd.extend(["--api-url", _state.api_url])
+        if _state.token:
+            cmd.extend(["--token", _state.token])
         cmd.extend(["watch", "--foreground"])
         if plan_id:
             cmd.extend(["--plan-id", plan_id])
@@ -5132,6 +5134,7 @@ def _watch_start(
             start_new_session=True,  # Detach from terminal
             cwd=str(repo_root),
         )
+        log_fh.close()  # Parent no longer needs its copy after fork
 
         # Wait briefly to check it didn't immediately crash
         import time as _time

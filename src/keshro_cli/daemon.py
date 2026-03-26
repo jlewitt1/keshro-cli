@@ -220,6 +220,13 @@ class KeshroDaemon:
                     f"Daemon already running for this repo (PID {old_pid}).\n"
                     f"Run: keshro watch stop"
                 )
+            except PermissionError:
+                # Process exists but owned by another user — treat as alive
+                logger.error(f"Daemon PID {old_pid} exists but owned by another user")
+                raise SystemExit(
+                    f"Daemon already running for this repo (PID {old_pid}, different user).\n"
+                    f"Run: keshro watch stop"
+                )
             except (ProcessLookupError, ValueError):
                 # Stale PID file
                 pid_path.unlink(missing_ok=True)
@@ -337,7 +344,9 @@ class KeshroDaemon:
                 await self._send_event(event)
                 self.state.events_processed += 1
             except Exception as e:
-                # Put it back and retry later
+                # Put it back for retry — warn if queue is full (appendleft drops newest)
+                if len(self.state.event_queue) >= MAX_QUEUE_SIZE:
+                    logger.warning("Event queue full during retry — newest event will be dropped")
                 self.state.event_queue.appendleft(event)
                 logger.debug(f"Event send failed, will retry: {e}")
                 break
@@ -576,6 +585,8 @@ class KeshroDaemon:
                 old_pid = int(pid_path.read_text().strip())
                 os.kill(old_pid, 0)
                 return False  # Process is alive
+            except PermissionError:
+                return False  # Process exists but owned by another user
             except (ProcessLookupError, ValueError):
                 pass
         # Stale — clean up
@@ -656,6 +667,8 @@ def is_daemon_running(repo: Path | None = None) -> bool:
         pid = int(pid_path.read_text().strip())
         os.kill(pid, 0)
         return True
+    except PermissionError:
+        return True  # Process exists but owned by another user
     except (ProcessLookupError, ValueError, FileNotFoundError):
         return False
 
