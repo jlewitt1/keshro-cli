@@ -1490,8 +1490,11 @@ async def _run_parallel(
     run_all: bool,
     dry_run: bool,
 ) -> None:
+    import uuid as _uuid
+
     resolved_plan_id = _require_plan_context(plan_id)
     resolved_dir = str(Path(work_dir).resolve()) if work_dir else os.getcwd()
+    session_id = f"agent-{_uuid.uuid4().hex[:8]}"
 
     claude_bin = shutil.which("claude")
     if not claude_bin:
