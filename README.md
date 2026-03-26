@@ -37,13 +37,13 @@ The CLI talks to `https://api.keshro.com` by default — override with `KESHRO_A
 ### Execution
 
 ```bash
-keshro continue -p <plan-id>                      # Resume next task
+keshro continue -p <plan-id>                      # Coordinator mode: launch parallel agents from your terminal
 keshro continue -p <plan-id> --confirm             # Approve and execute a draft plan
 keshro continue -p <plan-id> --all                 # Auto-continue through all tasks
 keshro continue -p <plan-id> --concurrency 10      # Up to 10 agents at once (default 5)
 keshro continue -p <plan-id> --dry-run             # Preview which tasks would launch
 keshro continue -p <plan-id> --dir /path/to/repo   # Point agent(s) at a different codebase
-keshro continue -p <plan-id> --no-parallel         # Single-task mode
+keshro continue -p <plan-id> --no-parallel         # Coordinator mode: force one task at a time
 keshro status -p <plan-id>                         # Live dashboard of all tasks and agents
 keshro status --watch                              # Auto-refresh every 10 seconds
 keshro setup-claude                                # Install global Claude Code slash command
@@ -51,7 +51,7 @@ keshro setup-claude                                # Install global Claude Code 
 
 ### What happens when you run `keshro continue`
 
-By default, Keshro launches parallel Claude Code agents in isolated git worktrees — one per actionable task, respecting dependency order. When run inside a coding agent (piped stdout), it falls back to single-task mode automatically.
+From your terminal, `keshro continue` acts as the coordinator: it can launch parallel Claude Code agents in isolated git worktrees, one per actionable task, respecting dependency order. When the same command runs inside a coding agent (piped stdout), it switches to worker mode automatically and resumes exactly one task instead of spawning more agents.
 
 Inside a coding agent, `keshro continue` prints a compact task brief instead of the full internal execution prompt. If the agent needs the extra task context, it can fetch it explicitly with `keshro task view <task-id> -p <plan-id>`. Users can monitor progress separately with `keshro status -p <plan-id> --watch` or `keshro status -p <plan-id> --tui`.
 

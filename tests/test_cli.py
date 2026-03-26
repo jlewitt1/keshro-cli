@@ -1044,6 +1044,43 @@ def test_require_plan_context_can_resolve_repo_link(monkeypatch):
     assert cli._require_plan_context(None) == "plan-123"
 
 
+def test_current_plan_id_prefers_cached_default_before_repo_resolution(monkeypatch):
+    monkeypatch.setattr(
+        "keshro_cli.cli.load_auth",
+        lambda: {
+            "default_plan_id": "plan-cached",
+            "default_plan_title": "Cached plan",
+        },
+    )
+
+    def _fail_resolve(*args, **kwargs):
+        raise AssertionError("repo resolution should not run when default plan is cached")
+
+    monkeypatch.setattr("keshro_cli.cli._resolve_repo_linked_plan", _fail_resolve)
+
+    assert cli._current_plan_id(None) == "plan-cached"
+
+
+def test_install_codex_integration_replaces_existing_managed_block(monkeypatch, tmp_path):
+    monkeypatch.setattr("keshro_cli.cli.CODEX_HOME_DIR", tmp_path)
+    target = tmp_path / "AGENTS.md"
+    old_block = (
+        "<!-- keshro-agent-instructions -->\n"
+        "# Keshro Integration\n\n"
+        "OLD CONTENT\n"
+        "<!-- keshro-agent-instructions -->\n"
+    )
+    target.write_text("Existing intro\n\n" + old_block + "\nExisting footer\n")
+
+    cli._install_codex_integration()
+
+    content = target.read_text()
+    assert "OLD CONTENT" not in content
+    assert "Existing intro" in content
+    assert "Existing footer" in content
+    assert content.count("<!-- keshro-agent-instructions -->") == 2
+
+
 def test_config_set_can_save_api_url(monkeypatch, capsys):
     monkeypatch.setattr(
         "keshro_cli.cli.update_auth",

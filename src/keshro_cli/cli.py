@@ -222,15 +222,17 @@ def _current_plan_id(
     explicit = _clean(plan_id)
     if explicit:
         return explicit
+    auth = load_auth()
+    cached_plan_id = _clean(auth.get("default_plan_id"))
+    if cached_plan_id:
+        return cached_plan_id
     repo_plan_id, repo_plan_title = _resolve_repo_linked_plan(work_dir)
     if repo_plan_id:
         update_auth(
             {"default_plan_id": repo_plan_id, "default_plan_title": repo_plan_title}
         )
         return repo_plan_id
-    auth = load_auth()
-    resolved = _clean(auth.get("default_plan_id"))
-    return resolved or None
+    return None
 
 
 def _current_context_label() -> str | None:
@@ -3167,7 +3169,7 @@ def _continue_command(
         ),
     ] = False,
 ):
-    """Resume execution of a plan. Launches parallel agents by default."""
+    """Resume execution of a plan. In the shell this is coordinator mode; in an agent it resumes one task."""
     # Inside a coding agent (piped stdout), always single-task mode.
     # In user's terminal, default to parallel unless --no-parallel is passed.
     use_parallel = not no_parallel and (sys.stdout.isatty() or dry_run)
@@ -3300,7 +3302,14 @@ def _install_codex_integration() -> Path:
     keshro_block = f"{marker}\n# Keshro Integration\n\n{KESHRO_SLASH_COMMAND}\n{marker}"
     if target.exists():
         content = target.read_text()
-        if marker not in content:
+        marker_re = re.compile(
+            rf"{re.escape(marker)}[\s\S]*?{re.escape(marker)}\n?",
+            re.MULTILINE,
+        )
+        if marker in content:
+            next_content = marker_re.sub(keshro_block + "\n", content, count=1).rstrip()
+            target.write_text(next_content + "\n")
+        else:
             target.write_text(content.rstrip() + "\n\n" + keshro_block + "\n")
     else:
         target.write_text(keshro_block + "\n")
