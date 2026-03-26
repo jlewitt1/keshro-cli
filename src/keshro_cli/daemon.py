@@ -45,6 +45,44 @@ from .hooks import (
 )
 from .watcher import GitWatcher, GitEvent
 
+
+def _extract_topical_context(
+    target_task: dict, all_steps: list[dict], max_entries: int = 5, max_chars: int = 500
+) -> list[str]:
+    """Find learnings from completed tasks that share tags with the target task."""
+    target_tags = {t.lower() for t in (target_task.get("tags") or [])}
+    if not target_tags:
+        return []
+
+    scored: list[tuple[int, str, str]] = []
+    target_id = target_task.get("id")
+    for step in all_steps:
+        if step.get("status") not in ("done", "completed") or step.get("id") == target_id:
+            continue
+        notes = (step.get("notes") or "").strip()
+        if not notes:
+            continue
+        step_tags = {t.lower() for t in (step.get("tags") or [])}
+        shared = target_tags & step_tags
+        if not shared:
+            continue
+
+        content = notes[:max_chars] + ("..." if len(notes) > max_chars else "")
+        title = step.get("title") or "Untitled"
+        shared_str = ", ".join(sorted(shared))
+        scored.append((len(shared), title, content, shared_str))
+
+    if not scored:
+        return []
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    result = []
+    for _score, title, content, shared_str in scored[:max_entries]:
+        result.append(f'- From "{title}" (shared: {shared_str}):')
+        for line in content.split("\n"):
+            result.append(f"  {line}")
+    return result
+
 logger = logging.getLogger("keshro.daemon")
 
 KESHRO_DIR = Path.home() / ".keshro"
@@ -585,6 +623,16 @@ class KeshroDaemon:
                     related = task.get("related_files") or []
                     if related:
                         lines.append("**Related files:** " + ", ".join(related[:10]))
+                        lines.append("")
+
+                    # Topical context — learnings from completed tasks with shared tags
+                    steps = plan.get("plan_steps") or plan.get("steps") or []
+                    topical = _extract_topical_context(task, steps)
+                    if topical:
+                        lines.append("## Relevant Learnings")
+                        lines.append("*From completed tasks that share tags with this task:*")
+                        lines.append("")
+                        lines.extend(topical)
                         lines.append("")
 
             # Pending observations
