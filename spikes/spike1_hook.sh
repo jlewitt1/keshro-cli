@@ -5,7 +5,7 @@
 # This hook is installed by spike1_setup.sh and fires on every Bash tool use.
 # It captures stdin (the hook event JSON) to see exactly what fields are available.
 
-LOG="/tmp/keshro-spike1.json"
+LOG="${LOG:-/tmp/keshro-spike1.json}"
 
 # Read the full JSON from stdin
 INPUT=$(cat)
