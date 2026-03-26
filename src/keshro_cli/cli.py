@@ -998,7 +998,7 @@ Treat Keshro as the live execution record. When meaningful task progress happens
 
 During execution:
 - run `keshro task start <task-id> -p {resolved_plan_id}` as soon as work begins
-- IMPORTANT: write progress notes frequently — at minimum after reading code, after each significant change, and before completion. The user is watching these notes in real time.
+- IMPORTANT: write progress notes frequently — at minimum after reading code, after each significant change, and before completion. These notes show up live in Keshro.
   Use: `keshro task note <task-id> -p {resolved_plan_id} -n "..."` for: what you found, what you changed, what you decided, what files you touched
 - use `keshro task artifact <task-id> -p {resolved_plan_id} -l "<url>"` for PRs, commits, dashboards, issues, and runbooks
 - use `keshro task block <task-id> -p {resolved_plan_id} -r "..."` the moment a real blocker appears that prevents further progress on the task
@@ -1008,23 +1008,23 @@ During execution:
 
 When a task is done:
 - record a concise completion note. It must include `Acceptance criteria met:` and `Verification:`. Add `Next task should know:` only when it helps the next task.
-- ask the user to confirm the task is complete before running `keshro task done`
+- ask for confirmation before running `keshro task done`
 - when marking done, report your session cost if available: `keshro task done <task-id> -p {resolved_plan_id} --cost <usd_amount> --tokens <token_count> --model <model_name>` (check your session stats for cost/token info)
-- after `keshro task done`, summarize what was accomplished and ask the user if they want to continue to the next task
-- do not automatically start the next task without the user's go-ahead
+- after `keshro task done`, summarize what was accomplished and ask whether to continue to the next task
+- do not automatically start the next task without a clear go-ahead
 
-Ask the user first before:
+Ask first before:
 - `keshro task done`
 - task deletion
 - major replans that change scope, sequencing, or {connected_delivery_label or "linked delivery work"}
 
-If a keshro command fails with a connection error, retry once after 5 seconds. For any other error, tell the user what happened and continue working on the code. Do not retry more than once unless the user asks.
+If a keshro command fails with a connection error, retry once after 5 seconds. For any other error, say what happened and continue working on the code. Do not retry more than once unless asked.
 
 Rules:
 - Keep updates concise, factual, and specific.
 - Do not silently work around blockers or plan drift.
 - Do not assume Keshro is current unless you updated it.
-- If the user asks how to monitor progress, point them to `keshro status -p {resolved_plan_id} --watch` or `keshro status -p {resolved_plan_id} --tui`.
+- If asked how to monitor progress, point to `keshro status -p {resolved_plan_id} --watch` or `keshro status -p {resolved_plan_id} --tui`.
 - If you need the full plan for context, use `keshro plan view {resolved_plan_id}`.
 - If you need more detail on any task, use `keshro task view <task-id> -p {resolved_plan_id}`."""
 
@@ -1100,7 +1100,7 @@ def _build_continue_brief(
             f'- Record concise progress notes with: `keshro task note {task_id} -p {resolved_plan_id} -n "..."`',
             "- Only mark the task blocked if work cannot continue. If local sources let you proceed, note the limitation instead.",
             "- Before `keshro task done`, include `Acceptance criteria met:` and `Verification:` in the completion note.",
-            f"- The user can monitor progress with `keshro status -p {resolved_plan_id} --watch` or `keshro status -p {resolved_plan_id} --tui`.",
+            f"- You can monitor progress with `keshro status -p {resolved_plan_id} --watch` or `keshro status -p {resolved_plan_id} --tui`.",
         ]
     )
     return "\n".join(lines)
@@ -1397,7 +1397,7 @@ def _build_continue_prompt(
         "Continue from this task now.",
         f'- When starting this task, use: `keshro task start {task_id} -p {resolved_plan_id} --reason "session:{session_id}"`',
         f'- Before starting work, create a git checkpoint so changes can be rolled back if needed: `git add -A && git commit -m "keshro: checkpoint before {task_title}" --allow-empty`',
-        "- Before writing code, briefly tell the user what this task involves and which files you expect to touch.",
+        "- Before writing code, briefly say what this task involves and which files you expect to touch.",
         "- Read existing files relevant to this task to understand the current state before making changes.",
         "- If this task is blocked, do not automatically move to the next task unless the plan clearly supports parallel or out-of-order work.",
         "- If you continue execution, keep Keshro updated as you work.",
@@ -1408,10 +1408,10 @@ def _build_continue_prompt(
         continuation.append(
             "- AUTO-CONTINUE MODE: After completing each task, automatically pull the next task with "
             f"`keshro task next -p {resolved_plan_id}` and continue working. "
-            "Still create checkpoints, record notes, and mark tasks done — but do not pause to ask the user between tasks. "
+            "Still create checkpoints, record notes, and mark tasks done — but do not pause for confirmation between tasks. "
             "If a task fails (tests don't pass, code doesn't compile, validation fails), mark it blocked with "
             f'`keshro task block <task-id> -p {resolved_plan_id} -r "..."` and stop. '
-            "Tell the user what failed and why. Do not skip to the next task."
+            "Say what failed and why. Do not skip to the next task."
         )
 
     if is_parallelizable:
@@ -1419,7 +1419,7 @@ def _build_continue_prompt(
             [
                 "",
                 "PARALLEL TASK: This task is marked as parallelizable. Before starting the work itself:",
-                "1. Tell the user: 'This task can be parallelized. I will split it into sub-tasks that other agents can pick up.'",
+                "1. Say: 'This task can be parallelized. I will split it into sub-tasks that other agents can pick up.'",
                 "2. Analyze the task to identify independent units of work (e.g., separate files, independent components, distinct modules).",
                 "3. For each independent unit, create a sub-task using:",
                 f'   `keshro task plan {resolved_plan_id} --title "<sub-task title>" --description "<what to do>" -o "unassigned"`',
@@ -3240,7 +3240,7 @@ To find which plan to use, run `keshro config` first. If no plan is set, run `ke
 ## Quick flow
 If user says "plan and run this project":
 1. Run `keshro plan generate "<their description>"` — creates a plan and sets it as active
-2. Run `keshro status` — show the user what the plan looks like before starting
+2. Run `keshro status` — show what the plan looks like before starting
 3. Run `keshro continue` — gets the first task
 4. Execute the task, writing notes along the way
 5. Run `keshro task done <task-id>` when complete
@@ -3254,14 +3254,14 @@ If user says "continue" or "keep going":
 If user says "what's happening" or "status":
 1. Run `keshro status`
 
-Always run `keshro status` after completing a task so the user sees the updated plan progress.
+Always run `keshro status` after completing a task so updated progress is visible right away.
 
 ## Rules
 - Run keshro commands via Bash, never as chat messages
 - Do NOT use Keshro MCP tools — always use the CLI
-- Write progress notes frequently with `keshro task note` — the user monitors these in real time
+- Write progress notes frequently with `keshro task note` — they show up in real time
 - Always run `keshro config` first if you're unsure which plan is active
-- When showing plan info to the user, include the plan URL from `keshro config` output so they can click through to the dashboard
+- When showing plan info, include the plan URL from `keshro config` output so it is easy to click through to the dashboard
 - In Claude Code, the user may invoke this via `/keshro`; in Codex, the user will usually ask in natural language instead of using a slash command
 """
 
@@ -4137,6 +4137,92 @@ def _collect_task_runtime_context() -> dict:
     return {key: value for key, value in context.items() if value not in (None, [], "")}
 
 
+def _extract_session_id(value: str | None) -> str:
+    cleaned = _clean(value)
+    if cleaned.startswith("session:"):
+        return cleaned.split("session:", 1)[1].strip()
+    return ""
+
+
+def _infer_agent_client() -> str:
+    override = _clean(os.environ.get("KESHRO_AGENT_CLIENT"))
+    if override:
+        return override
+    if os.environ.get("CODEX_THREAD_ID") or os.environ.get("CODEX_CI"):
+        return "Codex"
+    if os.environ.get("CURSOR_TRACE_ID") or os.environ.get("CURSOR_SESSION_ID"):
+        return "Cursor"
+    if (
+        os.environ.get("CLAUDECODE")
+        or os.environ.get("CLAUDE_CODE")
+        or os.environ.get("CLAUDE_SESSION_ID")
+    ):
+        return "Claude Code"
+    return ""
+
+
+def _infer_model_name() -> str:
+    for key in (
+        "KESHRO_AGENT_MODEL",
+        "OPENAI_MODEL",
+        "OPENAI_DEFAULT_MODEL",
+        "ANTHROPIC_MODEL",
+        "CLAUDE_MODEL",
+    ):
+        value = _clean(os.environ.get(key))
+        if value:
+            return value
+    return ""
+
+
+def _post_agent_task_event(
+    plan_id: str,
+    task_id: str,
+    *,
+    event: str,
+    reason: str | None = None,
+    note: str | None = None,
+    agent_session_id: str | None = None,
+    duration_seconds: float | None = None,
+    tokens_used: int | None = None,
+    cost_usd: float | None = None,
+    model: str | None = None,
+) -> None:
+    payload: dict[str, object] = {
+        "task_id": task_id,
+        "event": event,
+    }
+    if reason:
+        payload["reason"] = reason
+    if note:
+        payload["note"] = note
+    agent_client = _infer_agent_client()
+    if agent_client:
+        payload["agent_client"] = agent_client
+    session_id = _clean(agent_session_id)
+    if session_id:
+        payload["agent_session_id"] = session_id
+    resolved_model = _clean(model) or _infer_model_name()
+    if resolved_model:
+        payload["model"] = resolved_model
+    if duration_seconds is not None:
+        payload["duration_seconds"] = duration_seconds
+    if tokens_used is not None:
+        payload["tokens_used"] = tokens_used
+    if cost_usd is not None:
+        payload["cost_usd"] = cost_usd
+
+    try:
+        with make_client(_state.api_url, _state.token) as client:
+            client.post(
+                f"/v1/agent/plans/{plan_id}/task-event",
+                json=payload,
+                timeout=10,
+            )
+    except Exception:
+        pass
+
+
 def _do_task_update(
     plan_id: str | None,
     task_id: str,
@@ -4238,6 +4324,49 @@ def _ensure_completion_note_covers_requirements(
     )
 
 
+def _infer_task_done_context(plan_id: str | None, task_id: str) -> dict[str, object]:
+    resolved_plan_id = _require_plan_context(plan_id)
+    plan = _get_plan_or_exit(resolved_plan_id)
+    events = [
+        dict(event or {})
+        for event in (plan.get("task_feedback_events") or [])
+        if isinstance(event, dict) and _clean(event.get("task_id")) == task_id
+    ]
+    events.reverse()
+
+    session_id = ""
+    started_at = ""
+    for event in events:
+        if not session_id:
+            session_id = _clean(event.get("agent_session_id"))
+            if not session_id:
+                feedback_reason = _clean(event.get("feedback_reason"))
+                if feedback_reason.startswith("session:"):
+                    session_id = feedback_reason.split("session:", 1)[1].strip()
+        after = event.get("after") if isinstance(event.get("after"), dict) else {}
+        if not started_at and _clean(after.get("status")) == "in_progress":
+            started_at = _clean(event.get("created_at"))
+        if session_id and started_at:
+            break
+
+    duration_seconds = None
+    if started_at:
+        try:
+            started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+            duration_seconds = max(
+                0.0, (datetime.now(timezone.utc) - started).total_seconds()
+            )
+        except Exception:
+            duration_seconds = None
+
+    inferred: dict[str, object] = {}
+    if session_id:
+        inferred["agent_session_id"] = session_id
+    if duration_seconds is not None:
+        inferred["duration_seconds"] = round(duration_seconds, 1)
+    return inferred
+
+
 def _do_task_start(
     plan_id: str | None,
     task_id: str,
@@ -4254,6 +4383,15 @@ def _do_task_start(
         notes=_build_appended_task_notes(plan_id, task_id, notes),
         feedback_reason=feedback_reason,
         link=link,
+    )
+    resolved_plan_id = _require_plan_context(plan_id)
+    _post_agent_task_event(
+        resolved_plan_id,
+        task_id,
+        event="start",
+        reason=feedback_reason,
+        note=notes,
+        agent_session_id=_extract_session_id(feedback_reason),
     )
 
 
@@ -4273,6 +4411,20 @@ def _do_task_done(
         feedback_reason=feedback_reason,
         link=link,
         blocked_reason="",
+    )
+    resolved_plan_id = _require_plan_context(plan_id)
+    inferred = _infer_task_done_context(resolved_plan_id, task_id)
+    inferred_model = _infer_model_name()
+    _post_agent_task_event(
+        resolved_plan_id,
+        task_id,
+        event="done",
+        note=notes,
+        agent_session_id=str(inferred.get("agent_session_id") or ""),
+        duration_seconds=float(inferred.get("duration_seconds") or 0)
+        if inferred.get("duration_seconds") is not None
+        else None,
+        model=inferred_model or None,
     )
 
 
@@ -4329,6 +4481,18 @@ def _do_task_block(
         status="blocked",
         blocked_reason=blocked_reason,
         feedback_reason=feedback_reason,
+    )
+    resolved_plan_id = _require_plan_context(plan_id)
+    inferred = _infer_task_done_context(resolved_plan_id, task_id)
+    _post_agent_task_event(
+        resolved_plan_id,
+        task_id,
+        event="block",
+        reason=blocked_reason,
+        agent_session_id=str(inferred.get("agent_session_id") or ""),
+        duration_seconds=float(inferred.get("duration_seconds") or 0)
+        if inferred.get("duration_seconds") is not None
+        else None,
     )
 
 
@@ -4717,6 +4881,9 @@ def _task_done(
     tokens: Annotated[
         Optional[int], typer.Option("--tokens", help="Total tokens used.")
     ] = None,
+    duration: Annotated[
+        Optional[float], typer.Option("--duration", help="Session duration in seconds.")
+    ] = None,
     model_name: Annotated[
         Optional[str],
         typer.Option("--model", help="Model used (e.g., claude-sonnet-4-20250514)."),
@@ -4741,19 +4908,31 @@ def _task_done(
         feedback_reason=feedback_reason,
         link=link,
     )
-    # Report cost via agent API
-    if cost is not None or tokens is not None:
+    inferred = _infer_task_done_context(resolved_plan_id, resolved_task_id)
+    # Report completion metrics via agent API
+    if (
+        cost is not None
+        or tokens is not None
+        or duration is not None
+        or model_name
+        or inferred.get("agent_session_id")
+        or inferred.get("duration_seconds") is not None
+    ):
         try:
             with make_client(_state.api_url, _state.token) as c:
                 c.post(
                     f"/v1/agent/plans/{resolved_plan_id}/task-event",
                     json={
                         "task_id": resolved_task_id,
-                        "event": "note",
+                        "event": "done",
                         "note": f"Session cost: ${cost or 0:.4f} ({tokens or 0:,} tokens, {model_name or 'unknown'})",
+                        "agent_session_id": inferred.get("agent_session_id") or "",
                         "tokens_used": tokens or 0,
                         "model": model_name or "",
                         "cost_usd": cost or 0,
+                        "duration_seconds": duration
+                        if duration is not None
+                        else inferred.get("duration_seconds") or 0,
                     },
                     timeout=10,
                 )
