@@ -1308,6 +1308,7 @@ async def _launch_single_agent(
         )
 
     async with semaphore:
+        print(f"  {YELLOW}▶{RESET} {task_title} {DIM}starting...{RESET}")
         await _mark_task_status_async(api_client, plan_id, task_id, "in_progress")
         # Report start with session ID via agent API
         try:
@@ -1551,10 +1552,10 @@ async def _run_parallel(
 
         for task in actionable:
             title = _clean(task.get("title")) or "Untitled"
-            tid = _clean(task.get("id")) or "?"
+            order = task.get("order", 0)
             deps = task.get("depends_on") or []
-            dep_str = f" (depends on: {', '.join(deps[:3])})" if deps else ""
-            print(f"  {tid[:8]}  {title}{dep_str}")
+            dep_str = f" {DIM}← {', '.join(deps[:3])}{RESET}" if deps else ""
+            print(f"  {order:2d}. {title}{dep_str}")
 
         # File conflict detection — warn if parallel tasks touch same files
         _file_conflict_warnings = []
@@ -1605,7 +1606,7 @@ async def _run_parallel(
 
         semaphore = asyncio.Semaphore(max_concurrency)
         async with make_async_client(_state.api_url, _state.token) as api_client:
-            agent_tasks = [
+            agent_coros = [
                 _launch_single_agent(
                     task,
                     plan,
@@ -1618,41 +1619,51 @@ async def _run_parallel(
                 )
                 for task in actionable
             ]
-            results = await asyncio.gather(*agent_tasks, return_exceptions=True)
+            # Stream results as each agent completes
+            results: list[AgentResult | Exception] = []
+            completed_count = 0
+            total_agents = len(agent_coros)
+            for coro in asyncio.as_completed(agent_coros):
+                try:
+                    r = await coro
+                    results.append(r)
+                    completed_count += 1
+                    status = f"{GREEN}done{RESET}" if r.exit_code == 0 else f"{RED}blocked{RESET}"
+                    dur = f"{r.duration_seconds:.0f}s" if r.duration_seconds else ""
+                    cost = f" ${r.cost_usd:.2f}" if r.cost_usd > 0 else ""
+                    print(f"  [{completed_count}/{total_agents}] {status}  {r.task_title}{DIM} {dur}{cost}{RESET}")
+                except Exception as exc:
+                    results.append(exc)
+                    completed_count += 1
+                    print(f"  [{completed_count}/{total_agents}] {RED}error{RESET}  {exc}")
 
-        succeeded = 0
-        failed = 0
-        wave_cost = 0.0
-        wave_tokens = 0
-        for r in results:
-            if isinstance(r, Exception):
-                print(f"  {RED}[error]{RESET}  Agent crashed: {r}")
-                failed += 1
-            elif r.exit_code == 0:
-                cost_label = f" ${r.cost_usd:.2f}" if r.cost_usd > 0 else ""
-                print(
-                    f"  {GREEN}[done]{RESET}   {r.task_title} ({_format_duration(r.duration_seconds)}{cost_label})"
-                )
-                succeeded += 1
-                wave_cost += r.cost_usd
-                wave_tokens += r.tokens_used
-            else:
-                reason = r.stderr[:100] or r.stdout[:100] or "unknown error"
-                print(
-                    f"  {RED}[failed]{RESET} {r.task_title} ({_format_duration(r.duration_seconds)}) — {reason}"
-                )
-                failed += 1
-                wave_cost += r.cost_usd
-                wave_tokens += r.tokens_used
+        succeeded = sum(1 for r in results if not isinstance(r, Exception) and r.exit_code == 0)
+        failed = len(results) - succeeded
+        wave_cost = sum(r.cost_usd for r in results if not isinstance(r, Exception))
+        wave_tokens = sum(r.tokens_used for r in results if not isinstance(r, Exception))
 
-        cost_summary = (
-            f"  cost: ${wave_cost:.2f} ({wave_tokens:,} tokens)"
-            if wave_cost > 0
-            else ""
-        )
-        print(
-            f"\nWave {wave} complete: {GREEN}{succeeded} succeeded{RESET}, {RED}{failed} failed{RESET}{cost_summary}"
-        )
+        cost_summary = f"  cost: ${wave_cost:.2f} ({wave_tokens:,} tokens)" if wave_cost > 0 else ""
+        print(f"\nWave {wave} complete: {GREEN}{succeeded} succeeded{RESET}, {RED}{failed} failed{RESET}{cost_summary}")
+
+        # Check for blocked tasks and tell the user exactly what to do
+        with make_client(_state.api_url, _state.token) as refresh_client:
+            refreshed = refresh_client.get(f"/v1/plans/{resolved_plan_id}").json()
+        refreshed_steps = refreshed.get("plan_steps") or []
+        blocked_steps = [s for s in refreshed_steps if _clean(s.get("status")).lower() == "blocked"]
+        remaining_steps = [s for s in refreshed_steps if _clean(s.get("status")).lower() == "todo"]
+
+        if blocked_steps:
+            print(f"\n{RED}{'─' * 50}{RESET}")
+            print(f"{RED}{len(blocked_steps)} task(s) blocked — needs your attention:{RESET}\n")
+            for s in blocked_steps:
+                tid = _clean(s.get("id")) or "?"
+                title = _clean(s.get("title")) or "Untitled"
+                reason = _clean(s.get("blocked_reason")) or "no reason given"
+                print(f"  {RED}✗{RESET} {title}")
+                print(f"    {DIM}Reason: {reason}{RESET}")
+                print(f"    {DIM}Unblock: keshro task unblock {tid} -p {resolved_plan_id}{RESET}")
+            print(f"\n{DIM}After unblocking, run: keshro continue -p {resolved_plan_id}{RESET}")
+            print(f"{RED}{'─' * 50}{RESET}")
 
         if not run_all:
             if failed == 0 and succeeded > 0:
@@ -3194,8 +3205,10 @@ def _run_status(plan_id: str | None, watch: bool = False, tui: bool = False) -> 
             )
             raise typer.Exit(1)
 
-        api_url = _state.api_url
-        token = _state.token
+        from .client import get_api_url, get_token
+
+        api_url = get_api_url(_state.api_url)
+        token = get_token(_state.token)
         run_tui(api_url=api_url, token=token, plan_id=resolved_plan_id)
         return
 

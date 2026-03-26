@@ -235,7 +235,14 @@ class KeshroStatusApp(App):
 
     async def _sse_listen(self) -> None:
         """Connect to SSE stream; on any event, re-fetch plan data."""
-        from httpx_sse import aconnect_sse
+        try:
+            from httpx_sse import aconnect_sse
+        except ImportError:
+            self._sse_connected = False
+            self._update_live_indicator(False)
+            self._start_polling_fallback()
+            self.notify("Live updates unavailable — install httpx-sse for real-time: pip install httpx-sse", severity="warning", timeout=8)
+            return
 
         headers = {
             "Authorization": f"Bearer {self.token}",
