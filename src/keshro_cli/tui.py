@@ -74,6 +74,7 @@ class ActiveAgents(Static):
     """Shows currently active tasks (in_progress status)."""
 
     plan_data: reactive[dict | None] = reactive(None)
+    show_full: bool = False
 
     def render(self) -> str:
         if not self.plan_data:
@@ -84,12 +85,41 @@ class ActiveAgents(Static):
         if not active:
             return "[dim]No active agents[/dim]"
 
+        events = self.plan_data.get("task_feedback_events", [])
+
         lines = ["[bold]ACTIVE TASKS[/bold]", ""]
-        for step in active:
+        for step in sorted(active, key=lambda s: s.get("order", 0)):
             title = step.get("title", "Untitled")
-            owner = step.get("owner", "")
-            owner_label = f" [dim]({owner})[/dim]" if owner else ""
-            lines.append(f"  [yellow]▶[/yellow] {title}{owner_label}")
+            step_id = step.get("id", "")
+            session = step.get("agent_session_id", "")
+            session_label = f" [dim]{session}[/dim]" if session else ""
+            elapsed = ""
+            updated = step.get("last_updated_at", "")
+            if updated:
+                try:
+                    from datetime import datetime, timezone
+                    t = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+                    delta = datetime.now(timezone.utc) - t
+                    mins = int(delta.total_seconds() // 60)
+                    secs = int(delta.total_seconds() % 60)
+                    elapsed = f" [dim]{mins}m {secs}s[/dim]" if mins > 0 else f" [dim]{secs}s[/dim]"
+                except Exception:
+                    pass
+            lines.append(f"  [yellow]▶[/yellow] {title}{session_label}{elapsed}")
+
+            # Show latest notes for this task (what the agent is doing)
+            notes = (step.get("notes") or "").strip()
+            if notes:
+                note_lines = [l.strip() for l in notes.split("\n") if l.strip()]
+                if self.show_full:
+                    for nl in note_lines:
+                        lines.append(f"    [dim]{nl}[/dim]")
+                else:
+                    for nl in note_lines[-3:]:
+                        display = nl[:80] + "..." if len(nl) > 80 else nl
+                        lines.append(f"    [dim]{display}[/dim]")
+                    if len(note_lines) > 3:
+                        lines.append(f"    [dim]... {len(note_lines) - 3} more — press L for full logs[/dim]")
 
         return "\n".join(lines)
 
@@ -203,7 +233,10 @@ class KeshroStatusApp(App):
     BINDINGS = [
         ("q", "quit", "Quit"),
         ("r", "refresh", "Refresh"),
+        ("l", "toggle_logs", "Logs"),
     ]
+
+    _show_full_logs: bool = False
 
     def __init__(self, api_url: str, token: str, plan_id: str):
         super().__init__()
@@ -273,7 +306,7 @@ class KeshroStatusApp(App):
 
     def _start_polling_fallback(self) -> None:
         """Fall back to 10s polling if SSE is unavailable."""
-        self._poll_timer = self.set_interval(10.0, self._fetch_and_update)
+        self._poll_timer = self.set_interval(3.0, self._fetch_and_update)
 
     def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
         """If SSE worker dies, start polling fallback."""
@@ -317,6 +350,12 @@ class KeshroStatusApp(App):
 
     def action_refresh(self) -> None:
         self._fetch_and_update()
+
+    def action_toggle_logs(self) -> None:
+        self._show_full_logs = not self._show_full_logs
+        agents_widget = self.query_one("#agents", ActiveAgents)
+        agents_widget.show_full = self._show_full_logs
+        agents_widget.refresh()  # Force re-render
 
 
 def run_tui(api_url: str, token: str, plan_id: str) -> None:

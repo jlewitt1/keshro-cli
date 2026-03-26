@@ -636,7 +636,7 @@ def test_setup_claude_creates_slash_command(monkeypatch, tmp_path, capsys):
     assert target.exists()
     content = target.read_text()
     assert "keshro continue" in content
-    assert "Do not use Keshro MCP tools" in content
+    assert "Do NOT use Keshro MCP tools" in content
 
 
 def test_setup_claude_overwrites_existing(monkeypatch, tmp_path, capsys):
@@ -1617,7 +1617,7 @@ def test_auth_login_with_token_prints_human_text_by_default(monkeypatch, capsys)
 
     cli.main(["login", "ksh_pat_test"])
     out = capsys.readouterr().out.strip()
-    assert out == "Successfully logged in to Keshro as cli@example.com."
+    assert "Successfully logged in to Keshro as cli@example.com." in out
     assert saved["token"] == "ksh_pat_test"
 
 

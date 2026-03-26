@@ -57,6 +57,17 @@ def cmd_auth_login(
     else:
         print(f"Successfully logged in to Keshro as {body['user']['email']}.")
 
+    # Auto-install agent integrations (Claude Code, Codex, Cursor)
+    try:
+        from .cli import _install_agent_integrations
+
+        installed = _install_agent_integrations(silent=True)
+        if installed and not json_output:
+            for target in installed:
+                print(f"  ✓ {target}")
+    except Exception:
+        pass  # fail silently
+
 
 def cmd_auth_logout(json_output: bool = False):
     clear_auth()
