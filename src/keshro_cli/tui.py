@@ -85,12 +85,9 @@ class ActiveAgents(Static):
         if not active:
             return "[dim]No active agents[/dim]"
 
-        events = self.plan_data.get("task_feedback_events", [])
-
         lines = ["[bold]ACTIVE TASKS[/bold]", ""]
         for step in sorted(active, key=lambda s: s.get("order", 0)):
             title = step.get("title", "Untitled")
-            step_id = step.get("id", "")
             session = step.get("agent_session_id", "")
             session_label = f" [dim]{session}[/dim]" if session else ""
             elapsed = ""

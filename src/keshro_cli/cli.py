@@ -1665,23 +1665,23 @@ async def _run_parallel(
                 import time as _poll_time
                 _start_time = _poll_time.monotonic()
                 _last_heartbeat = 0  # seconds since last heartbeat message
-                poll_client = make_client(_state.api_url, _state.token)
                 try:
                     while not _poller_done:
                         await asyncio.sleep(5)
                         if _poller_done:
                             break
                         elapsed = _poll_time.monotonic() - _start_time
-                        # Heartbeat every 30s if no new notes have appeared
-                        if elapsed - _last_heartbeat >= 30:
-                            mins = int(elapsed // 60)
-                            secs = int(elapsed % 60)
-                            time_str = f"{mins}m {secs}s" if mins > 0 else f"{secs}s"
-                            print(f"  {DIM}⋯ agents still working ({time_str} elapsed){RESET}")
-                            _last_heartbeat = elapsed
                         try:
-                            resp = poll_client.get(f"/v1/plans/{resolved_plan_id}")
+                            async with make_async_client(_state.api_url, _state.token) as poll_client:
+                                resp = await poll_client.get(f"/v1/plans/{resolved_plan_id}")
                             if not resp.is_success:
+                                # Heartbeat even if poll fails
+                                if elapsed - _last_heartbeat >= 30:
+                                    mins = int(elapsed // 60)
+                                    secs = int(elapsed % 60)
+                                    time_str = f"{mins}m {secs}s" if mins > 0 else f"{secs}s"
+                                    print(f"  {DIM}⋯ agents still working ({time_str} elapsed){RESET}")
+                                    _last_heartbeat = elapsed
                                 continue
                             fresh = resp.json()
                             for s in fresh.get("plan_steps", []):
@@ -1701,10 +1701,17 @@ async def _run_parallel(
                                         print(f"  {DIM}[{title}]{RESET} {nl}")
                                     _last_heartbeat = _poll_time.monotonic() - _start_time
                                     _seen_notes[sid] = len(note_lines)
+                            # Heartbeat after notes — only if no new notes appeared this cycle
+                            if elapsed - _last_heartbeat >= 30:
+                                mins = int(elapsed // 60)
+                                secs = int(elapsed % 60)
+                                time_str = f"{mins}m {secs}s" if mins > 0 else f"{secs}s"
+                                print(f"  {DIM}⋯ agents still working ({time_str} elapsed){RESET}")
+                                _last_heartbeat = elapsed
                         except Exception:
                             pass
-                finally:
-                    poll_client.close()
+                except asyncio.CancelledError:
+                    pass
 
             poller_task = asyncio.create_task(_poll_progress())
 
@@ -3028,12 +3035,19 @@ def _setup_claude():
 def _setup_codex():
     """Install Keshro instructions in AGENTS.md for Codex"""
     try:
-        installed = _install_agent_integrations(silent=False)
-        codex = [i for i in installed if "Codex" in i]
-        if codex:
-            print(f"Installed Keshro instructions: {codex[0]}")
+        cwd = Path.cwd()
+        agents_file = cwd / "AGENTS.md"
+        marker = "<!-- keshro-agent-instructions -->"
+        keshro_block = f"{marker}\n# Keshro Integration\n\n{KESHRO_SLASH_COMMAND}\n{marker}"
+        if agents_file.exists():
+            content = agents_file.read_text()
+            if marker in content:
+                print("AGENTS.md already has Keshro instructions.")
+                return
+            agents_file.write_text(content.rstrip() + "\n\n" + keshro_block + "\n")
         else:
-            print("AGENTS.md already has Keshro instructions.")
+            agents_file.write_text(keshro_block + "\n")
+        print(f"Installed Keshro instructions: {agents_file}")
     except Exception as exc:
         print(f"{RED}Failed: {exc}{RESET}", file=sys.stderr)
         raise typer.Exit(1) from exc
@@ -3043,12 +3057,19 @@ def _setup_codex():
 def _setup_cursor():
     """Install Keshro instructions in .cursorrules for Cursor"""
     try:
-        installed = _install_agent_integrations(silent=False)
-        cursor = [i for i in installed if "Cursor" in i]
-        if cursor:
-            print(f"Installed Keshro instructions: {cursor[0]}")
+        cwd = Path.cwd()
+        cursor_file = cwd / ".cursorrules"
+        marker = "# keshro-agent-instructions"
+        keshro_block = f"{marker}\n{KESHRO_SLASH_COMMAND}\n# end-keshro"
+        if cursor_file.exists():
+            content = cursor_file.read_text()
+            if marker in content:
+                print(".cursorrules already has Keshro instructions.")
+                return
+            cursor_file.write_text(content.rstrip() + "\n\n" + keshro_block + "\n")
         else:
-            print(".cursorrules already has Keshro instructions.")
+            cursor_file.write_text(keshro_block + "\n")
+        print(f"Installed Keshro instructions: {cursor_file}")
     except Exception as exc:
         print(f"{RED}Failed: {exc}{RESET}", file=sys.stderr)
         raise typer.Exit(1) from exc
