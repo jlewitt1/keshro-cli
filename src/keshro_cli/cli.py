@@ -5080,10 +5080,14 @@ def _watch_start(
         bool,
         typer.Option("--foreground", "-f", help="Run in foreground instead of backgrounding."),
     ] = False,
+    no_git: Annotated[
+        bool,
+        typer.Option("--no-git", help="Disable git watcher. Rely on Claude Code hooks only."),
+    ] = False,
 ):
     """Start the Keshro background daemon.
 
-    Watches git activity and automatically tracks task progress.
+    Monitors your coding session via Claude Code hooks and optionally git.
     Auto-detects the plan from saved config or .keshro file.
     Runs in the background by default. Use --foreground to keep in terminal.
     """
@@ -5124,6 +5128,8 @@ def _watch_start(
             cmd.extend(["--plan-id", plan_id])
         if poll_interval != 1.0:
             cmd.extend(["--poll-interval", str(poll_interval)])
+        if no_git:
+            cmd.append("--no-git")
 
         # Redirect stdout/stderr to log file
         from .daemon import LOG_FILE
@@ -5160,6 +5166,7 @@ def _watch_start(
         poll_interval=poll_interval,
         api_url=_state.api_url or None,
         token=_state.token,
+        enable_git_watcher=not no_git,
     )
     daemon.state.repo_root = repo_root
     daemon.setup_repo()
@@ -5235,9 +5242,15 @@ def _watch_status():
     # Stats
     events = status.get("events_processed", 0)
     completed = status.get("tasks_completed", 0)
+    hook_events = status.get("hook_events_received", 0)
+    files_touched = status.get("files_touched_current_task", 0)
     queue = status.get("queue_size", 0)
     print(f"  Events processed:  {events}")
     print(f"  Tasks completed:   {completed}")
+    if hook_events > 0:
+        print(f"  Hook events:       {hook_events}")
+    if files_touched > 0:
+        print(f"  Files (this task): {files_touched}")
     if queue > 0:
         print(f"  Queued events:     {YELLOW}{queue}{RESET}")
 
@@ -5257,6 +5270,86 @@ def _watch_status():
 
     print()
     print(f"  Log: {LOG_FILE}")
+
+
+@watch_app.command("logs")
+def _watch_logs(
+    follow: Annotated[
+        bool,
+        typer.Option("--follow", "-f", help="Follow the log output (like tail -f)."),
+    ] = True,
+    lines: Annotated[
+        int,
+        typer.Option("--lines", "-n", help="Number of lines to show."),
+    ] = 50,
+):
+    """Show daemon logs."""
+    from .daemon import LOG_FILE
+
+    if not LOG_FILE.exists():
+        print(f"{DIM}No daemon logs found at {LOG_FILE}{RESET}")
+        raise typer.Exit(0)
+
+    if follow:
+        os.execvp("tail", ["tail", "-f", "-n", str(lines), str(LOG_FILE)])
+    else:
+        import subprocess as _sp
+        result = _sp.run(["tail", "-n", str(lines), str(LOG_FILE)], text=True, capture_output=True)
+        print(result.stdout, end="")
+
+
+@watch_app.command("install")
+def _watch_install():
+    """Install auto-restart so the daemon survives crashes and reboots (macOS only)."""
+    from .launchd import install_launchd, is_macos
+
+    if not is_macos():
+        print(f"{YELLOW}Auto-restart is currently macOS only (launchd).{RESET}")
+        print(f"Linux systemd support coming soon.")
+        raise typer.Exit(1)
+
+    _ensure_authenticated()
+
+    repo_root = Path.cwd()
+    try:
+        import subprocess as _sp
+        result = _sp.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            repo_root = Path(result.stdout.strip())
+    except Exception:
+        pass
+
+    if install_launchd(repo_root):
+        print(f"{GREEN}Auto-restart installed{RESET}")
+        print(f"  The daemon will restart automatically on crash or login.")
+        print(f"  Repo: {repo_root}")
+        print(f"  Remove with: keshro watch uninstall")
+    else:
+        print(f"{RED}Failed to install auto-restart.{RESET}")
+        raise typer.Exit(1)
+
+
+@watch_app.command("uninstall")
+def _watch_uninstall():
+    """Remove auto-restart (uninstall launchd agent)."""
+    from .launchd import uninstall_launchd, is_macos
+
+    if not is_macos():
+        raise typer.Exit(0)
+
+    repo_root = Path.cwd()
+    try:
+        import subprocess as _sp
+        result = _sp.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            repo_root = Path(result.stdout.strip())
+    except Exception:
+        pass
+
+    if uninstall_launchd(repo_root):
+        print(f"{GREEN}Auto-restart removed.{RESET}")
+    else:
+        print(f"{DIM}No auto-restart configured for this repo.{RESET}")
 
 
 if __name__ == "__main__":
