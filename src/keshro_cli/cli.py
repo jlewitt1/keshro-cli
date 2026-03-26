@@ -2933,15 +2933,21 @@ To find which plan to use, run `keshro config` first. If no plan is set, run `ke
 ## Quick flow
 If user says "plan and run this project":
 1. Run `keshro plan generate "<their description>"` — creates a plan and sets it as active
-2. Run `keshro continue` — gets the first task (no plan ID needed)
-3. Execute the task, writing notes along the way
-4. Mark done, then run `keshro continue` again for the next task
+2. Run `keshro status` — show the user what the plan looks like before starting
+3. Run `keshro continue` — gets the first task
+4. Execute the task, writing notes along the way
+5. Run `keshro task done <task-id>` when complete
+6. Run `keshro status` — show updated progress after each task
+7. Run `keshro continue` again for the next task
 
 If user says "continue" or "keep going":
-1. Run `keshro continue` — picks up where you left off
+1. Run `keshro status` first — show where things stand
+2. Run `keshro continue` — picks up where you left off
 
 If user says "what's happening" or "status":
 1. Run `keshro status`
+
+Always run `keshro status` after completing a task so the user sees the updated plan progress.
 
 ## Rules
 - Run keshro commands via Bash, never as chat messages
