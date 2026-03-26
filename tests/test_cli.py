@@ -1054,14 +1054,18 @@ def test_current_plan_id_prefers_cached_default_before_repo_resolution(monkeypat
     )
 
     def _fail_resolve(*args, **kwargs):
-        raise AssertionError("repo resolution should not run when default plan is cached")
+        raise AssertionError(
+            "repo resolution should not run when default plan is cached"
+        )
 
     monkeypatch.setattr("keshro_cli.cli._resolve_repo_linked_plan", _fail_resolve)
 
     assert cli._current_plan_id(None) == "plan-cached"
 
 
-def test_install_codex_integration_replaces_existing_managed_block(monkeypatch, tmp_path):
+def test_install_codex_integration_replaces_existing_managed_block(
+    monkeypatch, tmp_path
+):
     monkeypatch.setattr("keshro_cli.cli.CODEX_HOME_DIR", tmp_path)
     target = tmp_path / "AGENTS.md"
     old_block = (
@@ -1084,7 +1088,10 @@ def test_install_codex_integration_replaces_existing_managed_block(monkeypatch, 
 def test_setup_all_reports_already_present_integrations(monkeypatch, capsys):
     monkeypatch.setattr(
         "keshro_cli.cli._install_agent_integrations",
-        lambda silent=True: ([], ["Claude Code: /tmp/keshro.md", "Codex: /tmp/codex.md"]),
+        lambda silent=True: (
+            [],
+            ["Claude Code: /tmp/keshro.md", "Codex: /tmp/codex.md"],
+        ),
     )
 
     cli.main(["setup"])

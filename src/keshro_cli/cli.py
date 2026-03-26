@@ -4070,6 +4070,73 @@ def _do_task_add(
         _print_task_detail(plan, title_hint=title)
 
 
+def _git_branch_for_runtime(repo_root: Path | None) -> str | None:
+    if repo_root is None:
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=str(repo_root),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        branch = _clean(result.stdout)
+        return branch or None
+    except Exception:
+        return None
+
+
+def _python_runtime_details() -> tuple[str | None, str | None]:
+    python_exec = shutil.which("python") or shutil.which("python3")
+    if not python_exec:
+        return None, None
+    try:
+        result = subprocess.run(
+            [python_exec, "--version"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        version = _clean(result.stdout) or _clean(result.stderr) or None
+    except Exception:
+        version = None
+    return python_exec, version
+
+
+def _collect_task_runtime_context() -> dict:
+    cwd = str(Path.cwd().resolve())
+    repo_root = _discover_repo_root(cwd)
+    python_exec, python_version = _python_runtime_details()
+    available_tools: list[str] = []
+    missing_tools: list[str] = []
+    for tool in ["python", "python3", "uv", "pytest", "git"]:
+        if shutil.which(tool):
+            available_tools.append(tool)
+        else:
+            missing_tools.append(tool)
+
+    virtual_env = _clean(os.environ.get("VIRTUAL_ENV")) or None
+    if not virtual_env and repo_root:
+        candidate = repo_root / ".venv"
+        if candidate.exists():
+            virtual_env = str(candidate)
+
+    context = {
+        "cwd": cwd,
+        "repo_root": str(repo_root) if repo_root else None,
+        "git_branch": _git_branch_for_runtime(repo_root),
+        "git_remote_url": _discover_git_remote_url(repo_root),
+        "python_executable": python_exec,
+        "python_version": python_version,
+        "virtual_env": virtual_env,
+        "available_tools": available_tools,
+        "missing_tools": missing_tools,
+        "os": f"{sys.platform} ({os.name})",
+    }
+    return {key: value for key, value in context.items() if value not in (None, [], "")}
+
+
 def _do_task_update(
     plan_id: str | None,
     task_id: str,
@@ -4099,6 +4166,7 @@ def _do_task_update(
             payload[key] = value
     if link is not None:
         payload["artifact_links"] = link
+    payload["runtime_context"] = _collect_task_runtime_context()
     with make_client(_state.api_url, _state.token) as client:
         res = client.patch(
             f"/v1/plans/{plan_id}/tasks/{task_id}",
