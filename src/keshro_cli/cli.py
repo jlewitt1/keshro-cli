@@ -2614,6 +2614,10 @@ def _create_project(
         )
 
     # Resolve description from file if provided
+    if description and description_file:
+        raise SystemExit(
+            "Cannot use both --description and --description-file. Provide only one."
+        )
     resolved_description = _clean(description)
     if description_file:
         desc_path = Path(description_file).resolve()
@@ -2953,6 +2957,11 @@ def _create_plan_inner(
                 question_id = _clean(question.get("id"))
                 value = _clean(parsed.get(_normalize_prompt_key(question_id)))
                 if value and value.lower() != "unknown":
+                    # Normalize to canonical option value if question has structured answers
+                    options = list(question.get("answers") or [])
+                    if options:
+                        option_field = {"options": [_clean(o.get("value")) for o in options if _clean(o.get("value"))]}
+                        value = _match_select_option(option_field, value)
                     clarifier_answers[question_id] = value
                     continue
                 options = list(question.get("answers") or [])
@@ -2980,6 +2989,7 @@ def _create_plan_inner(
             "title": None,
             "discovered_context": truncated_context,
             "answers": clarifier_answers if clarifier_answers else None,
+            "org_id": _clean(org_id) or None,
         }
 
     _render_plan_prefill_handoff(payload, work_dir=resolved_work_dir)

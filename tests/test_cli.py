@@ -640,7 +640,7 @@ def test_create_plan_with_clarifiers(fake_client, monkeypatch, capsys):
     encoded = match.group(1)
     padded = encoded + "=" * ((4 - len(encoded) % 4) % 4)
     decoded = json.loads(base64.urlsafe_b64decode(padded.encode()).decode())
-    assert decoded["answers"]["auth_method"] == "JWT tokens"
+    assert decoded["answers"]["auth_method"] == "jwt"
     assert call_count["count"] == 2
 
 
@@ -683,6 +683,16 @@ def test_create_rejects_both_path_and_description(fake_client, monkeypatch):
 def test_create_rejects_no_path_or_description(fake_client, monkeypatch):
     monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "1")
     exit_code = cli.main(["create"])
+    assert exit_code == 1
+
+
+def test_create_rejects_description_and_description_file(fake_client, monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "1")
+    desc_file = tmp_path / "spec.txt"
+    desc_file.write_text("some spec")
+    exit_code = cli.main(
+        ["create", "--description", "inline desc", "--description-file", str(desc_file)]
+    )
     assert exit_code == 1
 
 
