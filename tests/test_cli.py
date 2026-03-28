@@ -253,6 +253,15 @@ class _FakeClient:
                     ],
                 }
             )
+        if path == "/v1/plans/discovery-prompt":
+            return _FakeResponse(
+                {
+                    "prompt": "## Project Info\n- Language:\n- Framework:",
+                    "discovery_commands": ["python --version"],
+                }
+            )
+        if path == "/v1/plans/describe/preview":
+            return _FakeResponse({"questions": []})
         if path == "/v1/migrations/clarifiers":
             return _FakeResponse({"questions": []})
         if path == "/v1/migrations":
@@ -527,6 +536,159 @@ def test_create_migration_from_path_key_requires_claude_code(fake_client, monkey
     monkeypatch.delenv("CLAUDE_CODE_ENTRYPOINT", raising=False)
     monkeypatch.setattr("shutil.which", lambda name: None)
     exit_code = cli.main(["create", "--path", "aws-batch-to-airflow"])
+    assert exit_code == 1
+
+
+def test_create_plan_from_description(fake_client, monkeypatch, capsys):
+    monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "1")
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: "/usr/local/bin/claude" if name == "claude" else None,
+    )
+
+    def _fake_run(cmd, capture_output, text, cwd, check):
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout="## Project Info\n- Language: Python\n- Framework: FastAPI",
+            stderr="",
+        )
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr("webbrowser.open", lambda url: None)
+    cli.main(["create", "--description", "Build a REST API for user management"])
+
+    out = capsys.readouterr().out
+    assert "Prepared plan draft for" in out
+
+    discovery_call = next(
+        call for call in fake_client.calls if call[1] == "/v1/plans/discovery-prompt"
+    )
+    assert discovery_call[2]["description"] == "Build a REST API for user management"
+
+    preview_call = next(
+        call for call in fake_client.calls if call[1] == "/v1/plans/describe/preview"
+    )
+    assert preview_call[2]["description"] == "Build a REST API for user management"
+    assert preview_call[2]["discovered_context"]
+
+
+def test_create_plan_with_clarifiers(fake_client, monkeypatch, capsys):
+    monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "1")
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: "/usr/local/bin/claude" if name == "claude" else None,
+    )
+
+    call_count = {"count": 0}
+
+    def _fake_run(cmd, capture_output, text, cwd, check):
+        call_count["count"] += 1
+        if call_count["count"] == 1:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout="## Project Info\n- Language: Python\n- Framework: FastAPI",
+                stderr="",
+            )
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout="- auth_method: JWT tokens",
+            stderr="",
+        )
+
+    def _post(path, json=None):
+        fake_client.calls.append(("POST", path, json))
+        if path == "/v1/plans/describe/preview":
+            return _FakeResponse(
+                {
+                    "questions": [
+                        {
+                            "id": "auth_method",
+                            "question": "What authentication method will you use?",
+                            "answers": [
+                                {"value": "jwt", "answer_title": "JWT tokens"},
+                                {
+                                    "value": "session",
+                                    "answer_title": "Session cookies",
+                                    "recommended": True,
+                                },
+                            ],
+                        }
+                    ]
+                }
+            )
+        return _FakeResponse(
+            {
+                "prompt": "## Project Info\n- Language:\n- Framework:",
+                "discovery_commands": [],
+            }
+        )
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr(fake_client, "post", _post)
+
+    opened_urls = []
+    monkeypatch.setattr("webbrowser.open", lambda url: opened_urls.append(url))
+
+    cli.main(["create", "--description", "Build a REST API"])
+
+    assert len(opened_urls) == 1
+    match = re.search(r"draft=([A-Za-z0-9_-]+)", opened_urls[0])
+    assert match
+    encoded = match.group(1)
+    padded = encoded + "=" * ((4 - len(encoded) % 4) % 4)
+    decoded = json.loads(base64.urlsafe_b64decode(padded.encode()).decode())
+    assert decoded["answers"]["auth_method"] == "JWT tokens"
+    assert call_count["count"] == 2
+
+
+def test_create_plan_from_description_file(fake_client, monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "1")
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: "/usr/local/bin/claude" if name == "claude" else None,
+    )
+
+    desc_file = tmp_path / "spec.txt"
+    desc_file.write_text("Build a REST API for user management")
+
+    def _fake_run(cmd, capture_output, text, cwd, check):
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout="- Language: Python", stderr=""
+        )
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr("webbrowser.open", lambda url: None)
+    cli.main(["create", "--description-file", str(desc_file)])
+
+    out = capsys.readouterr().out
+    assert "Prepared plan draft for" in out
+
+    discovery_call = next(
+        call for call in fake_client.calls if call[1] == "/v1/plans/discovery-prompt"
+    )
+    assert discovery_call[2]["description"] == "Build a REST API for user management"
+
+
+def test_create_rejects_both_path_and_description(fake_client, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "1")
+    exit_code = cli.main(
+        ["create", "--path", "aws-batch-to-airflow", "--description", "some project"]
+    )
+    assert exit_code == 1
+
+
+def test_create_rejects_no_path_or_description(fake_client, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "1")
+    exit_code = cli.main(["create"])
+    assert exit_code == 1
+
+
+def test_create_rejects_missing_description_file(fake_client, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "1")
+    exit_code = cli.main(["create", "--description-file", "/nonexistent/spec.txt"])
     assert exit_code == 1
 
 
