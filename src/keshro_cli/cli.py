@@ -2547,14 +2547,28 @@ def _logout_alias():
 
 
 @app.command("create")
-def _create_migration(
+def _create_project(
     path: Annotated[
-        str,
+        Optional[str],
         typer.Option(
             "--path",
             help="Migration path key, for example aws-batch-to-airflow.",
         ),
-    ],
+    ] = None,
+    description: Annotated[
+        Optional[str],
+        typer.Option(
+            "--description",
+            help="Project description for plan mode. Use instead of --path for non-migration projects.",
+        ),
+    ] = None,
+    description_file: Annotated[
+        Optional[str],
+        typer.Option(
+            "--description-file",
+            help="Path to a file containing the project description (PRD, spec, etc.).",
+        ),
+    ] = None,
     field: Annotated[
         Optional[list[str]],
         typer.Option(
@@ -2592,15 +2606,37 @@ def _create_migration(
         ),
     ] = None,
 ):
-    """Create a migration project from a stable path key. Requires a coding agent that can run shell commands."""
+    """Create a project with codebase discovery. Use --path for migrations or --description for general projects."""
     if sys.stdout.isatty():
         raise SystemExit(
             "This command needs to run inside a coding agent so it can scan your codebase.\n"
             "Run it from your agent's terminal, or use the prompt copy/paste path in Keshro instead."
         )
+
+    # Resolve description from file if provided
+    resolved_description = _clean(description)
+    if description_file:
+        desc_path = Path(description_file).resolve()
+        if not desc_path.is_file():
+            raise SystemExit(f"Description file not found: {description_file}")
+        resolved_description = desc_path.read_text(encoding="utf-8").strip()
+        if not resolved_description:
+            raise SystemExit(f"Description file is empty: {description_file}")
+
+    # Validate: exactly one mode
+    has_path = bool(_clean(path))
+    has_description = bool(resolved_description)
+    if not has_path and not has_description:
+        raise SystemExit(
+            "Provide either --path (for migrations) or --description / --description-file (for general projects)."
+        )
+    if has_path and has_description:
+        raise SystemExit(
+            "Cannot use both --path and --description. Use --path for migrations, --description for general projects."
+        )
+
     import tempfile
 
-    answers = _parse_field_assignments(field)
     clone_dir = None
     if repo_url and not work_dir:
         clone_dir = tempfile.mkdtemp(prefix="keshro-clone-")
@@ -2619,15 +2655,24 @@ def _create_migration(
         work_dir = clone_dir
 
     try:
-        return _create_migration_inner(
-            path,
-            answers,
-            context,
-            github_url,
-            resource_url,
-            org_id,
-            work_dir,
-        )
+        if has_path:
+            answers = _parse_field_assignments(field)
+            return _create_migration_inner(
+                path,
+                answers,
+                context,
+                github_url,
+                resource_url,
+                org_id,
+                work_dir,
+            )
+        else:
+            return _create_plan_inner(
+                resolved_description,
+                context,
+                org_id,
+                work_dir,
+            )
     finally:
         if clone_dir:
             import shutil as _shutil
@@ -2732,6 +2777,212 @@ def _create_migration_inner(
         elif not _state.json:
             print("No additional follow-up questions needed.")
     _render_prefill_handoff(payload, template, work_dir=resolved_work_dir)
+
+
+def _build_plan_discovery_prompt(backend_prompt: str, discovery_commands: list[str]) -> str:
+    """Wrap a backend-generated discovery prompt with agent instructions."""
+    parts = [
+        "You are helping create a Keshro execution plan for a project.",
+        "Inspect the current workspace and gather the project-specific facts below.",
+        "Return only the completed markdown template with the same headings and field labels.",
+        "Do not wrap the answer in code fences. Do not add commentary before or after the template.",
+        "Use `Unknown` for values you cannot verify from the repository, configs, or local docs.",
+    ]
+    if discovery_commands:
+        parts.append("")
+        parts.append(
+            "Try running these commands to discover relevant context. "
+            "These are best-effort — if a command fails (tool not installed, no access, permission denied, etc.), "
+            "note which command failed and why in a single line, then continue with what you can find from files and configs. "
+            "Do not stop or error out if a discovery command fails."
+        )
+        for cmd in discovery_commands:
+            parts.append(f"  $ {cmd}")
+    parts.append("")
+    parts.append(backend_prompt)
+    return "\n".join(parts)
+
+
+def _build_plan_clarifier_prompt(
+    description: str, discovered_context: str, questions: list[dict]
+) -> str:
+    """Build a clarifier prompt for generic projects (not migrations)."""
+    lines = [
+        "You are helping finalize a Keshro project plan.",
+        "Answer the follow-up questions below using the current workspace and the already-gathered project context.",
+        "Prefer concrete answers grounded in the repository, configs, docs, and runtime clues available locally.",
+        "If something still cannot be verified, use the recommended option when one exists; otherwise write `Unknown`.",
+        "Return only bullet lines in the exact format `- <question id>: <answer>`.",
+        "",
+        "Project description:",
+        description,
+    ]
+    if discovered_context:
+        lines.extend(["", "Discovered context:", discovered_context])
+    lines.extend(["", "Follow-up questions:"])
+    for question in questions:
+        prompt_id = _clean(question.get("id"))
+        prompt_text = _clean(question.get("question"))
+        why = _clean(question.get("why_this_matters"))
+        placeholder = _clean(question.get("placeholder"))
+        lines.append(f"- {prompt_id}: {prompt_text}")
+        if why:
+            lines.append(f"  Why it matters: {why}")
+        options = list(question.get("answers") or [])
+        if options:
+            lines.append("  Options:")
+            for option in options:
+                title = _clean(option.get("answer_title")) or _clean(option.get("value"))
+                value = _clean(option.get("value"))
+                suffix = " [recommended]" if option.get("recommended") else ""
+                lines.append(f"  - {title}{suffix}: {value}")
+        elif placeholder:
+            lines.append(f"  Hint: {placeholder}")
+    return "\n".join(lines)
+
+
+def _render_plan_prefill_handoff(
+    payload: dict, work_dir: str | None = None
+) -> None:
+    """Open browser with describe mode draft for plan projects."""
+    if _state.json:
+        print_output(payload, True)
+        return
+    title = _clean(payload.get("title")) or "project"
+    print(f"\nPrepared plan draft for {title}.")
+    query = urlencode(
+        {
+            "mode": "describe",
+            "draft": _encode_prefill_draft(payload),
+            "clarify": "true",
+        }
+    )
+    url = f"{_app_url_from_api_url(_state.api_url)}/new?{query}"
+    import webbrowser
+
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+    base = f"{_app_url_from_api_url(_state.api_url)}/new"
+    print(
+        f"\nContinue here to answer follow-up questions and generate the plan:\n{base}?...\n"
+    )
+    print(f"Full URL (if browser didn't open):\n{url}\n")
+    if not work_dir:
+        print(
+            "Tip: Use --dir to point to your project directory for better auto-discovery."
+        )
+
+
+def _create_plan_inner(
+    description: str,
+    context: str | None,
+    org_id: str | None,
+    work_dir: str | None,
+) -> None:
+    """Create a generic project plan with codebase discovery — same pattern as migrations."""
+    resolved_work_dir = str(Path(work_dir).resolve()) if work_dir else None
+
+    with make_client(_state.api_url, _state.token) as client:
+        # Phase 1: Get dynamic discovery prompt from backend
+        if not _state.json:
+            print("Generating discovery prompt for your project...")
+        discovery_res = client.post(
+            "/v1/plans/discovery-prompt",
+            json={"description": description},
+        )
+        discovery_res.raise_for_status()
+        discovery_data = discovery_res.json()
+        backend_prompt = discovery_data.get("prompt", "")
+        discovery_commands = discovery_data.get("discovery_commands", [])
+
+        # Phase 2: Run discovery through coding agent
+        if not _state.json:
+            print("Scanning codebase for project context...")
+        agent_prompt = _build_plan_discovery_prompt(backend_prompt, discovery_commands)
+        discovered_context = _run_prompt_in_claude(
+            agent_prompt,
+            missing_env_message=(
+                "This command needs to run inside a coding agent so it can scan your codebase.\n"
+                "Run it from your agent's terminal, or use the prompt copy/paste path in Keshro instead."
+            ),
+            missing_binary_message=(
+                "Could not find a coding agent binary. Make sure you're running this from within your agent's terminal."
+            ),
+            failure_message_prefix="Coding agent returned an error: ",
+            empty_message="Coding agent returned no discovery response.",
+            work_dir=resolved_work_dir,
+        )
+
+        # Phase 3: Get clarifying questions (with discovered context)
+        if not _state.json:
+            print("Checking for high-impact follow-up questions...")
+        preview_res = client.post(
+            "/v1/plans/describe/preview",
+            json={
+                "description": description,
+                "discovered_context": discovered_context,
+            },
+        )
+        preview_res.raise_for_status()
+        preview_data = preview_res.json()
+        questions = preview_data.get("questions", [])
+
+        # Phase 4: Run clarifiers through coding agent
+        clarifier_answers: dict[str, str] = {}
+        if questions:
+            if not _state.json:
+                print("Collecting follow-up answers...")
+            clarifier_prompt = _build_plan_clarifier_prompt(
+                description, discovered_context, questions
+            )
+            raw = _run_prompt_in_claude(
+                clarifier_prompt,
+                missing_env_message=(
+                    "This command needs to run inside a coding agent.\n"
+                    "Run it from your agent's terminal."
+                ),
+                missing_binary_message="Could not find a coding agent binary.",
+                failure_message_prefix="Coding agent returned an error: ",
+                empty_message="Coding agent returned no clarifier answers.",
+                work_dir=resolved_work_dir,
+            )
+            parsed = _parse_discovery_key_values(raw)
+            for question in questions:
+                question_id = _clean(question.get("id"))
+                value = _clean(parsed.get(_normalize_prompt_key(question_id)))
+                if value and value.lower() != "unknown":
+                    clarifier_answers[question_id] = value
+                    continue
+                options = list(question.get("answers") or [])
+                recommended = next(
+                    (option for option in options if option.get("recommended")),
+                    None,
+                )
+                if recommended:
+                    recommended_value = _clean(recommended.get("value"))
+                    if recommended_value:
+                        clarifier_answers[question_id] = recommended_value
+        elif not _state.json:
+            print("No additional follow-up questions needed.")
+
+        # Phase 5: Build payload and hand off
+        # Truncate discovered context to keep URL reasonable
+        truncated_context = discovered_context[:4000] if discovered_context else ""
+
+        merged_description = description
+        if _clean(context):
+            merged_description = f"{description}\n\n{_clean(context)}"
+
+        payload = {
+            "description": merged_description,
+            "title": None,
+            "discovered_context": truncated_context,
+            "answers": clarifier_answers if clarifier_answers else None,
+        }
+
+    _render_plan_prefill_handoff(payload, work_dir=resolved_work_dir)
 
 
 @migration_app.command("list")
