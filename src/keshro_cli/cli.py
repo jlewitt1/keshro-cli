@@ -74,6 +74,20 @@ def _clean(value: str | None) -> str:
     return (value or "").strip()
 
 
+def _coding_agent_name() -> str | None:
+    if os.environ.get("CLAUDECODE"):
+        return "Claude Code"
+    if os.environ.get("CODEX_SANDBOX") or os.environ.get("CODEX_HOME"):
+        return "Codex"
+    if os.environ.get("CURSOR_TRACE_ID") or os.environ.get("CURSOR_SESSION_ID"):
+        return "Cursor"
+    return None
+
+
+def _inside_coding_agent() -> bool:
+    return _coding_agent_name() is not None
+
+
 def _parse_timestamp(value: str | None) -> datetime | None:
     raw = _clean(value)
     if not raw:
@@ -707,7 +721,7 @@ def _run_prompt_in_claude(
     empty_message: str,
     work_dir: str | None = None,
 ) -> str:
-    if sys.stdout.isatty():
+    if not _inside_coding_agent():
         raise SystemExit(missing_env_message)
     claude_bin = shutil.which("claude")
     if not claude_bin:
@@ -2751,7 +2765,7 @@ def _create_migration(
 
             # Step 3: Have the coding agent answer the questions
             answered: dict[str, str] = {}
-            if questions and not sys.stdout.isatty():
+            if questions and _inside_coding_agent():
                 if not _state.json:
                     print(
                         f"{CYAN}Asking AI agent to answer {len(questions)} clarifying questions...{RESET}"
@@ -3489,9 +3503,13 @@ When the user says things like "plan this", "run this project", "execute", "use 
 
 ### 1. Create a plan from a description
 ```bash
-keshro plan generate "Refactor the auth module to support API keys and rate limiting"
+keshro create --context "Refactor the auth module to support API keys and rate limiting"
 ```
-This generates a dependency-aware task graph with AI enrichment. Returns a plan ID.
+Use `keshro create` for new project planning so Keshro can gather codebase context, ask follow-up questions, and generate a better plan.
+
+If the user already gave a concrete project description, use it directly. Do not ask them to restate it.
+
+If another plan is currently active, do not say it was "cancelled". Just create the new plan; it will become the active one.
 
 ### 2. Import from Linear, Jira, or GitHub
 ```bash
@@ -3543,7 +3561,7 @@ To find which plan to use, run `keshro config` first. If no plan is set, run `ke
 
 ## Quick flow
 If user says "plan and run this project":
-1. Run `keshro plan generate "<their description>"` — creates a plan and sets it as active
+1. Run `keshro create --context "<their description>"` — creates a plan and sets it as active
 2. Run `keshro status` — show what the plan looks like before starting
 3. Run `keshro continue` — gets the first task
 4. Execute the task, writing notes along the way
@@ -3563,6 +3581,8 @@ Always run `keshro status` after completing a task so updated progress is visibl
 ## Rules
 - Run keshro commands via Bash, never as chat messages
 - Do NOT use Keshro MCP tools — always use the CLI
+- For new plans from natural-language requests, prefer `keshro create` over `keshro plan generate`
+- If the user asks for a new plan and already provided the description, create it immediately instead of asking "what should the plan be about?"
 - Write progress notes frequently with `keshro task note` — they show up in real time
 - Always run `keshro config` first if you're unsure which plan is active
 - When showing plan info, include the plan URL from `keshro config` output so it is easy to click through to the dashboard
@@ -5887,50 +5907,77 @@ def _plan_import(
 
     # Step 2: Ask clarifying questions (interactive)
     answers: dict[str, str] = {}
-    if questions and not skip_questions and sys.stdout.isatty():
-        print(f"\n{CYAN}Clarifying questions ({len(questions)}):{RESET}")
-        print(
-            f"{DIM}Your answers help produce a better plan. Press Enter to skip any question.{RESET}\n"
-        )
+    if questions and not skip_questions:
+        if _inside_coding_agent():
+            print(
+                f"{CYAN}Asking AI agent to answer {len(questions)} clarifying questions...{RESET}"
+            )
+            import_context = "\n\n".join(
+                part
+                for part in [
+                    preview.get("issues_text", ""),
+                    enrichment,
+                ]
+                if _clean(part)
+            )
+            answers = _answer_questions_via_agent(
+                questions,
+                import_context or f"Imported project from {provider}",
+                None,
+                os.getcwd(),
+            )
+            if not _state.json:
+                answered_count = sum(
+                    1
+                    for value in answers.values()
+                    if value and value.lower() != "unknown"
+                )
+                print(f"  Agent answered {answered_count}/{len(questions)} questions.")
+        elif sys.stdout.isatty():
+            print(f"\n{CYAN}Clarifying questions ({len(questions)}):{RESET}")
+            print(
+                f"{DIM}Your answers help produce a better plan. Press Enter to skip any question.{RESET}\n"
+            )
 
-        for q in questions:
-            qid = q.get("id", "")
-            question_text = q.get("question", "")
-            why = q.get("why_this_matters", "")
-            options = q.get("answers", [])
-            placeholder = q.get("placeholder", "")
+            for q in questions:
+                qid = q.get("id", "")
+                question_text = q.get("question", "")
+                why = q.get("why_this_matters", "")
+                options = q.get("answers", [])
+                placeholder = q.get("placeholder", "")
 
-            print(f"  {YELLOW}{question_text}{RESET}")
-            if why:
-                print(f"  {DIM}{why}{RESET}")
+                print(f"  {YELLOW}{question_text}{RESET}")
+                if why:
+                    print(f"  {DIM}{why}{RESET}")
 
-            if options:
-                for idx, opt in enumerate(options, 1):
-                    rec = " (recommended)" if opt.get("recommended") else ""
-                    print(
-                        f"    {idx}. {opt.get('answer_title', opt.get('value', ''))}{rec}"
-                    )
-                raw = input(
-                    f"  {DIM}Enter number or type answer [{placeholder or 'skip'}]: {RESET}"
-                ).strip()
-                if raw:
-                    # Check if it's a number selecting an option
-                    try:
-                        choice_idx = int(raw) - 1
-                        if 0 <= choice_idx < len(options):
-                            answers[qid] = options[choice_idx].get("value", raw)
-                        else:
+                if options:
+                    for idx, opt in enumerate(options, 1):
+                        rec = " (recommended)" if opt.get("recommended") else ""
+                        print(
+                            f"    {idx}. {opt.get('answer_title', opt.get('value', ''))}{rec}"
+                        )
+                    raw = input(
+                        f"  {DIM}Enter number or type answer [{placeholder or 'skip'}]: {RESET}"
+                    ).strip()
+                    if raw:
+                        try:
+                            choice_idx = int(raw) - 1
+                            if 0 <= choice_idx < len(options):
+                                answers[qid] = options[choice_idx].get("value", raw)
+                            else:
+                                answers[qid] = raw
+                        except ValueError:
                             answers[qid] = raw
-                    except ValueError:
+                else:
+                    raw = input(
+                        f"  {DIM}Answer [{placeholder or 'skip'}]: {RESET}"
+                    ).strip()
+                    if raw:
                         answers[qid] = raw
-            else:
-                raw = input(f"  {DIM}Answer [{placeholder or 'skip'}]: {RESET}").strip()
-                if raw:
-                    answers[qid] = raw
-            print()
+                print()
 
-        answered = len(answers)
-        print(f"  {DIM}{answered}/{len(questions)} questions answered.{RESET}\n")
+            answered = len(answers)
+            print(f"  {DIM}{answered}/{len(questions)} questions answered.{RESET}\n")
 
     # Step 3: Generate plan
     print(f"{CYAN}Generating plan...{RESET}")
