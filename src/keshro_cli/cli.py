@@ -2546,15 +2546,64 @@ def _logout_alias():
 # ---------------------------------------------------------------------------
 
 
+def _classify_source(source: str | None) -> tuple[str, str | None]:
+    """Classify a positional source argument into (source_type, value).
+
+    Returns one of:
+      ("directory", None)          — use cwd
+      ("directory", resolved_path) — local path
+      ("github_repo", url)         — GitHub repo URL
+      ("github_issue", url)        — GitHub issue URL
+      ("linear", url)              — Linear issue URL
+      ("jira", url)                — Jira URL
+      ("url", url)                 — any other URL
+    """
+    if not source:
+        return ("directory", None)
+
+    # URLs
+    if source.startswith("http://") or source.startswith("https://"):
+        # GitHub issue: https://github.com/{owner}/{repo}/issues/{num}
+        if re.match(r"https://github\.com/[^/]+/[^/]+/issues/\d+", source):
+            return ("github_issue", source)
+        # GitHub repo: https://github.com/{owner}/{repo} with optional /tree/... or /blob/...
+        if re.match(r"https://github\.com/[^/]+/[^/]+(/tree/.*|/blob/.*)?$", source):
+            return ("github_repo", source)
+        # Linear
+        if source.startswith("https://linear.app/"):
+            return ("linear", source)
+        # Jira
+        if "/browse/" in source or "/jira/" in source:
+            return ("jira", source)
+        # Any other URL
+        return ("url", source)
+
+    # Local paths
+    if source.startswith("/") or source.startswith("./") or source.startswith(".."):
+        return ("directory", str(Path(source).resolve()))
+    # Check if it looks like a relative path that exists
+    if os.path.exists(source):
+        return ("directory", str(Path(source).resolve()))
+
+    # Default: assume it's a path
+    return ("directory", source)
+
+
 @app.command("create")
 def _create_migration(
+    source: Annotated[
+        Optional[str],
+        typer.Argument(
+            help="Directory, GitHub URL, Linear URL, or any URL. Defaults to current directory.",
+        ),
+    ] = None,
     path: Annotated[
-        str,
+        Optional[str],
         typer.Option(
             "--path",
             help="Migration path key, for example aws-batch-to-airflow.",
         ),
-    ],
+    ] = None,
     field: Annotated[
         Optional[list[str]],
         typer.Option(
@@ -2591,16 +2640,32 @@ def _create_migration(
             help="Git repo URL to clone and scan. Cloned to a temp directory.",
         ),
     ] = None,
+    skip_questions: Annotated[
+        bool,
+        typer.Option(
+            "--skip-questions",
+            help="Skip clarifying questions and generate the plan immediately.",
+        ),
+    ] = False,
 ):
-    """Create a migration project from a stable path key. Requires a coding agent that can run shell commands."""
-    if sys.stdout.isatty():
-        raise SystemExit(
-            "This command needs to run inside a coding agent so it can scan your codebase.\n"
-            "Run it from your agent's terminal, or use the prompt copy/paste path in Keshro instead."
-        )
+    """Create a project. Pass a directory, GitHub URL, Linear URL, or any URL — Keshro figures out the rest."""
+    # Classify the positional source argument and set defaults
+    source_type, source_value = _classify_source(source)
+    if source_type == "directory" and work_dir is None:
+        work_dir = source_value or "."
+    elif source_type == "github_repo" and repo_url is None:
+        repo_url = source_value
+    elif source_type == "github_issue":
+        if github_url is None:
+            github_url = source_value
+        if resource_url is None:
+            resource_url = source_value
+    elif source_type in ("linear", "jira", "url"):
+        if resource_url is None:
+            resource_url = source_value
     import tempfile
 
-    answers = _parse_field_assignments(field)
+    # Clone remote repo if needed
     clone_dir = None
     if repo_url and not work_dir:
         clone_dir = tempfile.mkdtemp(prefix="keshro-clone-")
@@ -2619,20 +2684,259 @@ def _create_migration(
         work_dir = clone_dir
 
     try:
-        return _create_migration_inner(
-            path,
-            answers,
-            context,
-            github_url,
-            resource_url,
-            org_id,
-            work_dir,
-        )
+        if path:
+            # Migration mode — use the existing migration flow
+            answers = _parse_field_assignments(field)
+            return _create_migration_inner(
+                path,
+                answers,
+                context,
+                github_url,
+                resource_url,
+                org_id,
+                work_dir,
+            )
+        else:
+            # Generic project mode — scan, get questions, agent answers, generate plan
+            _ensure_authenticated()
+            resolved_work_dir = str(Path(work_dir or ".").resolve())
+
+            if not _state.json:
+                source_label = source_value or resolved_work_dir
+                print(f"{CYAN}Creating project from: {source_label}{RESET}")
+
+            # Step 1: Collect codebase context if we have a directory
+            discovered_context = None
+            if os.path.isdir(resolved_work_dir):
+                if not _state.json:
+                    print(f"Scanning {resolved_work_dir}...")
+                discovered_context = _collect_generic_discovery(resolved_work_dir)
+
+            # Build description from context + source info
+            desc_parts = []
+            if context:
+                desc_parts.append(context)
+            if resource_url:
+                desc_parts.append(f"Reference: {resource_url}")
+            if not desc_parts and discovered_context:
+                desc_parts.append(f"Project in {resolved_work_dir}")
+            description = "\n\n".join(desc_parts) or f"Project in {resolved_work_dir}"
+
+            client = make_client()
+
+            # Step 2: Get clarifying questions from the preview endpoint
+            questions: list[dict] = []
+            enrichment_context = ""
+            if not skip_questions:
+                if not _state.json:
+                    print(f"{CYAN}Generating clarifying questions...{RESET}")
+
+                preview_payload: dict[str, Any] = {
+                    "description": description,
+                    "discovered_context": discovered_context,
+                }
+                try:
+                    resp = client.post(
+                        "/v1/plans/describe/preview",
+                        json=preview_payload,
+                        timeout=60,
+                    )
+                    resp.raise_for_status()
+                    preview = resp.json()
+                    questions = preview.get("questions", [])
+                    enrichment_context = preview.get("enrichment_context", "")
+                except Exception as exc:
+                    if not _state.json:
+                        print(f"{YELLOW}Could not generate questions: {exc}{RESET}")
+
+            # Step 3: Have the coding agent answer the questions
+            answered: dict[str, str] = {}
+            if questions and not sys.stdout.isatty():
+                if not _state.json:
+                    print(
+                        f"{CYAN}Asking AI agent to answer {len(questions)} clarifying questions...{RESET}"
+                    )
+                answered = _answer_questions_via_agent(
+                    questions, description, discovered_context, resolved_work_dir
+                )
+                if not _state.json:
+                    answered_count = sum(
+                        1 for v in answered.values() if v and v.lower() != "unknown"
+                    )
+                    print(
+                        f"  Agent answered {answered_count}/{len(questions)} questions."
+                    )
+            elif questions and not _state.json:
+                # TTY mode — print questions for the user
+                print(
+                    f"\n{CYAN}Clarifying questions (skipping — run from an AI agent for auto-answers):{RESET}"
+                )
+                for q in questions:
+                    print(f"  • {q.get('question', '')}")
+                print()
+
+            # Step 4: Generate the plan
+            if not _state.json:
+                print(f"{CYAN}Generating execution plan...{RESET}")
+
+            # Fold enrichment context + answered questions into the description
+            full_description = description
+            if enrichment_context:
+                full_description += f"\n\n{enrichment_context}"
+            if answered:
+                qa_text = "\n".join(
+                    f"Q: {q.get('question', '')}\nA: {answered.get(q.get('id', ''), 'skipped')}"
+                    for q in questions
+                )
+                full_description += f"\n\n---\nClarifying question answers:\n{qa_text}"
+
+            generate_payload: dict[str, Any] = {
+                "description": full_description,
+                "project_type": "generic",
+                "discovered_context": discovered_context,
+            }
+            if org_id:
+                generate_payload["org_id"] = org_id
+
+            try:
+                resp = client.post(
+                    "/v1/plans/generate", json=generate_payload, timeout=120
+                )
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                _print_http_error(exc)
+                raise typer.Exit(1) from exc
+
+            plan = resp.json()
+            plan_id = plan.get("id", "")
+            steps = plan.get("plan_steps", [])
+
+            _set_default_plan_after_create(plan)
+
+            if _state.json:
+                print_output(plan)
+            else:
+                print(f"\n{GREEN}Plan created: {plan.get('title', 'Untitled')}{RESET}")
+                print(f"  ID: {plan_id}")
+                print(f"  Tasks: {len(steps)}")
+                print(f"  Status: {plan.get('status', 'draft')}")
+                print(f"\n  Run {CYAN}keshro continue{RESET} to start executing.")
+
     finally:
         if clone_dir:
             import shutil as _shutil
 
             _shutil.rmtree(clone_dir, ignore_errors=True)
+
+
+def _collect_generic_discovery(work_dir: str) -> str | None:
+    """Collect basic project facts from a directory for plan enrichment."""
+    facts = []
+
+    # Check for common project files
+    project_files = [
+        ("package.json", "Node.js project"),
+        ("requirements.txt", "Python project"),
+        ("pyproject.toml", "Python project"),
+        ("go.mod", "Go project"),
+        ("Cargo.toml", "Rust project"),
+        ("pom.xml", "Java/Maven project"),
+        ("build.gradle", "Java/Gradle project"),
+        ("Gemfile", "Ruby project"),
+    ]
+
+    for filename, label in project_files:
+        filepath = os.path.join(work_dir, filename)
+        if os.path.exists(filepath):
+            facts.append(f"Detected: {label} ({filename})")
+            try:
+                with open(filepath) as f:
+                    content = f.read(4096)
+                facts.append(f"Contents of {filename}:\n{content}")
+            except Exception:
+                pass
+            break
+
+    # Directory listing
+    try:
+        entries = sorted(os.listdir(work_dir))
+        top_entries = [e for e in entries if not e.startswith(".")][:30]
+        if top_entries:
+            facts.append(f"Top-level files/dirs: {', '.join(top_entries)}")
+    except Exception:
+        pass
+
+    return "\n\n".join(facts) if facts else None
+
+
+def _answer_questions_via_agent(
+    questions: list[dict],
+    description: str,
+    discovered_context: str | None,
+    work_dir: str,
+) -> dict[str, str]:
+    """Use the coding agent to answer clarifying questions about the project."""
+    q_lines = []
+    for q in questions:
+        qid = q.get("id", "")
+        text = q.get("question", "")
+        why = q.get("why_this_matters", "")
+        options = q.get("answers", [])
+        q_lines.append(f"Question ID: {qid}")
+        q_lines.append(f"Question: {text}")
+        if why:
+            q_lines.append(f"Why it matters: {why}")
+        if options:
+            opt_strs = [
+                f"  - {o.get('value', '')}: {o.get('answer_title', '')}"
+                + (" (recommended)" if o.get("recommended") else "")
+                for o in options
+            ]
+            q_lines.append("Options:\n" + "\n".join(opt_strs))
+        q_lines.append("")
+
+    prompt = f"""You are answering clarifying questions about a software project to help generate a better execution plan.
+
+Project description: {description}
+
+{"Discovered codebase context:" + chr(10) + discovered_context if discovered_context else ""}
+
+Answer each question below based on what you know about this project and codebase. If a question has options, pick the best one. If you genuinely don't know, answer "unknown".
+
+Reply in this exact format — one line per question, with the question ID and your answer:
+ANSWER <question_id>: <your answer>
+
+Questions:
+{chr(10).join(q_lines)}"""
+
+    try:
+        raw = _run_prompt_in_claude(
+            prompt,
+            missing_env_message="Not inside a coding agent — skipping auto-answers.",
+            missing_binary_message="Claude binary not found — skipping auto-answers.",
+            failure_message_prefix="Agent failed to answer questions: ",
+            empty_message="",
+            work_dir=work_dir,
+        )
+    except SystemExit:
+        return {}
+
+    if not raw:
+        return {}
+
+    # Parse ANSWER lines
+    answers: dict[str, str] = {}
+    for line in raw.splitlines():
+        line = line.strip()
+        if line.upper().startswith("ANSWER "):
+            rest = line[7:]
+            if ":" in rest:
+                qid, answer = rest.split(":", 1)
+                qid = qid.strip()
+                answer = answer.strip()
+                if answer.lower() != "unknown":
+                    answers[qid] = answer
+    return answers
 
 
 def _create_migration_inner(
