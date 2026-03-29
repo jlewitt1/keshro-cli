@@ -164,7 +164,11 @@ class PlanInsights(Static):
         lines = ["[bold]PLAN INSIGHTS[/bold]", ""]
 
         if sources:
-            names = [_clean(source.get("name")) for source in sources if _clean(source.get("name"))]
+            names = [
+                _clean(source.get("name"))
+                for source in sources
+                if _clean(source.get("name"))
+            ]
             if names:
                 lines.append(f"[cyan]Enriched by:[/cyan] {', '.join(names)}")
             highlights: list[str] = []

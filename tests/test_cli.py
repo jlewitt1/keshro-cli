@@ -623,7 +623,9 @@ def test_continue_prompt_surfaces_plan_risks_unknowns_and_ui_link(
     out = ANSI_RE.sub("", capsys.readouterr().out)
     assert "Top plan risks:" in out
     assert "Open questions:" in out
-    assert "Review full risks/questions in UI: http://localhost:3000/plans/plan-123" in out
+    assert (
+        "Review full risks/questions in UI: http://localhost:3000/plans/plan-123" in out
+    )
     assert "Source highlights:" not in out
 
 
@@ -1138,7 +1140,9 @@ def test_get_plan_or_exit_clears_stale_cached_default_on_404(monkeypatch):
         status_code = 404
 
         def __init__(self):
-            self.request = httpx.Request("GET", "http://localhost:8000/v1/plans/plan-stale")
+            self.request = httpx.Request(
+                "GET", "http://localhost:8000/v1/plans/plan-stale"
+            )
 
         def json(self):
             return {"detail": "Plan not found"}
@@ -1152,10 +1156,13 @@ def test_get_plan_or_exit_clears_stale_cached_default_on_404(monkeypatch):
 
         def get(self, path, params=None, headers=None, timeout=None):
             response = _404Response()
-            raise httpx.HTTPStatusError("Plan not found", request=response.request, response=response)
+            raise httpx.HTTPStatusError(
+                "Plan not found", request=response.request, response=response
+            )
 
     monkeypatch.setattr(
-        "keshro_cli.cli.make_client", lambda api_url=None, token=None: _MissingPlanClient()
+        "keshro_cli.cli.make_client",
+        lambda api_url=None, token=None: _MissingPlanClient(),
     )
 
     with pytest.raises(httpx.HTTPStatusError):
@@ -2368,8 +2375,12 @@ def test_status_surfaces_enrichment_analysis_and_ui_review_link(
                     ],
                     "decisions": {
                         "confidence_score": 74,
-                        "risks": [{"title": "Autoscaling values may break existing installs"}],
-                        "unknowns": [{"question": "Which clusters need backwards compatibility?"}],
+                        "risks": [
+                            {"title": "Autoscaling values may break existing installs"}
+                        ],
+                        "unknowns": [
+                            {"question": "Which clusters need backwards compatibility?"}
+                        ],
                     },
                 }
             )
