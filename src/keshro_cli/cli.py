@@ -3764,6 +3764,13 @@ You are integrated with Keshro — the intelligent execution layer for coding ag
 
 When the user says things like "plan this", "run this project", "execute", "use Keshro", or "keshro":
 
+### 0. Authenticate if needed
+If `keshro config` shows `Authenticated: no`, the correct login command is:
+```bash
+keshro login <api-token>
+```
+Do not use `keshro auth login`. Do not invent a `--token` flag.
+
 ### 1. Create a plan from a description
 ```bash
 keshro create --context "Refactor the auth module to support API keys and rate limiting"
@@ -3844,6 +3851,7 @@ Always run `keshro status` after completing a task so updated progress is visibl
 ## Rules
 - Run keshro commands via Bash, never as chat messages
 - Do NOT use Keshro MCP tools — always use the CLI
+- If auth is missing, use exactly `keshro login <api-token>`
 - For new plans from natural-language requests, prefer `keshro create` over `keshro plan generate`
 - If the user asks for a new plan and already provided the description, create it immediately instead of asking "what should the plan be about?"
 - Write progress notes frequently with `keshro task note` — they show up in real time
@@ -3942,7 +3950,7 @@ def _install_agent_integrations(silent: bool = False) -> tuple[list[str], list[s
     return installed, already_present
 
 
-@app.command("setup-claude")
+@app.command("setup-claude", hidden=True)
 def _setup_claude():
     """Install a global Claude Code slash command for Keshro"""
     target = _install_claude_integration()
