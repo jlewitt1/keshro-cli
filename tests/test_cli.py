@@ -1094,7 +1094,7 @@ def test_require_plan_context_can_resolve_repo_link(monkeypatch):
     assert cli._require_plan_context(None) == "plan-123"
 
 
-def test_current_plan_id_prefers_cached_default_before_repo_resolution(monkeypatch):
+def test_current_plan_id_prefers_repo_resolution_before_cached_default(monkeypatch):
     monkeypatch.setattr(
         "keshro_cli.cli.load_auth",
         lambda: {
@@ -1102,15 +1102,67 @@ def test_current_plan_id_prefers_cached_default_before_repo_resolution(monkeypat
             "default_plan_title": "Cached plan",
         },
     )
+    saved = {}
 
-    def _fail_resolve(*args, **kwargs):
-        raise AssertionError(
-            "repo resolution should not run when default plan is cached"
-        )
+    monkeypatch.setattr(
+        "keshro_cli.cli.update_auth", lambda payload: saved.update(payload) or payload
+    )
+    monkeypatch.setattr(
+        "keshro_cli.cli._resolve_repo_linked_plan",
+        lambda *args, **kwargs: ("plan-linked", "Repo linked plan"),
+    )
 
-    monkeypatch.setattr("keshro_cli.cli._resolve_repo_linked_plan", _fail_resolve)
+    assert cli._current_plan_id(None) == "plan-linked"
+    assert saved["default_plan_id"] == "plan-linked"
+    assert saved["default_plan_title"] == "Repo linked plan"
 
-    assert cli._current_plan_id(None) == "plan-cached"
+
+def test_get_plan_or_exit_clears_stale_cached_default_on_404(monkeypatch):
+    saved = {}
+    monkeypatch.setattr(
+        "keshro_cli.cli.load_auth",
+        lambda: {
+            "default_plan_id": "plan-stale",
+            "default_plan_title": "Stale plan",
+        },
+    )
+    monkeypatch.setattr(
+        "keshro_cli.cli._resolve_repo_linked_plan",
+        lambda *args, **kwargs: (None, None),
+    )
+    monkeypatch.setattr(
+        "keshro_cli.cli.update_auth", lambda payload: saved.update(payload) or payload
+    )
+
+    class _404Response:
+        status_code = 404
+
+        def __init__(self):
+            self.request = httpx.Request("GET", "http://localhost:8000/v1/plans/plan-stale")
+
+        def json(self):
+            return {"detail": "Plan not found"}
+
+    class _MissingPlanClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, path, params=None, headers=None, timeout=None):
+            response = _404Response()
+            raise httpx.HTTPStatusError("Plan not found", request=response.request, response=response)
+
+    monkeypatch.setattr(
+        "keshro_cli.cli.make_client", lambda api_url=None, token=None: _MissingPlanClient()
+    )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        cli._get_plan_or_exit(None)
+
+    assert saved["default_plan_id"] is None
+    assert saved["default_plan_title"] is None
 
 
 def test_install_codex_integration_replaces_existing_managed_block(

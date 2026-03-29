@@ -69,6 +69,25 @@ def _truncate_text(value: str, limit: int = 110) -> str:
     return text[: limit - 1].rstrip() + "…"
 
 
+def _analysis_item_text(item: object, *, fallback: str) -> str:
+    if isinstance(item, dict):
+        for key in ("title", "description", "question", "summary"):
+            value = _clean(item.get(key))
+            if value:
+                return value
+        return fallback
+    value = _clean(item)
+    return value or fallback
+
+
+def _confidence_percent(value: object) -> int | None:
+    if not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and 0 <= value <= 1:
+        return round(value * 100)
+    return round(value)
+
+
 def _app_url_from_api_url(api_url: str) -> str:
     clean = api_url.rstrip("/")
     if clean.endswith(":8000"):
@@ -166,8 +185,9 @@ class PlanInsights(Static):
         risks = analysis.get("risks") or []
         unknowns = analysis.get("unknowns") or []
         summary_bits: list[str] = []
-        if isinstance(confidence, (int, float)):
-            summary_bits.append(f"confidence {confidence:.0%}")
+        confidence_percent = _confidence_percent(confidence)
+        if confidence_percent is not None:
+            summary_bits.append(f"confidence {confidence_percent}%")
         if risks:
             summary_bits.append(f"{len(risks)} risks")
         if unknowns:
@@ -178,13 +198,17 @@ class PlanInsights(Static):
         if risks:
             lines.append("[red]Top risks:[/red]")
             for risk in risks[:3]:
-                lines.append(f"  • {_truncate_text(risk, 100)}")
+                lines.append(
+                    f"  • {_truncate_text(_analysis_item_text(risk, fallback='Unspecified risk'), 100)}"
+                )
         if unknowns:
             if risks:
                 lines.append("")
             lines.append("[yellow]Open questions:[/yellow]")
             for unknown in unknowns[:3]:
-                lines.append(f"  • {_truncate_text(unknown, 100)}")
+                lines.append(
+                    f"  • {_truncate_text(_analysis_item_text(unknown, fallback='Unspecified question'), 100)}"
+                )
 
         if self.app_url:
             lines.extend(["", f"[dim]Review in UI:[/dim] [link={self.app_url}/plans/{plan.get('id', '')}]{self.app_url}/plans/{plan.get('id', '')}[/link]"])

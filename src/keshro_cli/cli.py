@@ -234,16 +234,16 @@ def _current_plan_id(
     explicit = _clean(plan_id)
     if explicit:
         return explicit
-    auth = load_auth()
-    cached_plan_id = _clean(auth.get("default_plan_id"))
-    if cached_plan_id:
-        return cached_plan_id
     repo_plan_id, repo_plan_title = _resolve_repo_linked_plan(work_dir)
     if repo_plan_id:
         update_auth(
             {"default_plan_id": repo_plan_id, "default_plan_title": repo_plan_title}
         )
         return repo_plan_id
+    auth = load_auth()
+    cached_plan_id = _clean(auth.get("default_plan_id"))
+    if cached_plan_id:
+        return cached_plan_id
     return None
 
 
@@ -1577,7 +1577,7 @@ def _build_continue_prompt(
             task_block.append(
                 f"  - {_truncate_text(question or summary or 'Unspecified question')}"
             )
-        plan_url = f"{_app_url_from_api_url(_state.api_url)}/plans/{resolved_plan_id}"
+        plan_url = f"{_current_app_url()}/plans/{resolved_plan_id}"
         task_block.append(f"Review full risks/questions in UI: {plan_url}")
 
     continuation = [
@@ -2398,11 +2398,24 @@ def _view_task(plan_id: str | None, task_id: str) -> None:
 
 
 def _get_plan_or_exit(plan_id: str | None) -> dict:
+    explicit_plan_id = _clean(plan_id)
     resolved_plan_id = _require_plan_context(plan_id)
-    with make_client(_state.api_url, _state.token) as client:
-        res = client.get(f"/v1/plans/{resolved_plan_id}")
-        res.raise_for_status()
-        return res.json()
+    try:
+        with make_client(_state.api_url, _state.token) as client:
+            res = client.get(f"/v1/plans/{resolved_plan_id}")
+            res.raise_for_status()
+            return res.json()
+    except httpx.HTTPStatusError as exc:
+        response = exc.response
+        cached_plan_id = _clean(load_auth().get("default_plan_id"))
+        if (
+            not explicit_plan_id
+            and response is not None
+            and response.status_code == 404
+            and cached_plan_id == resolved_plan_id
+        ):
+            update_auth({"default_plan_id": None, "default_plan_title": None})
+        raise
 
 
 def _find_task(plan: dict, task_id: str) -> dict | None:
@@ -5978,7 +5991,7 @@ def _plan_generate(
     _print_plan_enrichment(plan)
     _print_plan_analysis(plan)
     if plan.get("enrichment_sources") or _plan_analysis(plan):
-        app_url = _app_url_from_api_url(_state.api_url)
+        app_url = _current_app_url()
         print(f"  Review in UI: {app_url}/plans/{plan_id}")
 
     if steps:

@@ -97,13 +97,19 @@ SAMPLE_PLAN = {
         }
     ],
     "decisions": {
-        "confidence_score": 0.82,
+        "confidence_score": 82,
         "risks": [
-            "IAM permissions may be too narrow for Airflow workers to reach Batch and Glue.",
-            "Terraform assumptions may not match the existing VPC layout.",
+            {
+                "title": "IAM permissions may be too narrow for Airflow workers to reach Batch and Glue.",
+            },
+            {
+                "description": "Terraform assumptions may not match the existing VPC layout.",
+            },
         ],
         "unknowns": [
-            "Which environment owns the production DAG bucket?",
+            {
+                "question": "Which environment owns the production DAG bucket?",
+            },
         ],
     },
     "id": "plan-abc",
@@ -152,7 +158,7 @@ class TestPlanInsights:
         plan = {
             **SAMPLE_PLAN,
             "decisions": {
-                "risks": ["A" * 200],
+                "risks": [{"description": "A" * 200}],
             },
         }
         w = PlanInsights()
