@@ -3847,14 +3847,22 @@ keshro task note <task-id> -n "what you found or changed"
 keshro task done <task-id> -n "what was completed and how it was verified"
 keshro task block <task-id> -r "reason"
 keshro task unblock <task-id>
+keshro task view <task-id>                    # full task details
+keshro task edit <task-id> --title "..." --description "..."
+keshro task artifact <task-id> -l "<url>"     # attach a link
+keshro task decide <task-id> --context "..." --choice "..." --reasoning "..."
+keshro task delete <task-id>
 ```
 
 ## Plan management
 ```bash
 keshro plan list
 keshro plan view <plan-id>
+keshro plan generate "<description>"          # generate plan from text
 keshro plan update <plan-id> --status active
 keshro plan delete <plan-id>
+keshro plan push --provider linear            # push tasks to issue tracker
+keshro plan sync-pull                         # pull status from tracker
 ```
 
 ## Review and rollback
