@@ -153,6 +153,7 @@ class TestPlanInsights:
         assert "Open questions:" in text
         assert "Review in UI:" in text
         assert "http://localhost:3000/plans/plan-abc" in text
+        assert '[link="http://localhost:3000/plans/plan-abc"]' in text
 
     def test_truncates_long_risks(self):
         plan = {

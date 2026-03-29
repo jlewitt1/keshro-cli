@@ -211,7 +211,13 @@ class PlanInsights(Static):
                 )
 
         if self.app_url:
-            lines.extend(["", f"[dim]Review in UI:[/dim] [link={self.app_url}/plans/{plan.get('id', '')}]{self.app_url}/plans/{plan.get('id', '')}[/link]"])
+            plan_url = f"{self.app_url}/plans/{plan.get('id', '')}"
+            lines.extend(
+                [
+                    "",
+                    f'[dim]Review in UI:[/dim] [link="{plan_url}"]{plan_url}[/link]',
+                ]
+            )
 
         return "\n".join(lines)
 
