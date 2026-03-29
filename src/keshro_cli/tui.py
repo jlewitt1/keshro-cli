@@ -362,40 +362,41 @@ class KeshroStatusApp(App):
 
     CSS = """
     Screen {
-        layout: grid;
-        grid-size: 2 4;
-        grid-gutter: 1;
+        layout: vertical;
+        overflow-y: auto;
+        padding: 0 1;
     }
     PlanOverview {
-        column-span: 2;
         height: auto;
-        min-height: 8;
+        min-height: 6;
         border: solid $primary;
         padding: 1;
+        margin: 0 0 1 0;
     }
     PlanInsights {
-        column-span: 2;
         height: auto;
-        min-height: 8;
+        min-height: 6;
         border: solid $warning;
         padding: 1;
+        margin: 0 0 1 0;
     }
     ActiveAgents {
+        height: auto;
+        min-height: 5;
+        border: solid $secondary;
+        padding: 1;
+        margin: 0 0 1 0;
+    }
+    TaskGraph {
         height: auto;
         min-height: 6;
         border: solid $secondary;
         padding: 1;
-    }
-    TaskGraph {
-        height: auto;
-        min-height: 10;
-        border: solid $secondary;
-        padding: 1;
+        margin: 0 0 1 0;
     }
     RecentEvents {
-        column-span: 2;
         height: auto;
-        min-height: 8;
+        min-height: 5;
         border: solid $accent;
         padding: 1;
     }
