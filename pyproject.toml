@@ -21,11 +21,6 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Application Frameworks",
 ]
 requires-python = ">=3.11"
-
-[project.urls]
-Homepage = "https://keshro.com"
-Repository = "https://github.com/jlewitt1/keshro-cli"
-Documentation = "https://keshro.com/developers"
 dependencies = [
     "httpx>=0.28",
     "httpx-sse>=0.4",
@@ -33,6 +28,11 @@ dependencies = [
     "rich>=13.0",
     "textual>=0.80",
 ]
+
+[project.urls]
+Homepage = "https://keshro.com"
+Repository = "https://github.com/jlewitt1/keshro-cli"
+Documentation = "https://keshro.com/developers"
 
 [project.scripts]
 keshro = "keshro_cli.cli:main"
