@@ -510,20 +510,13 @@ def _extract_source_titles(source: dict, limit: int = 3) -> list[str]:
     return titles[:limit]
 
 
-def _print_plan_enrichment(
-    plan: dict, *, indent: str = "  ", detail_limit: int = 2
-) -> None:
+def _print_plan_enrichment(plan: dict, *, indent: str = "  ") -> None:
     sources = plan.get("enrichment_sources") or []
     if not sources:
         return
     names = [_clean(s.get("name")) for s in sources if _clean(s.get("name"))]
     if names:
         print(f"{indent}{DIM}Enriched by: {', '.join(names)}{RESET}")
-    for source in sources[:3]:
-        source_name = _clean(source.get("name")) or "Context"
-        titles = _extract_source_titles(source, limit=detail_limit)
-        if titles:
-            print(f"{indent}{DIM}  {source_name}: {'; '.join(titles)}{RESET}")
 
 
 def _print_plan_analysis(
@@ -1227,11 +1220,6 @@ def _build_continue_brief(
         names = [_clean(s.get("name")) for s in enrichment_sources if _clean(s.get("name"))]
         if names:
             lines.append(f"Enriched by: {', '.join(names)}")
-        source_titles = []
-        for source in enrichment_sources[:2]:
-            source_titles.extend(_extract_source_titles(source, limit=2))
-        if source_titles:
-            lines.append(f"Source highlights: {'; '.join(source_titles[:4])}")
     if risks:
         lines.append("Top plan risks:")
         for risk in risks[:2]:
@@ -1550,11 +1538,6 @@ def _build_continue_prompt(
         names = [s.get("name", "") for s in enrichment_sources if s.get("name")]
         if names:
             task_block.append(f"Plan context sources: {', '.join(names)}")
-        source_titles = []
-        for source in enrichment_sources[:2]:
-            source_titles.extend(_extract_source_titles(source, limit=2))
-        if source_titles:
-            task_block.append(f"Source highlights: {'; '.join(source_titles[:4])}")
 
     analysis = _plan_analysis(plan)
     risks = analysis.get("risks") if isinstance(analysis.get("risks"), list) else []
@@ -4349,11 +4332,6 @@ def _run_status(plan_id: str | None, watch: bool = False, tui: bool = False) -> 
 
     if not watch:
         _print_plan_status(plan)
-        # Also show dependency graph
-        from .graph import render_plan_summary
-
-        print()
-        print(render_plan_summary(plan))
         return
 
     # Try SSE first, fall back to polling

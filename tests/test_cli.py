@@ -624,7 +624,7 @@ def test_continue_prompt_surfaces_plan_risks_unknowns_and_ui_link(
     assert "Top plan risks:" in out
     assert "Open questions:" in out
     assert "Review full risks/questions in UI: http://localhost:3000/plans/plan-123" in out
-    assert "Source highlights: Best practices for AWS Batch" in out
+    assert "Source highlights:" not in out
 
 
 def test_continue_in_agent_mode_resumes_in_progress_task_before_next_todo(
@@ -2380,8 +2380,9 @@ def test_status_surfaces_enrichment_analysis_and_ui_review_link(
     out = ANSI_RE.sub("", capsys.readouterr().out)
     assert code == 0
     assert "Enriched by: Web research" in out
-    assert "Web research: Best practices for Helm charts" in out
     assert "Analysis: confidence: 74% · 1 risk · 1 open question" in out
     assert "Top risks:" in out
     assert "Open questions:" in out
     assert "Review in UI: http://localhost:3000/plans/plan-123" in out
+    assert "Best practices for Helm charts" not in out
+    assert "├──" not in out
