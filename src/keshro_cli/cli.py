@@ -101,6 +101,67 @@ def _parse_timestamp(value: str | None) -> datetime | None:
     return parsed
 
 
+def _format_duration_compact(seconds: float | int) -> str:
+    total_seconds = max(0, int(round(float(seconds or 0))))
+    mins, secs = divmod(total_seconds, 60)
+    hours, mins = divmod(mins, 60)
+    if hours > 0:
+        return f"{hours}h {mins}m"
+    if mins > 0:
+        return f"{mins}m {secs}s"
+    return f"{secs}s"
+
+
+def _event_status(event: dict) -> str:
+    after = event.get("after")
+    if isinstance(after, dict):
+        status = _clean(after.get("status"))
+        if status:
+            return status
+    event_type = _clean(event.get("event_type")).lower()
+    if event_type == "task_start":
+        return "in_progress"
+    if event_type == "task_done":
+        return "completed"
+    if event_type == "task_block":
+        return "blocked"
+    return ""
+
+
+def _elapsed_runtime_from_events(events: list[dict]) -> tuple[float, int]:
+    by_task: dict[str, list[dict]] = {}
+    for event in events:
+        task_id = _clean(event.get("task_id"))
+        if not task_id:
+            continue
+        by_task.setdefault(task_id, []).append(event)
+
+    total_elapsed = 0.0
+    tasks_with_elapsed = 0
+    for task_events in by_task.values():
+        sorted_events = sorted(
+            task_events, key=lambda event: _clean(event.get("created_at"))
+        )
+        started_at: datetime | None = None
+        finished_at: datetime | None = None
+        for event in sorted_events:
+            event_time = _parse_timestamp(event.get("created_at"))
+            if event_time is None:
+                continue
+            status = _event_status(event)
+            if started_at is None and status == "in_progress":
+                started_at = event_time
+                continue
+            if started_at is not None and status in {"completed", "blocked"}:
+                finished_at = event_time
+                break
+        if started_at is not None and finished_at is not None:
+            total_elapsed += max(0.0, (finished_at - started_at).total_seconds())
+            tasks_with_elapsed += 1
+
+    return total_elapsed, tasks_with_elapsed
+
+
 def _format_plan_timestamp(value: str | None) -> str:
     raw = _clean(value)
     parsed = _parse_timestamp(raw)
