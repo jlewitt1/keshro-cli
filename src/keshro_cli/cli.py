@@ -75,7 +75,7 @@ def _clean(value: str | None) -> str:
 
 
 def _coding_agent_name() -> str | None:
-    if os.environ.get("CLAUDECODE"):
+    if os.environ.get("CLAUDECODE") or os.environ.get("CLAUDE_CODE_ENTRYPOINT"):
         return "Claude Code"
     if os.environ.get("CODEX_SANDBOX") or os.environ.get("CODEX_HOME"):
         return "Codex"
@@ -234,16 +234,16 @@ def _current_plan_id(
     explicit = _clean(plan_id)
     if explicit:
         return explicit
-    auth = load_auth()
-    cached_plan_id = _clean(auth.get("default_plan_id"))
-    if cached_plan_id:
-        return cached_plan_id
     repo_plan_id, repo_plan_title = _resolve_repo_linked_plan(work_dir)
     if repo_plan_id:
         update_auth(
             {"default_plan_id": repo_plan_id, "default_plan_title": repo_plan_title}
         )
         return repo_plan_id
+    auth = load_auth()
+    cached_plan_id = _clean(auth.get("default_plan_id"))
+    if cached_plan_id:
+        return cached_plan_id
     return None
 
 
@@ -467,6 +467,100 @@ def _print_plan_detail(plan: dict, context_label: str | None = None) -> None:
                 print(f"     Notes: {step['notes']}")
     else:
         print(f"{DIM}Steps:{RESET} none")
+
+
+def _plan_analysis(plan: dict) -> dict:
+    decisions = plan.get("decisions") or {}
+    return decisions if isinstance(decisions, dict) else {}
+
+
+def _truncate_text(value: str, limit: int = 110) -> str:
+    text = _clean(value)
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def _extract_source_titles(source: dict, limit: int = 3) -> list[str]:
+    titles: list[str] = []
+    for item in source.get("sources") or []:
+        title = _clean((item or {}).get("title"))
+        if title:
+            titles.append(title)
+    if titles:
+        return titles[:limit]
+
+    detail = _clean(source.get("detail"))
+    if not detail:
+        return []
+
+    for raw_line in detail.splitlines():
+        line = _clean(raw_line)
+        if not line:
+            continue
+        match = re.match(r"^(.*?)(?:\s*(?:—|->)\s*)?(https?://\S+)\s*$", line)
+        if match:
+            label = _clean(match.group(1))
+            if label:
+                titles.append(label)
+        elif not re.search(r"https?://", line):
+            titles.append(line)
+        if len(titles) >= limit:
+            break
+    return titles[:limit]
+
+
+def _print_plan_enrichment(plan: dict, *, indent: str = "  ") -> None:
+    sources = plan.get("enrichment_sources") or []
+    if not sources:
+        return
+    names = [_clean(s.get("name")) for s in sources if _clean(s.get("name"))]
+    if names:
+        print(f"{indent}{DIM}Enriched by: {', '.join(names)}{RESET}")
+
+
+def _print_plan_analysis(
+    plan: dict, *, indent: str = "  ", item_limit: int = 3
+) -> None:
+    analysis = _plan_analysis(plan)
+    if not analysis:
+        return
+
+    confidence = analysis.get("confidence_score")
+    risks = analysis.get("risks") if isinstance(analysis.get("risks"), list) else []
+    unknowns = (
+        analysis.get("unknowns") if isinstance(analysis.get("unknowns"), list) else []
+    )
+
+    summary_parts: list[str] = []
+    if confidence is not None:
+        summary_parts.append(f"confidence: {confidence}%")
+    if risks:
+        summary_parts.append(f"{len(risks)} risk{'s' if len(risks) != 1 else ''}")
+    if unknowns:
+        summary_parts.append(
+            f"{len(unknowns)} open question{'s' if len(unknowns) != 1 else ''}"
+        )
+    if summary_parts:
+        print(f"{indent}{DIM}Analysis: {' · '.join(summary_parts)}{RESET}")
+
+    if risks:
+        print(f"{indent}{RED}Top risks:{RESET}")
+        for risk in risks[:item_limit]:
+            title = _clean((risk or {}).get("title"))
+            description = _clean((risk or {}).get("description"))
+            print(
+                f"{indent}  - {_truncate_text(title or description or 'Unspecified risk')}"
+            )
+
+    if unknowns:
+        print(f"{indent}{YELLOW}Open questions:{RESET}")
+        for unknown in unknowns[:item_limit]:
+            question = _clean((unknown or {}).get("question"))
+            summary = _clean((unknown or {}).get("summary"))
+            print(
+                f"{indent}  - {_truncate_text(question or summary or 'Unspecified question')}"
+            )
 
 
 def _print_task_detail(
@@ -926,6 +1020,16 @@ def _app_url_from_api_url(api_url: str) -> str:
     return resolved
 
 
+def _current_app_url() -> str:
+    auth = load_auth()
+    api_url = (
+        _clean(_state.api_url)
+        or _clean(auth.get("api_url"))
+        or DEFAULT_API_URL
+    )
+    return _app_url_from_api_url(api_url)
+
+
 def _encode_prefill_draft(payload: dict) -> str:
     encoded = base64.urlsafe_b64encode(
         json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -1083,6 +1187,12 @@ def _build_continue_brief(
         for item in (task.get("acceptance_criteria") or [])
         if str(item).strip()
     ]
+    enrichment_sources = plan.get("enrichment_sources") or []
+    analysis = _plan_analysis(plan)
+    risks = analysis.get("risks") if isinstance(analysis.get("risks"), list) else []
+    unknowns = (
+        analysis.get("unknowns") if isinstance(analysis.get("unknowns"), list) else []
+    )
 
     lines = [
         f"Task: {task_title}",
@@ -1106,13 +1216,36 @@ def _build_continue_brief(
         lines.append(
             f"Additional task context is available via: keshro task view {task_id} -p {resolved_plan_id}"
         )
+    if enrichment_sources:
+        names = [_clean(s.get("name")) for s in enrichment_sources if _clean(s.get("name"))]
+        if names:
+            lines.append(f"Enriched by: {', '.join(names)}")
+    if risks:
+        lines.append("Top plan risks:")
+        for risk in risks[:2]:
+            title = _clean((risk or {}).get("title"))
+            description = _clean((risk or {}).get("description"))
+            lines.append(
+                f"  - {_truncate_text(title or description or 'Unspecified risk')}"
+            )
+    if unknowns:
+        lines.append("Open questions:")
+        for unknown in unknowns[:2]:
+            question = _clean((unknown or {}).get("question"))
+            summary = _clean((unknown or {}).get("summary"))
+            lines.append(
+                f"  - {_truncate_text(question or summary or 'Unspecified question')}"
+            )
+        lines.append(f"Review full risks/questions in UI: {_current_app_url()}/plans/{resolved_plan_id}")
     lines.extend(
         [
             "",
             "Execution reminders:",
             f'- Start work with: `keshro task start {task_id} -p {resolved_plan_id} --reason "session:{session_id}"`',
             f'- Record concise progress notes with: `keshro task note {task_id} -p {resolved_plan_id} -n "..."`',
+            "- The current task and plan context are already included below. Do not re-fetch them with `keshro plan view` or `keshro task next` before you start working.",
             "- Only mark the task blocked if work cannot continue. If local sources let you proceed, note the limitation instead.",
+            "- If a keshro command fails with a connection error, retry once after 5 seconds. For any other error, say what happened and keep working unless the failure blocks the task.",
             "- Before `keshro task done`, include `Acceptance criteria met:` and `Verification:` in the completion note.",
             f"- You can monitor progress with `keshro status -p {resolved_plan_id} --watch` or `keshro status -p {resolved_plan_id} --tui`.",
         ]
@@ -1405,6 +1538,30 @@ def _build_continue_prompt(
         names = [s.get("name", "") for s in enrichment_sources if s.get("name")]
         if names:
             task_block.append(f"Plan context sources: {', '.join(names)}")
+
+    analysis = _plan_analysis(plan)
+    risks = analysis.get("risks") if isinstance(analysis.get("risks"), list) else []
+    unknowns = (
+        analysis.get("unknowns") if isinstance(analysis.get("unknowns"), list) else []
+    )
+    if risks:
+        task_block.append("Top plan risks:")
+        for risk in risks[:2]:
+            title = _clean((risk or {}).get("title"))
+            description = _clean((risk or {}).get("description"))
+            task_block.append(
+                f"  - {_truncate_text(title or description or 'Unspecified risk')}"
+            )
+    if unknowns:
+        task_block.append("Open questions:")
+        for unknown in unknowns[:2]:
+            question = _clean((unknown or {}).get("question"))
+            summary = _clean((unknown or {}).get("summary"))
+            task_block.append(
+                f"  - {_truncate_text(question or summary or 'Unspecified question')}"
+            )
+        plan_url = f"{_current_app_url()}/plans/{resolved_plan_id}"
+        task_block.append(f"Review full risks/questions in UI: {plan_url}")
 
     continuation = [
         "",
@@ -2224,11 +2381,24 @@ def _view_task(plan_id: str | None, task_id: str) -> None:
 
 
 def _get_plan_or_exit(plan_id: str | None) -> dict:
+    explicit_plan_id = _clean(plan_id)
     resolved_plan_id = _require_plan_context(plan_id)
-    with make_client(_state.api_url, _state.token) as client:
-        res = client.get(f"/v1/plans/{resolved_plan_id}")
-        res.raise_for_status()
-        return res.json()
+    try:
+        with make_client(_state.api_url, _state.token) as client:
+            res = client.get(f"/v1/plans/{resolved_plan_id}")
+            res.raise_for_status()
+            return res.json()
+    except httpx.HTTPStatusError as exc:
+        response = exc.response
+        cached_plan_id = _clean(load_auth().get("default_plan_id"))
+        if (
+            not explicit_plan_id
+            and response is not None
+            and response.status_code == 404
+            and cached_plan_id == resolved_plan_id
+        ):
+            update_auth({"default_plan_id": None, "default_plan_title": None})
+        raise
 
 
 def _find_task(plan: dict, task_id: str) -> dict | None:
@@ -3923,6 +4093,15 @@ def _print_plan_status(plan: dict) -> None:
     )
     print()
 
+    _print_plan_enrichment(plan)
+    _print_plan_analysis(plan)
+    if plan.get("enrichment_sources") or _plan_analysis(plan):
+        plan_id = _clean(plan.get("id"))
+        if plan_id:
+            app_url = _current_app_url()
+            print(f"  {DIM}Review in UI: {app_url}/plans/{plan_id}{RESET}")
+        print()
+
     # Status symbols
     STATUS_ICON = {
         "completed": f"{GREEN}✓{RESET}",
@@ -4069,13 +4248,6 @@ def _print_plan_status(plan: dict) -> None:
                     f"    {DIM}{model}: {m_tasks} task{'s' if m_tasks != 1 else ''} · {m_tokens:,} tok · ${m_cost:.2f}{RESET}"
                 )
 
-    # Enrichment sources
-    sources = plan.get("enrichment_sources") or []
-    if sources:
-        names = [s.get("name", "") for s in sources if s.get("name")]
-        if names:
-            print(f"  {DIM}Informed by: {', '.join(names)}{RESET}")
-
     print()
 
 
@@ -4160,11 +4332,6 @@ def _run_status(plan_id: str | None, watch: bool = False, tui: bool = False) -> 
 
     if not watch:
         _print_plan_status(plan)
-        # Also show dependency graph
-        from .graph import render_plan_summary
-
-        print()
-        print(render_plan_summary(plan))
         return
 
     # Try SSE first, fall back to polling
@@ -5799,28 +5966,11 @@ def _plan_generate(
     print(f"  Tasks: {len(steps)}")
     print(f"  Status: {plan.get('status', 'draft')}")
 
-    # Show enrichment sources
-    sources = plan.get("enrichment_sources") or []
-    if sources:
-        names = [s.get("name", "") for s in sources if s.get("name")]
-        if names:
-            print(f"  Informed by: {', '.join(names)}")
-
-    # Show analysis if available
-    analysis = plan.get("decisions") or {}
-    if isinstance(analysis, dict):
-        conf = analysis.get("confidence_score")
-        risks = analysis.get("risks") or []
-        unknowns = analysis.get("unknowns") or []
-        parts = []
-        if conf is not None:
-            parts.append(f"confidence: {conf}%")
-        if risks:
-            parts.append(f"{len(risks)} risk{'s' if len(risks) != 1 else ''}")
-        if unknowns:
-            parts.append(f"{len(unknowns)} unknown{'s' if len(unknowns) != 1 else ''}")
-        if parts:
-            print(f"  Analysis: {' · '.join(parts)}")
+    _print_plan_enrichment(plan)
+    _print_plan_analysis(plan)
+    if plan.get("enrichment_sources") or _plan_analysis(plan):
+        app_url = _current_app_url()
+        print(f"  Review in UI: {app_url}/plans/{plan_id}")
 
     if steps:
         print(f"\n{CYAN}Tasks:{RESET}")

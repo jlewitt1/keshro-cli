@@ -577,6 +577,56 @@ def test_continue_prompt_mentions_status_tracking_and_blocking_rule(
     assert "Only mark the task blocked if work cannot continue" in out
 
 
+def test_continue_prompt_surfaces_plan_risks_unknowns_and_ui_link(
+    fake_client, monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        "keshro_cli.cli.load_auth",
+        lambda: {**_auth_with_plan(), "api_url": "http://localhost:8000"},
+    )
+    monkeypatch.setattr(
+        "keshro_cli.client.load_auth",
+        lambda: {**_auth_with_plan(), "api_url": "http://localhost:8000"},
+    )
+    _bypass_auth(monkeypatch)
+
+    original_get = fake_client.get
+
+    def _get(path, params=None, headers=None, timeout=None):
+        response = original_get(path, params=params, headers=headers, timeout=timeout)
+        if path != "/v1/plans/plan-123":
+            return response
+        plan = response.json()
+        plan["enrichment_sources"] = [
+            {
+                "name": "Web research",
+                "detail": "Best practices for AWS Batch -> https://docs.aws.amazon.com/batch/latest/userguide/best-practices.html",
+            }
+        ]
+        plan["decisions"] = {
+            "risks": [
+                {
+                    "title": "Rollback path is unclear",
+                    "description": "Current cutover steps do not define a clean rollback.",
+                }
+            ],
+            "unknowns": [
+                {
+                    "question": "Which environments need phased rollout first?",
+                }
+            ],
+        }
+        return _FakeResponse(plan)
+
+    fake_client.get = _get
+    cli.main(["continue"])
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+    assert "Top plan risks:" in out
+    assert "Open questions:" in out
+    assert "Review full risks/questions in UI: http://localhost:3000/plans/plan-123" in out
+    assert "Source highlights:" not in out
+
+
 def test_continue_in_agent_mode_resumes_in_progress_task_before_next_todo(
     fake_client, monkeypatch, capsys
 ):
@@ -1044,7 +1094,7 @@ def test_require_plan_context_can_resolve_repo_link(monkeypatch):
     assert cli._require_plan_context(None) == "plan-123"
 
 
-def test_current_plan_id_prefers_cached_default_before_repo_resolution(monkeypatch):
+def test_current_plan_id_prefers_repo_resolution_before_cached_default(monkeypatch):
     monkeypatch.setattr(
         "keshro_cli.cli.load_auth",
         lambda: {
@@ -1052,15 +1102,67 @@ def test_current_plan_id_prefers_cached_default_before_repo_resolution(monkeypat
             "default_plan_title": "Cached plan",
         },
     )
+    saved = {}
 
-    def _fail_resolve(*args, **kwargs):
-        raise AssertionError(
-            "repo resolution should not run when default plan is cached"
-        )
+    monkeypatch.setattr(
+        "keshro_cli.cli.update_auth", lambda payload: saved.update(payload) or payload
+    )
+    monkeypatch.setattr(
+        "keshro_cli.cli._resolve_repo_linked_plan",
+        lambda *args, **kwargs: ("plan-linked", "Repo linked plan"),
+    )
 
-    monkeypatch.setattr("keshro_cli.cli._resolve_repo_linked_plan", _fail_resolve)
+    assert cli._current_plan_id(None) == "plan-linked"
+    assert saved["default_plan_id"] == "plan-linked"
+    assert saved["default_plan_title"] == "Repo linked plan"
 
-    assert cli._current_plan_id(None) == "plan-cached"
+
+def test_get_plan_or_exit_clears_stale_cached_default_on_404(monkeypatch):
+    saved = {}
+    monkeypatch.setattr(
+        "keshro_cli.cli.load_auth",
+        lambda: {
+            "default_plan_id": "plan-stale",
+            "default_plan_title": "Stale plan",
+        },
+    )
+    monkeypatch.setattr(
+        "keshro_cli.cli._resolve_repo_linked_plan",
+        lambda *args, **kwargs: (None, None),
+    )
+    monkeypatch.setattr(
+        "keshro_cli.cli.update_auth", lambda payload: saved.update(payload) or payload
+    )
+
+    class _404Response:
+        status_code = 404
+
+        def __init__(self):
+            self.request = httpx.Request("GET", "http://localhost:8000/v1/plans/plan-stale")
+
+        def json(self):
+            return {"detail": "Plan not found"}
+
+    class _MissingPlanClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, path, params=None, headers=None, timeout=None):
+            response = _404Response()
+            raise httpx.HTTPStatusError("Plan not found", request=response.request, response=response)
+
+    monkeypatch.setattr(
+        "keshro_cli.cli.make_client", lambda api_url=None, token=None: _MissingPlanClient()
+    )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        cli._get_plan_or_exit(None)
+
+    assert saved["default_plan_id"] is None
+    assert saved["default_plan_title"] is None
 
 
 def test_install_codex_integration_replaces_existing_managed_block(
@@ -2225,3 +2327,62 @@ def test_status_shows_cost_summary(fake_client, capsys, monkeypatch):
     assert "250,000 tokens" in out
     assert "claude-sonnet-4" in out
     assert "Greptile" in out
+
+
+def test_status_surfaces_enrichment_analysis_and_ui_review_link(
+    fake_client, capsys, monkeypatch
+):
+    _auth = {
+        **_auth_with_plan(),
+        "token": "ksh_pat_test",
+        "api_url": "http://localhost:8000",
+    }
+    monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: _auth)
+    monkeypatch.setattr("keshro_cli.client.load_auth", lambda: _auth)
+    original_get = fake_client.get
+
+    def _get_status(path, params=None, headers=None, timeout=None):
+        if path == "/v1/plans/plan-123":
+            return _FakeResponse(
+                {
+                    "id": "plan-123",
+                    "title": "Kubetorch Helm Chart Horizontal Scaling Enhancement",
+                    "status": "draft",
+                    "source_type": "",
+                    "target_type": "",
+                    "updated_at": "2026-03-11T15:30:00Z",
+                    "plan_steps": [
+                        {
+                            "id": "t1",
+                            "order": 1,
+                            "title": "Audit current chart structure",
+                            "status": "todo",
+                        }
+                    ],
+                    "task_feedback_events": [],
+                    "enrichment_sources": [
+                        {
+                            "name": "Web research",
+                            "detail": "Best practices for Helm charts -> https://example.com/helm",
+                        }
+                    ],
+                    "decisions": {
+                        "confidence_score": 74,
+                        "risks": [{"title": "Autoscaling values may break existing installs"}],
+                        "unknowns": [{"question": "Which clusters need backwards compatibility?"}],
+                    },
+                }
+            )
+        return original_get(path, params=params, headers=headers, timeout=timeout)
+
+    fake_client.get = _get_status
+    code = cli.main(["status", "-p", "plan-123"])
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+    assert code == 0
+    assert "Enriched by: Web research" in out
+    assert "Analysis: confidence: 74% · 1 risk · 1 open question" in out
+    assert "Top risks:" in out
+    assert "Open questions:" in out
+    assert "Review in UI: http://localhost:3000/plans/plan-123" in out
+    assert "Best practices for Helm charts" not in out
+    assert "├──" not in out
