@@ -1083,11 +1083,7 @@ def _app_url_from_api_url(api_url: str) -> str:
 
 def _current_app_url() -> str:
     auth = load_auth()
-    api_url = (
-        _clean(_state.api_url)
-        or _clean(auth.get("api_url"))
-        or DEFAULT_API_URL
-    )
+    api_url = _clean(_state.api_url) or _clean(auth.get("api_url")) or DEFAULT_API_URL
     return _app_url_from_api_url(api_url)
 
 
@@ -1278,7 +1274,9 @@ def _build_continue_brief(
             f"Additional task context is available via: keshro task view {task_id} -p {resolved_plan_id}"
         )
     if enrichment_sources:
-        names = [_clean(s.get("name")) for s in enrichment_sources if _clean(s.get("name"))]
+        names = [
+            _clean(s.get("name")) for s in enrichment_sources if _clean(s.get("name"))
+        ]
         if names:
             lines.append(f"Enriched by: {', '.join(names)}")
     if risks:
@@ -1297,7 +1295,9 @@ def _build_continue_brief(
             lines.append(
                 f"  - {_truncate_text(question or summary or 'Unspecified question')}"
             )
-        lines.append(f"Review full risks/questions in UI: {_current_app_url()}/plans/{resolved_plan_id}")
+        lines.append(
+            f"Review full risks/questions in UI: {_current_app_url()}/plans/{resolved_plan_id}"
+        )
     lines.extend(
         [
             "",
@@ -1694,19 +1694,51 @@ def _build_parallel_prompt(
     task_title = _clean(task.get("title")) or "Untitled task"
     branch_name = f"keshro/{_task_title_slug(task_title)}"
 
-    parallel_context = "\n".join(
-        [
-            "",
-            "PARALLEL EXECUTION MODE:",
-            f"- You are one of {total_agents} agents running concurrently in isolated git worktrees.",
-            "- You are responsible for exactly ONE task. Complete it, then exit. Do NOT pull the next task.",
-            f"- Create your changes on a branch named `{branch_name}`.",
-            "- Other agents are working on other tasks simultaneously — note any potential file conflicts in your completion notes.",
-            "- Do not ask the user for confirmation — execute autonomously.",
-            f"- When done, mark the task complete: `keshro task done {task_id} -p {resolved_plan_id}`",
-            f'- If the task fails, mark it blocked: `keshro task block {task_id} -p {resolved_plan_id} -r "reason"`',
-        ]
-    )
+    # Collect file changes from other tasks so this agent knows what's been touched
+    other_files_lines = []
+    steps = plan.get("plan_steps") or []
+    for s in steps:
+        if s.get("id") == task.get("id"):
+            continue
+        s_status = (s.get("status") or "").lower()
+        if s_status not in ("completed", "in_progress"):
+            continue
+        s_files = s.get("related_files") or []
+        s_notes = s.get("notes") or ""
+        # Extract files from notes (format: "Files created: x, y | Files modified: z")
+        import re as _re
+
+        note_files = _re.findall(
+            r"Files (?:created|modified|changed):\s*([^\n|]+)", s_notes
+        )
+        all_files = set(s_files)
+        for nf in note_files:
+            for f in nf.split(","):
+                f = f.strip().split("(")[0].strip()  # remove descriptions in parens
+                if f:
+                    all_files.add(f)
+        if all_files:
+            status_label = "done" if s_status == "completed" else "active"
+            other_files_lines.append(
+                f"  [{status_label}] {_clean(s.get('title'))}: {', '.join(sorted(all_files)[:10])}"
+            )
+
+    parallel_parts = [
+        "",
+        "PARALLEL EXECUTION MODE:",
+        f"- You are one of {total_agents} agents running concurrently in isolated git worktrees.",
+        "- You are responsible for exactly ONE task. Complete it, then exit. Do NOT pull the next task.",
+        f"- Create your changes on a branch named `{branch_name}`.",
+        "- Do not ask the user for confirmation — execute autonomously.",
+        f"- When done, mark the task complete: `keshro task done {task_id} -p {resolved_plan_id}`",
+        f'- If the task fails, mark it blocked: `keshro task block {task_id} -p {resolved_plan_id} -r "reason"`',
+    ]
+    if other_files_lines:
+        parallel_parts.append("")
+        parallel_parts.append("Files touched by other agents (avoid conflicts):")
+        parallel_parts.extend(other_files_lines)
+
+    parallel_context = "\n".join(parallel_parts)
     return base_prompt + parallel_context
 
 
