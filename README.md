@@ -1,88 +1,132 @@
 # Keshro CLI
 
-The intelligent execution layer for coding agents. Keshro makes agents learn from each other, execute safely in parallel, and not ship garbage.
+Keshro is the execution layer for coding agents.
+
+It turns a plan into a coordinated execution loop: the next task is selected, the agent gets the right context, progress is tracked as work happens, and the plan stays readable in both the CLI and the web app.
+
+## What it does
+
+- turns project plans into executable task queues
+- gives agents compact, task-specific execution briefs
+- tracks notes, blockers, artifacts, decisions, and completion state
+- launches parallel agents in isolated git worktrees
+- carries forward relevant context from earlier completed tasks
+- links back to the Keshro web UI when review is easier there
+
+## Who this is for
+
+Use the CLI if you want Keshro to drive execution from your terminal or inside an existing coding-agent workflow.
+
+This is the default Keshro interface for:
+
+- Claude Code
+- Codex
+- Cursor
+- terminal-first agent workflows
+
+If you specifically want an MCP server instead, use [`keshro-mcp`](../keshro-mcp).
 
 ## Install
 
 ```bash
-curl -fsSL https://api.keshro.com/v1/cli/install | sh -s -- ksh_pat_...
+pip install keshro
 ```
 
-This downloads, installs, and authenticates in one step. Get your token from **Account → API** in the Keshro app.
-
-### From source
+Or with `uv`:
 
 ```bash
+uv tool install keshro
+```
+
+Or from source:
+
+```bash
+git clone https://github.com/jlewitt1/keshro-cli.git
+cd keshro-cli
 pip install -e ".[dev]"
-# or with uv:
-uv tool install .
 ```
 
-## Auth
+## Quickstart
+
+### 1. Log in
 
 ```bash
-keshro login ksh_pat_...     # First-time login
-keshro login                 # Reuse saved session
-keshro logout
+keshro login ksh_pat_...
 ```
 
-Auth state is stored in `~/.keshro/auth.json`. `keshro login` installs the global Claude Code slash command and global Codex instructions in `~/.codex/AGENTS.md`. If you also want Cursor integration, run `keshro setup` inside each repo where you want `.cursorrules` instructions.
+Get your token from **Account -> API** at [keshro.com](https://keshro.com).
 
-When you save or create a plan from a repo, Keshro stores that repo-to-plan link server-side so CLI commands can resolve the active plan from the current checkout.
+Auth is stored at `~/.keshro/auth.json`.
 
-The CLI talks to `https://api.keshro.com` by default — override with `KESHRO_API_URL`.
+`keshro login` also installs:
 
-## Commands
+- the global Claude Code slash command
+- global Codex instructions in `~/.codex/AGENTS.md`
+
+If you also want Cursor repo rules, run `keshro setup` inside the repo you want Cursor to use.
+
+### 2. Create or import a plan
+
+```bash
+keshro plan generate "Refactor the auth layer to support API keys and rate limiting"
+```
+
+Or import from a tracker:
+
+```bash
+keshro import linear --project <key>
+```
+
+### 3. Review status
+
+```bash
+keshro status -p <plan-id>
+```
+
+### 4. Execute
+
+```bash
+keshro continue -p <plan-id>
+```
+
+If the plan is still a draft:
+
+```bash
+keshro continue -p <plan-id> --confirm
+```
+
+## Core commands
 
 ### Execution
 
 ```bash
-keshro continue -p <plan-id>                      # Coordinator mode: launch parallel agents from your terminal
-keshro continue -p <plan-id> --confirm             # Approve and execute a draft plan
-keshro continue -p <plan-id> --all                 # Auto-continue through all tasks
-keshro continue -p <plan-id> --concurrency 10      # Up to 10 agents at once (default 5)
-keshro continue -p <plan-id> --dry-run             # Preview which tasks would launch
-keshro continue -p <plan-id> --dir /path/to/repo   # Point agent(s) at a different codebase
-keshro continue -p <plan-id> --no-parallel         # Coordinator mode: force one task at a time
-keshro status -p <plan-id>                         # Live dashboard of all tasks and agents
-keshro status --watch                              # Auto-refresh every 10 seconds
-keshro status --tui                                # Interactive dashboard with plan insights and live events
-keshro setup-claude                                # Install global Claude Code slash command
+keshro continue -p <plan-id>
+keshro continue -p <plan-id> --confirm
+keshro continue -p <plan-id> --all
+keshro continue -p <plan-id> --concurrency 10
+keshro continue -p <plan-id> --dry-run
+keshro continue -p <plan-id> --dir /path/to/repo
+keshro continue -p <plan-id> --no-parallel
 ```
 
-`keshro status` also surfaces plan enrichment, top risks, open questions, and a direct app URL when the web UI is the better place to review or edit that context.
-
-### What happens when you run `keshro continue`
-
-From your terminal, `keshro continue` acts as the coordinator: it can launch parallel Claude Code agents in isolated git worktrees, one per actionable task, respecting dependency order. When the same command runs inside a coding agent (piped stdout), it switches to worker mode automatically and resumes exactly one task instead of spawning more agents.
-
-Inside a coding agent, `keshro continue` prints a compact task brief instead of the full internal execution prompt. If the agent needs the extra task context, it can fetch it explicitly with `keshro task view <task-id> -p <plan-id>`. Users can monitor progress separately with `keshro status -p <plan-id> --watch` or `keshro status -p <plan-id> --tui`.
-
-**Intelligent execution features:**
-
-- **Topical context** — when one agent discovers something about IAM, every future IAM-related task gets that context automatically. Learnings route by domain tag, not just sequence.
-- **Parallel worktrees** — multiple agents run simultaneously in isolated git worktrees. No merge conflicts.
-- **Git checkpoints** — auto-commit before each task for one-command rollback.
-- **Task splitting** — parallelizable tasks auto-decompose into sub-tasks for other agents.
-- **Task handoff** — "Next task should know:" notes flow to the next task's prompt.
-- **Validation gates** — agents verify changes (lint, tests, syntax) before marking done.
-- **Session history** — completed task summaries + git changes since last checkpoint.
-- **Draft plan gate** — draft plans require `--confirm` before first execution.
-- **Auto-continue** — `--all` runs through all tasks without pausing.
-- **Agent session IDs** — each session gets a unique ID for multi-agent tracking.
-- **Multi-repo** — `--dir` points Claude at a codebase in a different directory.
-
-### Plan management
+### Status and monitoring
 
 ```bash
-keshro plan view <plan-id>
-keshro plan list
-keshro plan update <plan-id> --status ready
-keshro plan create --title "..." --source-type "..." --target-type "..."
-keshro import linear --project <key>               # Import from Linear
+keshro status -p <plan-id>
+keshro status --watch
+keshro status --tui
 ```
 
-### Task management
+`keshro status` surfaces:
+
+- task progress
+- blocked work
+- enrichment context
+- top risks
+- open questions
+- direct links to the Keshro web app when the UI is the better place to review something
+
+### Task lifecycle
 
 ```bash
 keshro task next -p <plan-id>
@@ -93,36 +137,80 @@ keshro task block <task-id> -p <plan-id> -r "..."
 keshro task unblock <task-id> -p <plan-id>
 keshro task done <task-id> -p <plan-id> -n "Acceptance criteria met: ... Verification: ..."
 keshro task decide <task-id> -p <plan-id> --context "..." --choice "..." --reasoning "..."
+```
+
+### Plan management
+
+```bash
+keshro plan view <plan-id>
+keshro plan list
+keshro plan update <plan-id> --status active
+keshro plan create --title "..." --source-type "..." --target-type "..."
+```
+
+### Review and rollback
+
+```bash
 keshro explain <task-id> -p <plan-id>
 keshro rollback <task-id> -p <plan-id>
 ```
 
-## How it works
+## How `keshro continue` works
 
-The CLI is a thin HTTP client over the Keshro API with an intelligent prompt builder on top. Every command calls the hosted Keshro backend — the CLI doesn't store plans or state locally.
+When run from your terminal, `keshro continue` acts as the coordinator:
 
-The execution engine (`keshro continue`) builds a structured prompt that includes:
-1. The current task with description and acceptance criteria
-2. Prior progress from completed tasks
-3. **Sequential handoff** — explicit "Next task should know:" notes from previous tasks
-4. **Topical context** — learnings from any completed task that shares domain tags (e.g. IAM, Airflow, Terraform)
-5. Git state since the last checkpoint
-6. Workspace configuration
+- it finds the next actionable task
+- can launch parallel agents in isolated git worktrees
+- respects dependency order
+- keeps task state synced back to the plan
 
-The CLI prints a compact execution brief to stdout for the coding agent to follow, with `keshro task view` available when the agent needs the fuller task context.
+When the same command runs inside a coding agent, it switches to worker mode automatically and prints a compact task brief instead of spawning more agents.
+
+That brief includes:
+
+1. the current task
+2. acceptance criteria
+3. relevant notes from completed tasks
+4. explicit handoff notes
+5. topical context from related earlier work
+6. repo and git state when available
+
+If the agent needs full task detail, it can fetch it explicitly:
+
+```bash
+keshro task view <task-id> -p <plan-id>
+```
+
+## Execution model
+
+Keshro is designed around real execution, not just static planning.
+
+Key behaviors:
+
+- **Parallel worktrees**: multiple agents can run safely at once
+- **Topical context routing**: relevant learnings flow by domain, not just task order
+- **Task splitting**: parallelizable work can be broken into subtasks
+- **Git checkpoints**: rollback points exist before task execution
+- **Validation gates**: agents can verify changes before closing tasks
+- **Draft gating**: draft plans require explicit confirmation before execution
+- **Session tracking**: work is associated with agent sessions and execution metadata
+
+## Configuration
+
+By default, the CLI talks to:
+
+```text
+https://api.keshro.com
+```
+
+Override with:
+
+```bash
+export KESHRO_API_URL="https://your-keshro-api"
+```
 
 ## Publishing
 
-### Via GitHub Actions (recommended)
-
-1. Update version in `pyproject.toml` and push
-2. Go to Actions → "Publish CLI" → Run workflow
-
-### Manual
-
-```bash
-python -m build --sdist
-curl -X PUT -H "X-Deploy-Secret: $DEPLOY_SECRET" \
-  -F "file=@dist/keshro-0.1.0.tar.gz" \
-  https://api.keshro.com/v1/cli/upload
-```
+1. Update the version in `pyproject.toml`
+2. Create a GitHub release (or run the `Publish CLI` workflow manually)
+3. The package is published to PyPI automatically via trusted publishing

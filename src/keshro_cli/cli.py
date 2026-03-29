@@ -1073,7 +1073,7 @@ def _merge_clarifier_answers(
 def _app_url_from_api_url(api_url: str) -> str:
     resolved = _clean(api_url).rstrip("/")
     if not resolved:
-        return "https://app.keshro.com"
+        return "https://keshro.com"
     if "localhost" in resolved or "127.0.0.1" in resolved:
         return resolved.replace("://api.", "://").replace(":8000", ":3000")
     if "api." in resolved:

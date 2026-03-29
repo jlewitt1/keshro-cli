@@ -2,19 +2,15 @@ name: Publish CLI
 
 on:
   workflow_dispatch:
-    inputs:
-      environment:
-        description: "Deploy to production or staging"
-        required: true
-        default: "production"
-        type: choice
-        options:
-          - production
-          - staging
+  release:
+    types: [published]
 
 jobs:
   publish:
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # Required for PyPI trusted publishing
+
     steps:
       - uses: actions/checkout@v4
 
@@ -25,26 +21,8 @@ jobs:
       - name: Install build tools
         run: pip install build
 
-      - name: Build sdist
-        run: python -m build --sdist
+      - name: Build package
+        run: python -m build
 
-      - name: Upload to Keshro API
-        env:
-          DEPLOY_SECRET: ${{ secrets.DEPLOY_SECRET }}
-          API_URL: ${{ inputs.environment == 'production' && 'https://api.keshro.com' || 'http://localhost:8000' }}
-        run: |
-          PACKAGE=$(ls dist/keshro-*.tar.gz)
-          echo "Uploading $PACKAGE to $API_URL..."
-          HTTP_CODE=$(curl -fsSL -w "%{http_code}" \
-            -X PUT \
-            -H "X-Deploy-Secret: $DEPLOY_SECRET" \
-            -F "file=@$PACKAGE" \
-            "$API_URL/v1/cli/upload" \
-            -o /tmp/upload-response.json)
-          cat /tmp/upload-response.json
-          echo ""
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "Upload failed (HTTP $HTTP_CODE)"
-            exit 1
-          fi
-          echo "Published successfully."
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
