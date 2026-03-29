@@ -3849,6 +3849,14 @@ keshro task block <task-id> -r "reason"
 keshro task unblock <task-id>
 ```
 
+## Plan management
+```bash
+keshro plan list
+keshro plan view <plan-id>
+keshro plan update <plan-id> --status active
+keshro plan delete <plan-id>
+```
+
 ## Review and rollback
 ```bash
 keshro explain <task-id>
