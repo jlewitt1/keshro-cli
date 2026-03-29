@@ -46,8 +46,11 @@ keshro continue -p <plan-id> --dir /path/to/repo   # Point agent(s) at a differe
 keshro continue -p <plan-id> --no-parallel         # Coordinator mode: force one task at a time
 keshro status -p <plan-id>                         # Live dashboard of all tasks and agents
 keshro status --watch                              # Auto-refresh every 10 seconds
+keshro status --tui                                # Interactive dashboard with plan insights and live events
 keshro setup-claude                                # Install global Claude Code slash command
 ```
+
+`keshro status` also surfaces plan enrichment, top risks, open questions, and a direct app URL when the web UI is the better place to review or edit that context.
 
 ### What happens when you run `keshro continue`
 

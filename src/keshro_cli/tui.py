@@ -23,6 +23,61 @@ STATUS_ICONS = {
 }
 
 
+def _clean(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _plan_analysis(plan: dict) -> dict:
+    decisions = plan.get("decisions") or {}
+    return decisions if isinstance(decisions, dict) else {}
+
+
+def _extract_source_titles(source: dict, limit: int = 3) -> list[str]:
+    titles: list[str] = []
+    for item in source.get("sources") or []:
+        title = _clean(item.get("title") or item.get("label") or item.get("url"))
+        if title and title not in titles:
+            titles.append(title)
+        if len(titles) >= limit:
+            return titles
+    detail = _clean(source.get("detail"))
+    if not detail:
+        return titles
+    for raw_line in detail.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        for separator in (" -> ", " — ", " - https://", " - http://"):
+            if separator in line:
+                line = line.split(separator, 1)[0].strip()
+                break
+        if line.startswith("http://") or line.startswith("https://"):
+            continue
+        if line and line not in titles:
+            titles.append(line)
+        if len(titles) >= limit:
+            break
+    return titles
+
+
+def _truncate_text(value: str, limit: int = 110) -> str:
+    text = _clean(value)
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def _app_url_from_api_url(api_url: str) -> str:
+    clean = api_url.rstrip("/")
+    if clean.endswith(":8000"):
+        return clean[:-5] + ":3000"
+    if clean.endswith("/api"):
+        return clean[:-4]
+    return clean
+
+
 class PlanOverview(Static):
     """Shows plan title, progress bar, and summary stats."""
 
@@ -72,6 +127,71 @@ class PlanOverview(Static):
         return "\n".join(lines)
 
 
+class PlanInsights(Static):
+    """Shows enrichment context, risks, open questions, and UI review link."""
+
+    plan_data: reactive[dict | None] = reactive(None)
+    app_url: reactive[str] = reactive("")
+
+    def render(self) -> str:
+        if not self.plan_data:
+            return "[dim]No plan insights yet[/dim]"
+        plan = self.plan_data
+        analysis = _plan_analysis(plan)
+        sources = plan.get("enrichment_sources") or []
+        if not sources and not analysis:
+            return "[dim]No plan insights yet[/dim]"
+
+        lines = ["[bold]PLAN INSIGHTS[/bold]", ""]
+
+        if sources:
+            names = [_clean(source.get("name")) for source in sources if _clean(source.get("name"))]
+            if names:
+                lines.append(f"[cyan]Enriched by:[/cyan] {', '.join(names)}")
+            highlights: list[str] = []
+            for source in sources[:2]:
+                for title in _extract_source_titles(source, limit=2):
+                    if title not in highlights:
+                        highlights.append(title)
+                    if len(highlights) >= 3:
+                        break
+                if len(highlights) >= 3:
+                    break
+            for title in highlights:
+                lines.append(f"  [dim]• {_truncate_text(title, 90)}[/dim]")
+            if highlights:
+                lines.append("")
+
+        confidence = analysis.get("confidence_score")
+        risks = analysis.get("risks") or []
+        unknowns = analysis.get("unknowns") or []
+        summary_bits: list[str] = []
+        if isinstance(confidence, (int, float)):
+            summary_bits.append(f"confidence {confidence:.0%}")
+        if risks:
+            summary_bits.append(f"{len(risks)} risks")
+        if unknowns:
+            summary_bits.append(f"{len(unknowns)} open questions")
+        if summary_bits:
+            lines.append(f"[dim]{'  │  '.join(summary_bits)}[/dim]")
+
+        if risks:
+            lines.append("[red]Top risks:[/red]")
+            for risk in risks[:3]:
+                lines.append(f"  • {_truncate_text(risk, 100)}")
+        if unknowns:
+            if risks:
+                lines.append("")
+            lines.append("[yellow]Open questions:[/yellow]")
+            for unknown in unknowns[:3]:
+                lines.append(f"  • {_truncate_text(unknown, 100)}")
+
+        if self.app_url:
+            lines.extend(["", f"[dim]Review in UI:[/dim] [link={self.app_url}/plans/{plan.get('id', '')}]{self.app_url}/plans/{plan.get('id', '')}[/link]"])
+
+        return "\n".join(lines)
+
+
 class ActiveAgents(Static):
     """Shows currently active tasks (in_progress status)."""
 
@@ -90,8 +210,14 @@ class ActiveAgents(Static):
         lines = ["[bold]ACTIVE TASKS[/bold]", ""]
         for step in sorted(active, key=lambda s: s.get("order", 0)):
             title = step.get("title", "Untitled")
+            owner = _clean(step.get("owner"))
             session = step.get("agent_session_id", "")
-            session_label = f" [dim]{session}[/dim]" if session else ""
+            badges = []
+            if owner:
+                badges.append(owner)
+            if session:
+                badges.append(session)
+            session_label = f" [dim]{' · '.join(badges)}[/dim]" if badges else ""
             elapsed = ""
             updated = step.get("last_updated_at", "")
             if updated:
@@ -207,7 +333,7 @@ class KeshroStatusApp(App):
     CSS = """
     Screen {
         layout: grid;
-        grid-size: 2 2;
+        grid-size: 2 4;
         grid-gutter: 1;
     }
     PlanOverview {
@@ -215,6 +341,13 @@ class KeshroStatusApp(App):
         height: auto;
         min-height: 8;
         border: solid $primary;
+        padding: 1;
+    }
+    PlanInsights {
+        column-span: 2;
+        height: auto;
+        min-height: 8;
+        border: solid $warning;
         padding: 1;
     }
     ActiveAgents {
@@ -257,6 +390,7 @@ class KeshroStatusApp(App):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield PlanOverview(id="overview")
+        yield PlanInsights(id="insights")
         yield ActiveAgents(id="agents")
         yield TaskGraph(id="graph")
         yield RecentEvents(id="events")
@@ -352,6 +486,9 @@ class KeshroStatusApp(App):
             self._last_data = data
 
             self.query_one("#overview", PlanOverview).plan_data = data
+            insights = self.query_one("#insights", PlanInsights)
+            insights.plan_data = data
+            insights.app_url = _app_url_from_api_url(self.api_url)
             self.query_one("#agents", ActiveAgents).plan_data = data
             self.query_one("#graph", TaskGraph).plan_data = data
             self.query_one("#events", RecentEvents).plan_data = data

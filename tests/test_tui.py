@@ -7,6 +7,7 @@ import pytest
 from keshro_cli.tui import (
     ActiveAgents,
     KeshroStatusApp,
+    PlanInsights,
     PlanOverview,
     RecentEvents,
     TaskGraph,
@@ -89,14 +90,76 @@ SAMPLE_PLAN = {
         "total_cost_usd": 1.23,
         "total_tokens": 45000,
     },
+    "enrichment_sources": [
+        {
+            "name": "Web research",
+            "detail": "Best practices for Amazon Managed Workflows for Apache Airflow -> https://docs.aws.amazon.com/mwaa/latest/userguide/best-practices.html\nBest practices for AWS Batch -> https://docs.aws.amazon.com/batch/latest/userguide/best-practices.html",
+        }
+    ],
+    "decisions": {
+        "confidence_score": 0.82,
+        "risks": [
+            "IAM permissions may be too narrow for Airflow workers to reach Batch and Glue.",
+            "Terraform assumptions may not match the existing VPC layout.",
+        ],
+        "unknowns": [
+            "Which environment owns the production DAG bucket?",
+        ],
+    },
+    "id": "plan-abc",
 }
 
 EMPTY_PLAN = {
     "title": "Empty plan",
     "status": "draft",
+    "id": "plan-empty",
     "plan_steps": [],
     "task_feedback_events": [],
 }
+
+
+# ---------------------------------------------------------------------------
+# PlanInsights
+# ---------------------------------------------------------------------------
+
+
+class TestPlanInsights:
+    def test_no_data(self):
+        w = PlanInsights()
+        assert "No plan insights" in w.render()
+
+    def test_no_insights(self):
+        w = PlanInsights()
+        w.plan_data = EMPTY_PLAN
+        assert "No plan insights" in w.render()
+
+    def test_renders_enrichment_and_analysis(self):
+        w = PlanInsights()
+        w.plan_data = SAMPLE_PLAN
+        w.app_url = "http://localhost:3000"
+        text = w.render()
+        assert "Enriched by:" in text
+        assert "Web research" in text
+        assert "confidence 82%" in text
+        assert "2 risks" in text
+        assert "1 open questions" in text
+        assert "Top risks:" in text
+        assert "Open questions:" in text
+        assert "Review in UI:" in text
+        assert "http://localhost:3000/plans/plan-abc" in text
+
+    def test_truncates_long_risks(self):
+        plan = {
+            **SAMPLE_PLAN,
+            "decisions": {
+                "risks": ["A" * 200],
+            },
+        }
+        w = PlanInsights()
+        w.plan_data = plan
+        text = w.render()
+        assert "A" * 120 not in text
+        assert "…" in text
 
 
 # ---------------------------------------------------------------------------
@@ -394,6 +457,7 @@ class TestKeshroStatusApp:
         )
         async with app.run_test():
             assert app.query_one("#overview", PlanOverview)
+            assert app.query_one("#insights", PlanInsights)
             assert app.query_one("#agents", ActiveAgents)
             assert app.query_one("#graph", TaskGraph)
             assert app.query_one("#events", RecentEvents)
@@ -434,6 +498,10 @@ class TestKeshroStatusApp:
             overview = app.query_one("#overview", PlanOverview)
             assert overview.plan_data is not None
             assert overview.plan_data["title"] == "AWS Batch to Airflow pilot"
+
+            insights = app.query_one("#insights", PlanInsights)
+            assert insights.plan_data is not None
+            assert insights.app_url == "http://localhost:3000"
 
             agents = app.query_one("#agents", ActiveAgents)
             assert agents.plan_data is not None

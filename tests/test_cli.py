@@ -577,6 +577,56 @@ def test_continue_prompt_mentions_status_tracking_and_blocking_rule(
     assert "Only mark the task blocked if work cannot continue" in out
 
 
+def test_continue_prompt_surfaces_plan_risks_unknowns_and_ui_link(
+    fake_client, monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        "keshro_cli.cli.load_auth",
+        lambda: {**_auth_with_plan(), "api_url": "http://localhost:8000"},
+    )
+    monkeypatch.setattr(
+        "keshro_cli.client.load_auth",
+        lambda: {**_auth_with_plan(), "api_url": "http://localhost:8000"},
+    )
+    _bypass_auth(monkeypatch)
+
+    original_get = fake_client.get
+
+    def _get(path, params=None, headers=None, timeout=None):
+        response = original_get(path, params=params, headers=headers, timeout=timeout)
+        if path != "/v1/plans/plan-123":
+            return response
+        plan = response.json()
+        plan["enrichment_sources"] = [
+            {
+                "name": "Web research",
+                "detail": "Best practices for AWS Batch -> https://docs.aws.amazon.com/batch/latest/userguide/best-practices.html",
+            }
+        ]
+        plan["decisions"] = {
+            "risks": [
+                {
+                    "title": "Rollback path is unclear",
+                    "description": "Current cutover steps do not define a clean rollback.",
+                }
+            ],
+            "unknowns": [
+                {
+                    "question": "Which environments need phased rollout first?",
+                }
+            ],
+        }
+        return _FakeResponse(plan)
+
+    fake_client.get = _get
+    cli.main(["continue"])
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+    assert "Top plan risks:" in out
+    assert "Open questions:" in out
+    assert "Review full risks/questions in UI: http://localhost:3000/plans/plan-123" in out
+    assert "Source highlights: Best practices for AWS Batch" in out
+
+
 def test_continue_in_agent_mode_resumes_in_progress_task_before_next_todo(
     fake_client, monkeypatch, capsys
 ):
@@ -2225,3 +2275,61 @@ def test_status_shows_cost_summary(fake_client, capsys, monkeypatch):
     assert "250,000 tokens" in out
     assert "claude-sonnet-4" in out
     assert "Greptile" in out
+
+
+def test_status_surfaces_enrichment_analysis_and_ui_review_link(
+    fake_client, capsys, monkeypatch
+):
+    _auth = {
+        **_auth_with_plan(),
+        "token": "ksh_pat_test",
+        "api_url": "http://localhost:8000",
+    }
+    monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: _auth)
+    monkeypatch.setattr("keshro_cli.client.load_auth", lambda: _auth)
+    original_get = fake_client.get
+
+    def _get_status(path, params=None, headers=None, timeout=None):
+        if path == "/v1/plans/plan-123":
+            return _FakeResponse(
+                {
+                    "id": "plan-123",
+                    "title": "Kubetorch Helm Chart Horizontal Scaling Enhancement",
+                    "status": "draft",
+                    "source_type": "",
+                    "target_type": "",
+                    "updated_at": "2026-03-11T15:30:00Z",
+                    "plan_steps": [
+                        {
+                            "id": "t1",
+                            "order": 1,
+                            "title": "Audit current chart structure",
+                            "status": "todo",
+                        }
+                    ],
+                    "task_feedback_events": [],
+                    "enrichment_sources": [
+                        {
+                            "name": "Web research",
+                            "detail": "Best practices for Helm charts -> https://example.com/helm",
+                        }
+                    ],
+                    "decisions": {
+                        "confidence_score": 74,
+                        "risks": [{"title": "Autoscaling values may break existing installs"}],
+                        "unknowns": [{"question": "Which clusters need backwards compatibility?"}],
+                    },
+                }
+            )
+        return original_get(path, params=params, headers=headers, timeout=timeout)
+
+    fake_client.get = _get_status
+    code = cli.main(["status", "-p", "plan-123"])
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+    assert code == 0
+    assert "Enriched by: Web research" in out
+    assert "Web research: Best practices for Helm charts" in out
+    assert "Analysis: confidence: 74% · 1 risk · 1 open question" in out
+    assert "Top risks:" in out
+    assert "Open questions:" in out
+    assert "Review in UI: http://localhost:3000/plans/plan-123" in out
