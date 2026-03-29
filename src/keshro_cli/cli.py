@@ -3877,31 +3877,41 @@ Keshro remembers your active plan. No need to pass `-p` every time.
 - `keshro plan list` — shows all plans
 - `keshro config set --plan-id <id>` — switch active plan
 
+## Execution modes
+
+There are two ways to execute tasks:
+
+**Sequential (you do the work):** Run `keshro continue` to get the next task, execute it yourself, mark done, repeat. Good for tasks that need human judgment or when you want to review each step.
+
+**Parallel (launch agents):** Run `keshro continue --all` to launch multiple AI agents in parallel, each in an isolated git worktree. This is significantly faster for plans with parallelizable tasks. The agents work autonomously — you just monitor progress with `keshro status`.
+
+When the plan has parallelizable tasks, **prefer parallel mode** unless the user specifically asks to do tasks one at a time.
+
 ## Flows
 
 **User says "plan this" or "use keshro":**
 1. Run `keshro create` (or with context/URL)
 2. Run `keshro status` — show the plan
-3. **STOP and ask the user**: "Here's the plan with N tasks. Ready to execute?"
-4. Do NOT run `keshro continue` until the user says to proceed
+3. **STOP and ask the user**: "Here's the plan with N tasks (M parallelizable). Run in parallel or one at a time?"
+4. Do NOT start execution until the user says to proceed
 
-**User says "plan and run this" or "execute this" (explicitly wants execution):**
-1. Run `keshro create`
-2. Run `keshro status`
-3. Run `keshro continue --confirm` — start first task
-4. Execute the task, writing notes along the way
-5. Run `keshro task done <task-id>` when complete
-6. Run `keshro status` — show progress
-7. Run `keshro continue` for the next task
-8. Repeat steps 4-7 until all tasks are done or blocked
-
-When the user explicitly asks to run the plan, you should continue through all tasks automatically — completing one, then pulling the next — without stopping to ask permission between each task. Only stop if a task is blocked or an error occurs.
+**User says "run this" or "execute" (wants execution):**
+1. If plan has parallelizable tasks, use parallel mode:
+   ```bash
+   keshro continue --all --confirm
+   ```
+   This launches agents for all actionable tasks simultaneously. Monitor with `keshro status`.
+2. If tasks are sequential or user asked for one-at-a-time:
+   - Run `keshro continue --confirm` — get first task
+   - Execute the task, writing notes along the way
+   - Run `keshro task done <task-id>` when complete
+   - Run `keshro continue` for the next task
+   - Repeat until done or blocked
 
 **User says "continue" or "keep going":**
 1. Run `keshro status` — show where things stand
-2. Run `keshro continue`
-3. After completing the task, run `keshro continue` again for the next one
-4. Keep going through tasks until done or blocked
+2. If parallelizable tasks remain, suggest: "There are N parallelizable tasks. Want to run them in parallel with `keshro continue --all`?"
+3. Otherwise run `keshro continue` and execute sequentially
 
 **User says "status" or "what's happening":**
 1. Run `keshro status`
@@ -4384,7 +4394,7 @@ def _print_plan_status(plan: dict) -> None:
     total_tokens = agent_cost.get("total_tokens") or 0
     total_duration = agent_cost.get("total_duration_seconds") or 0
     tasks_tracked = agent_cost.get("tasks_tracked") or 0
-    if cost_usd > 0 or total_duration > 0:
+    if cost_usd > 0 or total_tokens > 0:
         cost_parts = []
         if total_duration > 0:
             mins = int(total_duration // 60)
@@ -4394,7 +4404,7 @@ def _print_plan_status(plan: dict) -> None:
             cost_parts.append(f"{total_tokens:,} tokens")
         if cost_usd > 0:
             cost_parts.append(f"${cost_usd:.2f}")
-        if tasks_tracked > 1:
+        if tasks_tracked > 1 and cost_usd > 0:
             avg_cost = cost_usd / tasks_tracked
             avg_dur = total_duration / tasks_tracked
             avg_mins = int(avg_dur // 60)
