@@ -74,6 +74,17 @@ def _clean(value: str | None) -> str:
     return (value or "").strip()
 
 
+def _read_context_file(path: str | None) -> str | None:
+    if not path:
+        return None
+    try:
+        return Path(path).read_text().strip() or None
+    except OSError as exc:
+        raise typer.BadParameter(
+            f"Could not read context file {path}: {exc}"
+        ) from exc
+
+
 def _coding_agent_name() -> str | None:
     if os.environ.get("CLAUDECODE") or os.environ.get("CLAUDE_CODE_ENTRYPOINT"):
         return "Claude Code"
@@ -2892,6 +2903,13 @@ def _create_migration(
     context: Annotated[
         Optional[str], typer.Option("--context", "-c", help="Additional context.")
     ] = None,
+    context_file: Annotated[
+        Optional[str],
+        typer.Option(
+            "--context-file",
+            help="Read additional context from a file.",
+        ),
+    ] = None,
     github_url: Annotated[
         Optional[str], typer.Option("--github-url", help="GitHub URL to attach.")
     ] = None,
@@ -2926,6 +2944,12 @@ def _create_migration(
     ] = False,
 ):
     """Create a project. Pass a directory, GitHub URL, Linear URL, or any URL — Keshro figures out the rest."""
+    file_context = _read_context_file(context_file)
+    if file_context:
+        context = "\n\n".join(
+            part for part in [context, file_context] if part and part.strip()
+        )
+
     # Classify the positional source argument and set defaults
     source_type, source_value = _classify_source(source)
     if source_type == "directory" and work_dir is None:
@@ -3758,106 +3782,131 @@ CLAUDE_COMMANDS_DIR = Path.home() / ".claude" / "commands"
 CODEX_HOME_DIR = Path.home() / ".codex"
 
 KESHRO_SLASH_COMMAND = """\
-You are integrated with Keshro — the intelligent execution layer for coding agents. Run all keshro commands via Bash.
+You are integrated with Keshro — the intelligent execution layer for AI agents. Run all keshro commands via Bash.
 
-## What you can do
-
-When the user says things like "plan this", "run this project", "execute", "use Keshro", or "keshro":
-
-### 0. Authenticate if needed
-If `keshro config` shows `Authenticated: no`, the correct login command is:
+## Auth
+If `keshro config` shows `Authenticated: no`, tell the user to run:
 ```bash
 keshro login <api-token>
 ```
-Do not use `keshro auth login`. Do not invent a `--token` flag.
+The command is `keshro login`. There is no `auth` subcommand.
 
-### 1. Create a plan from a description
+## Create a plan
 ```bash
-keshro create --context "Refactor the auth module to support API keys and rate limiting"
+keshro create
 ```
-Use `keshro create` for new project planning so Keshro can gather codebase context, ask follow-up questions, and generate a better plan.
+Run from the project directory. Keshro scans the project, generates clarifying questions (which you answer automatically), and produces a structured execution plan.
 
-If the user already gave a concrete project description, use it directly. Do not ask them to restate it.
+Also accepts URLs:
+```bash
+keshro create https://github.com/org/repo
+keshro create https://github.com/org/repo/issues/42
+keshro create https://linear.app/team/issue/PROJ-123
+```
 
-If another plan is currently active, do not say it was "cancelled". Just create the new plan; it will become the active one.
+If the user gave a project description, pass it as context:
+```bash
+keshro create --context "Refactor the auth module to support API keys"
+```
 
-### 2. Import from Linear, Jira, or GitHub
+For longer descriptions, write to a temp file:
+```bash
+cat > /tmp/keshro-context.txt <<'EOF'
+Refactor the auth module to support API keys and rate limiting.
+The current JWT implementation needs to stay for backward compatibility.
+EOF
+keshro create --context-file /tmp/keshro-context.txt
+```
+
+Plan creation can take a bit — Keshro scans the repo, gathers context, and generates the plan. Do not assume it failed.
+
+If another plan is currently active, just create the new one. It becomes the active plan.
+
+## Import from issue trackers
 ```bash
 keshro plan import linear --project <project-key>
 keshro plan import github --project <owner/repo>
 keshro plan import jira --project <project-key>
 ```
-Imports issues, enriches with codebase context, generates an execution plan.
 
-### 3. Execute a plan
+## Execute
 ```bash
-keshro continue -p <plan-id>
+keshro continue
 ```
-This prints your next task with full context. Follow the instructions — start the task, write notes as you work, mark it done when finished.
+Prints the next task with full context. Follow the instructions, then mark done.
 
-### 4. Check status
+## Status
 ```bash
-keshro status -p <plan-id>
-```
-
-### 5. During task execution
-As you work on a task, keep Keshro updated:
-```bash
-keshro task start <task-id> -p <plan-id>
-keshro task note <task-id> -p <plan-id> -n "what you found or changed"
-keshro task done <task-id> -p <plan-id>
-keshro task block <task-id> -p <plan-id> -r "reason"
+keshro status
 ```
 
-### 6. If a task is blocked
+## During task execution
 ```bash
-keshro task unblock <task-id> -p <plan-id>
+keshro task start <task-id>
+keshro task note <task-id> -n "what you found or changed"
+keshro task done <task-id> -n "what was completed and how it was verified"
+keshro task block <task-id> -r "reason"
+keshro task unblock <task-id>
 ```
 
-### 7. Review decisions and rollback
+## Review and rollback
 ```bash
-keshro explain <task-id> -p <plan-id>
-keshro rollback <task-id> -p <plan-id>
+keshro explain <task-id>
+keshro rollback <task-id>
 ```
 
 ## Plan context
-Keshro remembers your active plan. After creating or continuing a plan, it becomes the default.
-- `keshro continue` (no -p) resumes the active plan
-- `keshro status` (no -p) shows the active plan
-- `keshro config` shows the current active plan and auth status
-- To switch plans: `keshro config set --plan-id <plan-id>`
+Keshro remembers your active plan. No need to pass `-p` every time.
+- `keshro config` — shows active plan and auth status
+- `keshro plan list` — shows all plans
+- `keshro config set --plan-id <id>` — switch active plan
 
-To find which plan to use, run `keshro config` first. If no plan is set, run `keshro plan list` to see available plans.
+## Flows
 
-## Quick flow
-If user says "plan and run this project":
-1. Run `keshro create --context "<their description>"` — creates a plan and sets it as active
-2. Run `keshro status` — show what the plan looks like before starting
-3. Run `keshro continue` — gets the first task
+**User says "plan this" or "use keshro":**
+1. Run `keshro create` (or with context/URL)
+2. Run `keshro status` — show the plan
+3. **STOP and ask the user**: "Here's the plan with N tasks. Ready to execute?"
+4. Do NOT run `keshro continue` until the user says to proceed
+
+**User says "plan and run this" or "execute this" (explicitly wants execution):**
+1. Run `keshro create`
+2. Run `keshro status`
+3. Run `keshro continue --confirm` — start first task
 4. Execute the task, writing notes along the way
 5. Run `keshro task done <task-id>` when complete
-6. Run `keshro status` — show updated progress after each task
-7. Run `keshro continue` again for the next task
+6. Run `keshro status` — show progress
+7. Run `keshro continue` for the next task
+8. Repeat steps 4-7 until all tasks are done or blocked
 
-If user says "continue" or "keep going":
-1. Run `keshro status` first — show where things stand
-2. Run `keshro continue` — picks up where you left off
+When the user explicitly asks to run the plan, you should continue through all tasks automatically — completing one, then pulling the next — without stopping to ask permission between each task. Only stop if a task is blocked or an error occurs.
 
-If user says "what's happening" or "status":
+**User says "continue" or "keep going":**
+1. Run `keshro status` — show where things stand
+2. Run `keshro continue`
+3. After completing the task, run `keshro continue` again for the next one
+4. Keep going through tasks until done or blocked
+
+**User says "status" or "what's happening":**
 1. Run `keshro status`
 
-Always run `keshro status` after completing a task so updated progress is visible right away.
+## Stopping execution
+If the user says "stop", "pause", "hold on", or "wait":
+- Finish the current task if nearly done, or leave it in progress
+- Run `keshro status` to show where things stand
+- Do NOT pull the next task
+- Wait for the user to say "continue" or "keep going" before resuming
 
 ## Rules
 - Run keshro commands via Bash, never as chat messages
 - Do NOT use Keshro MCP tools — always use the CLI
-- If auth is missing, use exactly `keshro login <api-token>`
-- For new plans from natural-language requests, prefer `keshro create` over `keshro plan generate`
-- If the user asks for a new plan and already provided the description, create it immediately instead of asking "what should the plan be about?"
-- Write progress notes frequently with `keshro task note` — they show up in real time
-- Always run `keshro config` first if you're unsure which plan is active
-- When showing plan info, include the plan URL from `keshro config` output so it is easy to click through to the dashboard
-- In Claude Code, the user may invoke this via `/keshro`; in Codex, the user will usually ask in natural language instead of using a slash command
+- Never auto-execute a plan without user confirmation. Always show the plan and ask first.
+- Once the user says to execute, continue through tasks automatically — don't ask between each task
+- If the user says to stop, stop immediately after the current task
+- If the user already gave a description, create the plan immediately — don't ask them to restate it
+- Write progress notes frequently with `keshro task note`
+- Run `keshro status` after completing each task
+- Include the plan URL from `keshro config` output so the user can click through to the dashboard
 """
 
 

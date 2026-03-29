@@ -754,6 +754,7 @@ def test_setup_claude_creates_slash_command(monkeypatch, tmp_path, capsys):
     content = target.read_text()
     assert "keshro continue" in content
     assert "Do NOT use Keshro MCP tools" in content
+    assert "keshro create --context-file /tmp/keshro-context.txt" in content
 
 
 def test_setup_claude_overwrites_existing(monkeypatch, tmp_path, capsys):
@@ -767,6 +768,44 @@ def test_setup_claude_overwrites_existing(monkeypatch, tmp_path, capsys):
     content = (commands_dir / "keshro.md").read_text()
     assert "old content" not in content
     assert "keshro continue" in content
+
+
+def test_create_reads_context_from_file(fake_client, monkeypatch, tmp_path, capsys):
+    _auth = {**_auth_with_plan(), "token": "ksh_pat_test"}
+    monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: _auth)
+    monkeypatch.setattr("keshro_cli.client.load_auth", lambda: _auth)
+    monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
+    monkeypatch.setattr("keshro_cli.cli.update_auth", lambda payload: payload)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
+    monkeypatch.setattr("keshro_cli.cli._collect_generic_discovery", lambda _: None)
+
+    context_path = tmp_path / "context.txt"
+    context_path.write_text("Scale the Helm chart safely.")
+
+    original_post = fake_client.post
+
+    def _post(path, json=None, timeout=None):
+        if path == "/v1/plans/describe/preview":
+            return _FakeResponse({"questions": [], "enrichment_context": ""})
+        if path == "/v1/plans/generate":
+            assert json["description"] == "Scale the Helm chart safely."
+            return _FakeResponse(
+                {
+                    "id": "plan-ctx-1",
+                    "title": "Scalability plan",
+                    "status": "draft",
+                    "plan_steps": [],
+                }
+            )
+        return original_post(path, json=json, timeout=timeout)
+
+    fake_client.post = _post
+
+    code = cli.main(["create", "--context-file", str(context_path)])
+
+    assert code == 0
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+    assert "Scalability plan" in out
 
 
 def test_plan_create_saves_default_plan_automatically(fake_client, monkeypatch, capsys):
