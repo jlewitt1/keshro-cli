@@ -53,7 +53,9 @@ keshro status
 
 ## Works with
 
-Parallel execution works with [Claude Code](https://claude.ai/code) and [Codex](https://openai.com/index/introducing-codex/). Both agents run in isolated git worktrees during parallel mode. Planning, migration intake, single-task resume, task tracking, and the web dashboard also work with either agent. If one agent is rate-limited, Keshro suggests switching and supports a saved default via `keshro config set --agent ...`.
+Planning, execution, and parallel mode work with [Claude Code](https://claude.ai/code) and [Codex](https://openai.com/index/introducing-codex/). Both agents run in isolated git worktrees during parallel mode. If one agent is rate-limited, Keshro suggests switching and supports a saved default via `keshro config set --agent ...`.
+
+Cursor is supported for in-editor context via `.cursorrules` (`keshro setup-cursor`), but does not have a headless CLI, so it cannot be used as an execution agent.
 
 Keshro can also create general execution plans from repos, issues, and freeform descriptions, but the primary workflow is migrations.
 
