@@ -965,13 +965,27 @@ def test_continue_exits_when_not_authenticated(fake_client, monkeypatch):
     assert exit_code == 1
 
 
-def test_continue_rejects_codex_for_parallel_mode(fake_client, monkeypatch):
+def test_continue_allows_codex_for_parallel_mode(fake_client, monkeypatch):
+    """Codex should be accepted for parallel mode (no longer rejected)."""
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
+    monkeypatch.setattr("keshro_cli.cli._current_plan_label", lambda work_dir=None: "Test plan")
+    monkeypatch.setattr("typer.confirm", lambda *a, **kw: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+
+    parallel_called = {}
+
+    monkeypatch.setattr(
+        "keshro_cli.cli.asyncio.run",
+        lambda coro: (parallel_called.update({"yes": True}), coro.close())[1],
+    )
 
     exit_code = cli.main(["continue", "--agent", "codex"])
 
-    assert exit_code == 1
+    assert exit_code == 0
+    assert parallel_called.get("yes")
 
 
 def test_wrap_prompt_agent_error_suggests_switching_agents(monkeypatch):

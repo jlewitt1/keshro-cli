@@ -14,7 +14,7 @@ keshro continue           # agents execute in parallel if possible
 
 Keshro is built for migrations first. It scans the repo, asks the follow-up questions that actually matter for the migration, generates a migration-aware execution plan, then coordinates agents to execute it safely.
 
-Works with your existing coding agent. Use Claude Code, Codex, Cursor, or another agent for planning and migration intake.
+Works with your existing coding agent. Use Claude Code or Codex for planning, migration intake, and parallel execution.
 
 Examples:
 - AWS Batch -> Airflow
@@ -53,7 +53,7 @@ keshro status
 
 ## Works with
 
-Parallel execution currently requires [Claude Code](https://claude.ai/code). Planning, migration intake, single-task resume prompts, task tracking, and the web dashboard work with your existing setup. If Claude is rate-limited during prompt-based flows, Keshro now suggests switching agents and supports a saved default via `keshro config set --agent ...`.
+Parallel execution works with [Claude Code](https://claude.ai/code) and [Codex](https://openai.com/index/introducing-codex/). Both agents run in isolated git worktrees during parallel mode. Planning, migration intake, single-task resume, task tracking, and the web dashboard also work with either agent. If one agent is rate-limited, Keshro suggests switching and supports a saved default via `keshro config set --agent ...`.
 
 Keshro can also create general execution plans from repos, issues, and freeform descriptions, but the primary workflow is migrations.
 

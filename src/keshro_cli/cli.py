@@ -2422,6 +2422,20 @@ async def _mark_task_status_async(
         print(f"  {DIM}[warn] status update failed: {exc}{RESET}", file=sys.stderr)
 
 
+async def _cleanup_worktree(repo_dir: str, worktree_path: str) -> None:
+    """Remove a manually-created git worktree."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "worktree", "remove", "--force", worktree_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=repo_dir,
+        )
+        await proc.communicate()
+    except Exception:
+        pass
+
+
 async def _launch_single_agent(
     task: dict,
     plan: dict,
@@ -2431,20 +2445,22 @@ async def _launch_single_agent(
     semaphore: asyncio.Semaphore,
     api_client: httpx.AsyncClient,
     session_id: str = "",
+    agent: str = "auto",
 ) -> AgentResult:
     task_id = _clean(task.get("id")) or "unknown"
     task_title = _clean(task.get("title")) or "Untitled"
     worktree_name = f"keshro-{task_id[:8]}"
     prompt = _build_parallel_prompt(plan, task, total_agents, work_dir=work_dir)
 
-    claude_bin = shutil.which("claude")
-    if not claude_bin:
+    # Resolve agent binary
+    agent_name, agent_bin = _resolve_prompt_agent(agent)
+    if not agent_bin:
         return AgentResult(
             task_id=task_id,
             task_title=task_title,
             exit_code=127,
             stdout="",
-            stderr="claude binary not found",
+            stderr=f"{agent_name or agent} binary not found",
             duration_seconds=0,
         )
 
@@ -2475,30 +2491,73 @@ async def _launch_single_agent(
         except Exception:
             collab_active = False
 
+        # For Codex, create a manual git worktree for isolation
+        codex_worktree_path = ""
+        if agent_name == "codex":
+            try:
+                wt_proc = await asyncio.create_subprocess_exec(
+                    "git", "worktree", "add", "-d",
+                    os.path.join(work_dir, ".git", "worktrees-keshro", worktree_name),
+                    "HEAD",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=work_dir,
+                )
+                await wt_proc.communicate()
+                if wt_proc.returncode == 0:
+                    codex_worktree_path = os.path.join(
+                        work_dir, ".git", "worktrees-keshro", worktree_name
+                    )
+            except Exception:
+                pass
+
         start = time.monotonic()
         try:
-            proc = await asyncio.create_subprocess_exec(
-                claude_bin,
-                "-p",
-                prompt,
-                "--worktree",
-                worktree_name,
-                "--output-format",
-                "json",
-                "--permission-mode",
-                "auto",
-                "--no-session-persistence",
-                "--name",
-                f"keshro: {task_title[:40]}",
-                "--add-dir",
-                work_dir,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=work_dir,
-            )
+            if agent_name == "codex":
+                exec_dir = codex_worktree_path or work_dir
+                proc = await asyncio.create_subprocess_exec(
+                    agent_bin,
+                    "exec",
+                    prompt,
+                    "--cd",
+                    exec_dir,
+                    "--sandbox",
+                    "workspace-write",
+                    "--skip-git-repo-check",
+                    "--add-dir",
+                    exec_dir,
+                    "--color",
+                    "never",
+                    "--ephemeral",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=exec_dir,
+                )
+            else:
+                proc = await asyncio.create_subprocess_exec(
+                    agent_bin,
+                    "-p",
+                    prompt,
+                    "--worktree",
+                    worktree_name,
+                    "--output-format",
+                    "json",
+                    "--permission-mode",
+                    "auto",
+                    "--no-session-persistence",
+                    "--name",
+                    f"keshro: {task_title[:40]}",
+                    "--add-dir",
+                    work_dir,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=work_dir,
+                )
             stdout_bytes, stderr_bytes = await proc.communicate()
             exit_code = proc.returncode or 0
         except Exception as exc:
+            if codex_worktree_path:
+                await _cleanup_worktree(work_dir, codex_worktree_path)
             if collab_active:
                 try:
                     session_end(collab_session_id)
@@ -2513,11 +2572,15 @@ async def _launch_single_agent(
                 duration_seconds=time.monotonic() - start,
             )
 
+        # Clean up manual worktree for Codex
+        if codex_worktree_path:
+            await _cleanup_worktree(work_dir, codex_worktree_path)
+
         duration = time.monotonic() - start
         stdout_text = (stdout_bytes or b"").decode(errors="replace").strip()
         stderr_text = (stderr_bytes or b"").decode(errors="replace").strip()
 
-        # Parse cost and token data from Claude's JSON output
+        # Parse cost and token data from agent's JSON output (Claude only)
         cost_usd = 0.0
         tokens_used = 0
         model_name = ""
@@ -2631,6 +2694,7 @@ async def _run_parallel(
     max_concurrency: int,
     run_all: bool,
     dry_run: bool,
+    agent: str = "auto",
 ) -> None:
     import uuid as _uuid
 
@@ -2638,9 +2702,12 @@ async def _run_parallel(
     resolved_dir = str(Path(work_dir).resolve()) if work_dir else os.getcwd()
     session_id = f"agent-{_uuid.uuid4().hex[:8]}"
 
-    claude_bin = shutil.which("claude")
-    if not claude_bin:
-        raise SystemExit("Agent binary not found on PATH. Install your agent first.")
+    # Verify that the resolved agent binary exists
+    _agent_name, _agent_bin = _resolve_prompt_agent(agent)
+    if not _agent_bin:
+        raise SystemExit(
+            f"{_agent_name or agent} binary not found on PATH. Install your agent first."
+        )
 
     with make_client(_state.api_url, _state.token) as client:
         res = client.get(f"/v1/plans/{resolved_plan_id}")
@@ -2774,6 +2841,7 @@ async def _run_parallel(
                     semaphore,
                     api_client,
                     session_id=session_id,
+                    agent=agent,
                 )
                 for task in actionable
             ]
@@ -4828,12 +4896,6 @@ def _continue_command(
             agent=resolved_agent,
         )
     else:
-        if resolved_agent == "codex":
-            raise SystemExit(
-                "Parallel execution currently requires Claude Code. Use "
-                "`keshro continue --agent claude`, `keshro continue --agent auto`, "
-                "or `keshro continue --no-parallel --agent codex`."
-            )
         _ensure_authenticated()
         concurrency = max(1, min(concurrency, 30))
         asyncio.run(
@@ -4843,6 +4905,7 @@ def _continue_command(
                 max_concurrency=concurrency,
                 run_all=auto_continue,
                 dry_run=dry_run,
+                agent=resolved_agent,
             )
         )
 
