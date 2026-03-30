@@ -2452,17 +2452,8 @@ async def _launch_single_agent(
     worktree_name = f"keshro-{task_id[:8]}"
     prompt = _build_parallel_prompt(plan, task, total_agents, work_dir=work_dir)
 
-    # Resolve agent binary
+    # Resolve agent binary (_resolve_prompt_agent raises SystemExit if not found)
     agent_name, agent_bin = _resolve_prompt_agent(agent)
-    if not agent_bin:
-        return AgentResult(
-            task_id=task_id,
-            task_title=task_title,
-            exit_code=127,
-            stdout="",
-            stderr=f"{agent_name or agent} binary not found",
-            duration_seconds=0,
-        )
 
     async with semaphore:
         print(f"  {YELLOW}▶{RESET} {task_title} {DIM}starting...{RESET}")
@@ -2494,27 +2485,45 @@ async def _launch_single_agent(
         # For Codex, create a manual git worktree for isolation
         codex_worktree_path = ""
         if agent_name == "codex":
+            import tempfile
+
+            codex_worktree_path = os.path.join(
+                tempfile.gettempdir(), f"keshro-{worktree_name}"
+            )
             try:
                 wt_proc = await asyncio.create_subprocess_exec(
                     "git", "worktree", "add", "-d",
-                    os.path.join(work_dir, ".git", "worktrees-keshro", worktree_name),
+                    codex_worktree_path,
                     "HEAD",
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     cwd=work_dir,
                 )
-                await wt_proc.communicate()
-                if wt_proc.returncode == 0:
-                    codex_worktree_path = os.path.join(
-                        work_dir, ".git", "worktrees-keshro", worktree_name
+                wt_stdout, wt_stderr = await wt_proc.communicate()
+                if wt_proc.returncode != 0:
+                    err_msg = (wt_stderr or b"").decode(errors="replace").strip()
+                    return AgentResult(
+                        task_id=task_id,
+                        task_title=task_title,
+                        exit_code=1,
+                        stdout="",
+                        stderr=f"Failed to create worktree for Codex: {err_msg}",
+                        duration_seconds=0,
                     )
-            except Exception:
-                pass
+            except Exception as exc:
+                return AgentResult(
+                    task_id=task_id,
+                    task_title=task_title,
+                    exit_code=1,
+                    stdout="",
+                    stderr=f"Failed to create worktree for Codex: {exc}",
+                    duration_seconds=0,
+                )
 
         start = time.monotonic()
         try:
             if agent_name == "codex":
-                exec_dir = codex_worktree_path or work_dir
+                exec_dir = codex_worktree_path
                 proc = await asyncio.create_subprocess_exec(
                     agent_bin,
                     "exec",
@@ -2702,12 +2711,8 @@ async def _run_parallel(
     resolved_dir = str(Path(work_dir).resolve()) if work_dir else os.getcwd()
     session_id = f"agent-{_uuid.uuid4().hex[:8]}"
 
-    # Verify that the resolved agent binary exists
-    _agent_name, _agent_bin = _resolve_prompt_agent(agent)
-    if not _agent_bin:
-        raise SystemExit(
-            f"{_agent_name or agent} binary not found on PATH. Install your agent first."
-        )
+    # Verify that the resolved agent binary exists (raises SystemExit if not found)
+    _resolve_prompt_agent(agent)
 
     with make_client(_state.api_url, _state.token) as client:
         res = client.get(f"/v1/plans/{resolved_plan_id}")
