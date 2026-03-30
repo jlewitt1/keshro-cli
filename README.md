@@ -13,7 +13,15 @@ keshro continue --all     # agents execute in parallel
 
 Your AI agent is great at one task at a time. But real projects have 10-20 tasks with dependencies, shared context, and files that shouldn't be edited by two agents at once.
 
-Run them manually and you're the bottleneck. Run them in parallel and they conflict.
+Run them manually and you're the bottleneck. Run them in parallel and they conflict. The more edge cases a project has, the worse this gets.
+
+## What it's built for
+
+- **Stack migrations** — Express to Fastify, Terraform to Pulumi, Jenkins to GitHub Actions, and more. Framework-specific gotchas, config differences, and breaking changes that cascade if ordered wrong.
+- **Monolith decomposition** — extracting services from a shared codebase. Shared database tables, cross-module signals, feature flag dependencies, and more.
+- **Infrastructure overhauls** — adding autoscaling, PDBs, topology constraints to Helm charts, and more. Interactions between components that silently break in production.
+- **Auth refactors** — replacing custom JWT with NextAuth across dozens of routes, and more. Cookie vs header auth, SSR compatibility, role migration, token scheme changes.
+- **Any multi-task engineering project** where the edge cases compound across tasks and one agent session can't hold all the context.
 
 ## What Keshro does
 
