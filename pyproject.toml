@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "keshro"
 version = "0.1.7"
-description = "The intelligent execution layer for AI agents — CLI interface"
+description = "High-stakes engineering project execution for AI coding agents"
 readme = "README.md"
 license = {text = "MIT"}
 authors = [{name = "Josh Lewittes", email = "josh.lewittes@gmail.com"}]
