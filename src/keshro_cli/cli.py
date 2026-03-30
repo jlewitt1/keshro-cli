@@ -101,14 +101,21 @@ class _Spinner:
         start = time.time()
         while not self._stop.is_set():
             elapsed = int(time.time() - start)
+            elapsed_label = f"{elapsed}s"
+            terminal_width = shutil.get_terminal_size(fallback=(80, 24)).columns
+            available = max(20, terminal_width - len(elapsed_label) - 8)
+            message = self._message
+            if len(message) > available:
+                message = message[: max(1, available - 1)] + "…"
             print(
-                f"\r  {CYAN}{frames[i % len(frames)]}{RESET} {self._message} {DIM}{elapsed}s{RESET}",
+                f"\r  {CYAN}{frames[i % len(frames)]}{RESET} {message} {DIM}{elapsed_label}{RESET}",
                 end="",
                 flush=True,
             )
             self._stop.wait(0.1)
             i += 1
-        print("\r" + " " * (len(self._message) + 20) + "\r", end="", flush=True)
+        clear_width = max(len(self._message) + 20, shutil.get_terminal_size(fallback=(80, 24)).columns)
+        print("\r" + " " * clear_width + "\r", end="", flush=True)
 
 
 def _read_context_file(path: str | None) -> str | None:
@@ -1214,10 +1221,6 @@ def _collect_discovery_answer_from_claude(
     prompt = _build_agent_discovery_prompt(template)
     return _run_prompt_in_agent(
         prompt,
-        missing_env_message=(
-            "This command needs to run inside a coding agent so it can scan your codebase.\n"
-            "Run it from your agent's terminal, or use the prompt copy/paste path in Keshro instead."
-        ),
         missing_binary_message=(
             "Could not find a coding agent binary. Make sure you're running this from within your agent's terminal."
         ),
@@ -1249,6 +1252,15 @@ def _resolve_prompt_agent(agent: str) -> tuple[str, str]:
     raise SystemExit("Could not find a supported coding agent binary on PATH.")
 
 
+def _prompt_agent_display_name(agent: str) -> str:
+    resolved, _ = _resolve_prompt_agent(agent)
+    if resolved == "claude":
+        return "Claude Code"
+    if resolved == "codex":
+        return "Codex"
+    return resolved
+
+
 def _wrap_prompt_agent_error(detail: str, agent_name: str) -> str:
     lowered = detail.lower()
     if "hit your limit" in lowered or "quota" in lowered:
@@ -1272,7 +1284,6 @@ def _wrap_prompt_agent_error(detail: str, agent_name: str) -> str:
 def _run_prompt_in_agent(
     prompt: str,
     *,
-    missing_env_message: str,
     missing_binary_message: str,
     failure_message_prefix: str,
     empty_message: str,
@@ -1431,10 +1442,6 @@ def _collect_clarifier_answers_from_claude(
     prompt = _build_clarifier_prompt(template, payload, questions)
     raw = _run_prompt_in_agent(
         prompt,
-        missing_env_message=(
-            "This command needs to run inside a coding agent so it can scan your codebase.\n"
-            "Run it from your agent's terminal, or use the prompt copy/paste path in Keshro instead."
-        ),
         missing_binary_message=(
             "Could not find a coding agent binary. Make sure you're running this from within your agent's terminal."
         ),
@@ -3509,7 +3516,6 @@ def _find_migration_template(source: str, target: str) -> str | None:
             cleaned = cleaned.replace("&", " and ")
             cleaned = re.sub(r"[^a-z0-9]+", " ", cleaned).strip()
             synonyms = {
-                "apache airflow": "airflow",
                 "mwaa": "airflow",
             }
             return synonyms.get(cleaned, cleaned)
@@ -3728,6 +3734,8 @@ def _create_migration(
     try:
         context_entered_interactively = False
         if path:
+            if not _state.json:
+                print(f"{DIM}Using {_prompt_agent_display_name(agent)}{RESET}\n")
             # Migration mode — use the existing migration flow
             answers = _parse_field_assignments(field)
             return _create_migration_inner(
@@ -3746,6 +3754,8 @@ def _create_migration(
             # Generic project mode — scan, get questions, agent answers, generate plan
             _ensure_authenticated()
             resolved_work_dir = str(Path(work_dir or ".").resolve())
+            if not _state.json:
+                print(f"{DIM}Using {_prompt_agent_display_name(agent)}{RESET}\n")
 
             # If no description provided, prompt for one
             has_description = bool(
@@ -3795,7 +3805,7 @@ def _create_migration(
             discovered_context = None
             if os.path.isdir(resolved_work_dir):
                 if not _state.json:
-                    print(f"{CYAN}Scanning project: {resolved_work_dir}{RESET}")
+                    print(f"{CYAN}Using project: {resolved_work_dir}{RESET}")
                 discovered_context = _collect_generic_discovery(resolved_work_dir)
             elif not _state.json:
                 source_label = source_value or resolved_work_dir
@@ -4097,7 +4107,6 @@ Questions:
     try:
         raw = _run_prompt_in_agent(
             prompt,
-            missing_env_message="Not inside a coding agent — skipping auto-answers.",
             missing_binary_message="Claude binary not found — skipping auto-answers.",
             failure_message_prefix="Agent failed to answer questions: ",
             empty_message="",
@@ -4158,8 +4167,7 @@ def _create_migration_inner(
 
         with _Spinner(
             f"Analyzing {scan_target} and generating {source} -> {target} "
-            "migration inputs and follow-up questions "
-            "(workloads, schedules, target setup)..."
+            "migration inputs and follow-up questions..."
         ):
             discovered_answer = _collect_discovery_answer_from_claude(
                 template, work_dir=resolved_work_dir, agent=agent
@@ -4686,7 +4694,13 @@ def _continue_command(
     plan_id: Annotated[
         Optional[str],
         typer.Option(
-            "--plan-id", "-p", help="Plan ID. Uses saved plan context if omitted."
+            "--plan-id", "-p", help="Standalone plan ID. Uses saved execution context if omitted."
+        ),
+    ] = None,
+    migration_id: Annotated[
+        Optional[str],
+        typer.Option(
+            "--migration-id", "-m", help="Migration ID. Keshro resolves it to the linked execution plan."
         ),
     ] = None,
     work_dir: Annotated[
@@ -4743,8 +4757,11 @@ def _continue_command(
 ):
     """Resume execution of a plan. In the shell this is coordinator mode; in an agent it resumes one task."""
 
-    resolved_plan_id = plan_id
-    if not _clean(plan_id):
+    if _clean(plan_id) and _clean(migration_id):
+        raise SystemExit("Pass either --plan-id or --migration-id, not both.")
+
+    resolved_plan_id = migration_id or plan_id
+    if not _clean(resolved_plan_id):
         resolved_plan_id = _current_plan_id(None, work_dir=work_dir)
         if resolved_plan_id:
             resolved_plan_id = _confirm_implicit_continue_plan(

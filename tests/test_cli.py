@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -32,7 +33,12 @@ class _FakeResponse:
         self.status_code = status_code
 
     def raise_for_status(self):
-        return None
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                f"{self.status_code} error",
+                request=httpx.Request("GET", "https://api.example.test"),
+                response=httpx.Response(self.status_code, request=httpx.Request("GET", "https://api.example.test")),
+            )
 
     def json(self):
         return self._payload
@@ -649,6 +655,23 @@ def test_continue_prompt_omits_full_skill_boilerplate_in_non_tty_mode(
     assert "The current task and plan context are provided below" not in out
 
 
+def test_spinner_truncates_long_messages_but_keeps_animation(monkeypatch, capsys):
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr(
+        "keshro_cli.cli.shutil.get_terminal_size",
+        lambda fallback=(80, 24): os.terminal_size((40, 24)),
+    )
+
+    with cli._Spinner(
+        "Analyzing the current working directory and generating AWS Batch -> Airflow migration inputs and follow-up questions..."
+    ):
+        pass
+
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+    assert "⠋" in out
+    assert "…" in out
+
+
 def test_continue_prompt_mentions_status_tracking_and_blocking_rule(
     fake_client, monkeypatch, capsys
 ):
@@ -842,7 +865,16 @@ def test_continue_skips_confirmation_when_migration_id_is_explicit(
         lambda coro: (coro.close(), None)[1],
     )
 
-    cli.main(["continue", "-p", "migration-123"])
+    cli.main(["continue", "-m", "migration-123"])
+
+
+def test_continue_rejects_plan_id_and_migration_id_together(
+    fake_client, monkeypatch, capsys
+):
+    code = cli.main(["continue", "-p", "plan-123", "-m", "migration-123"])
+
+    assert code == 1
+    assert "either --plan-id or --migration-id" in capsys.readouterr().err
 
 
 def test_continue_exits_cleanly_when_implicit_plan_confirmation_is_declined(
@@ -874,11 +906,23 @@ def test_continue_can_override_implicit_plan_with_migration_id(
         lambda coro: (coro.close(), None)[1],
     )
 
+    original_get = fake_client.get
+
+    def _get(path, params=None, headers=None, timeout=None):
+        if path == "/v1/plans/migration-123":
+            fake_client.calls.append(("GET", path, params))
+            return _FakeResponse({"detail": "not found"}, status_code=404)
+        return original_get(path, params=params, headers=headers, timeout=timeout)
+
+    monkeypatch.setattr(fake_client, "get", _get)
+
     code = cli.main(["continue"])
 
     out = ANSI_RE.sub("", capsys.readouterr().out)
     assert code == 0
-    assert "Using: migration-123 (migration-123)" in out
+    assert "Using: AWS Batch to Airflow pilot (plan-123)" in out
+    assert ("GET", "/v1/plans/migration-123", None) in fake_client.calls
+    assert ("GET", "/v1/migrations/migration-123/plan", None) in fake_client.calls
 
 
 def test_continue_prompt_does_not_tell_claude_to_refetch(
