@@ -1819,8 +1819,7 @@ async def _launch_single_agent(
 
     async with semaphore:
         print(f"  {YELLOW}▶{RESET} {task_title} {DIM}starting...{RESET}")
-        await _mark_task_status_async(api_client, plan_id, task_id, "in_progress")
-        # Report start with session ID via agent API
+        # Report start with session ID via agent API (also sets status to in_progress)
         try:
             await api_client.post(
                 f"/v1/agent/plans/{plan_id}/task-event",
@@ -1831,7 +1830,8 @@ async def _launch_single_agent(
                 },
             )
         except Exception:
-            pass
+            # Fallback to plain status update if agent endpoint fails
+            await _mark_task_status_async(api_client, plan_id, task_id, "in_progress")
 
         # Register with Collaborator if available
         collab_session_id = f"keshro-{task_id}"
@@ -2834,6 +2834,53 @@ def _logout_alias():
 # ---------------------------------------------------------------------------
 
 
+def _detect_migration_intent(description: str) -> tuple[str, str] | None:
+    """Ask the LLM whether a description is about a technology/platform migration.
+
+    Returns (source_tech, target_tech) or None.
+    """
+    try:
+        client = make_client()
+        resp = client.post(
+            "/v1/plans/detect-migration",
+            json={"description": description},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        if data.get("is_migration") and data.get("source") and data.get("target"):
+            return (data["source"], data["target"])
+        return None
+    except Exception:
+        return None
+
+
+def _find_migration_template(source: str, target: str) -> str | None:
+    """Try to find a matching migration template key for a source/target pair."""
+    try:
+        client = make_client()
+        resp = client.get("/v1/migrations/path-templates")
+        if resp.status_code != 200:
+            return None
+        templates = resp.json()
+        # Normalize for matching
+        s_lower = source.lower()
+        t_lower = target.lower()
+        for tmpl in templates:
+            tmpl_source = (tmpl.get("source") or "").lower()
+            tmpl_target = (tmpl.get("target") or "").lower()
+            tmpl_key = tmpl.get("key") or ""
+            if (
+                (s_lower in tmpl_source or tmpl_source in s_lower)
+                and (t_lower in tmpl_target or tmpl_target in t_lower)
+            ):
+                return tmpl_key
+        return None
+    except Exception:
+        return None
+
+
 def _classify_source(source: str | None) -> tuple[str, str | None]:
     """Classify a positional source argument into (source_type, value).
 
@@ -3062,6 +3109,56 @@ def _create_migration(
                 desc_parts.append(f"Reference: {resource_url}")
             description = "\n\n".join(desc_parts)
 
+            # Detect migration intent and offer the migration pipeline
+            migration_match = _detect_migration_intent(description)
+            if migration_match and not path:
+                source_tech, target_tech = migration_match
+                if sys.stdout.isatty() and not _state.json:
+                    print(
+                        f"\n{CYAN}This looks like a migration ({source_tech} → {target_tech}).{RESET}"
+                    )
+                    print(
+                        f"{DIM}Keshro has enhanced analysis for migrations — "
+                        f"risk assessment, cost estimates, and step-by-step plans.{RESET}\n"
+                    )
+                    print(f"  1. Treat as migration {GREEN}(recommended){RESET}")
+                    print(f"  2. Treat as a general project")
+                    try:
+                        choice = input(f"\n  {CYAN}>{RESET} ").strip()
+                    except (EOFError, KeyboardInterrupt):
+                        choice = "1"
+                    if choice != "2":
+                        # Try to find a matching template
+                        template_key = _find_migration_template(
+                            source_tech, target_tech
+                        )
+                        if template_key:
+                            if not _state.json:
+                                print(
+                                    f"\n{CYAN}Using migration template: {template_key}{RESET}"
+                                )
+                            answers = _parse_field_assignments(field)
+                            return _create_migration_inner(
+                                template_key,
+                                answers,
+                                context,
+                                github_url,
+                                resource_url,
+                                org_id,
+                                work_dir,
+                            )
+                        else:
+                            # No template found — continue with generic but flag as migration
+                            description = (
+                                f"MIGRATION: {source_tech} → {target_tech}\n\n"
+                                + description
+                            )
+                            if not _state.json:
+                                print(
+                                    f"{DIM}No specific template found for {source_tech} → {target_tech}. "
+                                    f"Generating as a migration-aware project.{RESET}\n"
+                                )
+
             client = make_client()
 
             # Step 2: Get clarifying questions from the preview endpoint
@@ -3106,18 +3203,40 @@ def _create_migration(
                     print(
                         f"  Agent answered {answered_count}/{len(questions)} questions."
                     )
-            elif questions and not _state.json:
-                # TTY mode — print questions for the user
+            elif questions and sys.stdout.isatty() and not _state.json:
+                # TTY mode — let the user answer interactively
                 print(
-                    f"\n{CYAN}Clarifying questions (skipping — run from an AI agent for auto-answers):{RESET}"
+                    f"\n{CYAN}Clarifying questions ({len(questions)}) — press Enter to skip any{RESET}"
                 )
-                for q in questions:
-                    print(f"  • {q.get('question', '')}")
+                for qi, q in enumerate(questions, 1):
+                    qtext = q.get("question", "")
+                    why = q.get("why_this_matters", "")
+                    options = q.get("answers", [])
+                    print(f"\n  {CYAN}{qi}.{RESET} {qtext}")
+                    if why:
+                        print(f"     {DIM}{why}{RESET}")
+                    if options:
+                        for oi, opt in enumerate(options, 1):
+                            rec = f" {GREEN}(recommended){RESET}" if opt.get("recommended") else ""
+                            print(f"     {DIM}{oi}. {opt.get('answer_title', opt.get('value', ''))}{rec}{RESET}")
+                    try:
+                        answer = input(f"  {CYAN}>{RESET} ").strip()
+                    except (EOFError, KeyboardInterrupt):
+                        print()
+                        break
+                    if answer:
+                        # If user typed a number and there are options, use the option value
+                        if options and answer.isdigit():
+                            idx = int(answer) - 1
+                            if 0 <= idx < len(options):
+                                answer = options[idx].get("value", answer)
+                        answered[q.get("id", f"q{qi}")] = answer
+                answered_count = sum(1 for v in answered.values() if v)
+                if answered_count:
+                    print(f"\n  {DIM}{answered_count}/{len(questions)} answered{RESET}")
                 print()
 
             # Step 4: Generate the plan
-            if not _state.json:
-                print(f"{CYAN}Generating execution plan...{RESET}")
 
             # Fold enrichment context + answered questions into the description
             full_description = description
@@ -3138,14 +3257,43 @@ def _create_migration(
             if org_id:
                 generate_payload["org_id"] = org_id
 
+            # Spinner while generating
+            import threading
+
+            stop_spinner = threading.Event()
+
+            def _spin():
+                frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+                i = 0
+                start = time.time()
+                while not stop_spinner.is_set():
+                    elapsed = int(time.time() - start)
+                    print(
+                        f"\r  {CYAN}{frames[i % len(frames)]}{RESET} Generating execution plan... {DIM}{elapsed}s{RESET}",
+                        end="",
+                        flush=True,
+                    )
+                    stop_spinner.wait(0.1)
+                    i += 1
+                print("\r" + " " * 60 + "\r", end="", flush=True)
+
+            if not _state.json and sys.stdout.isatty():
+                spinner_thread = threading.Thread(target=_spin, daemon=True)
+                spinner_thread.start()
+            elif not _state.json:
+                print(f"{CYAN}Generating execution plan...{RESET}")
+
             try:
                 resp = client.post(
                     "/v1/plans/generate", json=generate_payload, timeout=120
                 )
                 resp.raise_for_status()
             except httpx.HTTPStatusError as exc:
+                stop_spinner.set()
                 _print_http_error(exc)
                 raise typer.Exit(1) from exc
+            finally:
+                stop_spinner.set()
 
             plan = resp.json()
             plan_id = plan.get("id", "")
@@ -3160,7 +3308,9 @@ def _create_migration(
                 print(f"  ID: {plan_id}")
                 print(f"  Tasks: {len(steps)}")
                 print(f"  Status: {plan.get('status', 'draft')}")
-                print(f"\n  Run {CYAN}keshro continue{RESET} to start executing.")
+                app_url = _app_url_from_api_url(_state.api_url)
+                print(f"\n  {DIM}Dashboard: {app_url}/plans/{plan_id}{RESET}")
+                print(f"  Run {CYAN}keshro continue{RESET} to start executing.")
 
     finally:
         if clone_dir:
@@ -4551,6 +4701,10 @@ def _run_status(plan_id: str | None, watch: bool = False, tui: bool = False) -> 
 
 @plan_app.command("status")
 def _plan_status(
+    plan_id_arg: Annotated[
+        Optional[str],
+        typer.Argument(help="Plan ID. Uses saved plan context if omitted."),
+    ] = None,
     plan_id: Annotated[
         Optional[str],
         typer.Option(
@@ -4567,11 +4721,15 @@ def _plan_status(
     ] = False,
 ):
     """Live status dashboard for a plan. Shows all tasks, active agents, and blockers."""
-    _run_status(plan_id, watch=watch, tui=tui)
+    _run_status(plan_id_arg or plan_id, watch=watch, tui=tui)
 
 
 @app.command("status")
 def _status_alias(
+    plan_id_arg: Annotated[
+        Optional[str],
+        typer.Argument(help="Plan ID. Uses saved plan context if omitted."),
+    ] = None,
     plan_id: Annotated[
         Optional[str],
         typer.Option(
@@ -4588,7 +4746,7 @@ def _status_alias(
     ] = False,
 ):
     """Live status dashboard for the current plan."""
-    _run_status(plan_id, watch=watch, tui=tui)
+    _run_status(plan_id_arg or plan_id, watch=watch, tui=tui)
 
 
 @plan_app.command("next")
