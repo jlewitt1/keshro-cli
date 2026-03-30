@@ -398,7 +398,7 @@ def _execution_context_arg(plan: dict | None = None, plan_id: str | None = None)
     return _clean(plan_id) or _clean((plan or {}).get("id")) or ""
 
 
-def _set_default_plan_after_create(plan: dict) -> None:
+def _set_default_plan_after_create(plan: dict, *, announce: bool = True) -> None:
     if _state.json:
         return
     plan_id = _clean(plan.get("id"))
@@ -410,7 +410,8 @@ def _set_default_plan_after_create(plan: dict) -> None:
         return
     update_auth({"default_plan_id": plan_id, "default_plan_title": plan_title})
     _link_current_repo_to_plan(plan_id, plan_title=plan_title)
-    print(f"Saved default plan: {plan_title}")
+    if announce:
+        print(f"Saved default plan: {plan_title}")
 
 
 def _resolve_plan_context(plan_id: str | None) -> tuple[str | None, str | None]:
@@ -1726,8 +1727,8 @@ def _create_migration_from_payload(
                     if attempt < 5:
                         time.sleep(0.75)
 
-    if linked_plan:
-        _set_default_plan_after_create(linked_plan)
+                if linked_plan:
+                    _set_default_plan_after_create(linked_plan, announce=False)
 
     if _state.json:
         print_output(dict(created), True)

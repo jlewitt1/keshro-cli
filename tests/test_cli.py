@@ -1556,6 +1556,7 @@ def test_migration_create_handles_linked_plan_fetch_request_error(capsys, monkey
     assert "Migration created: AWS Batch -> Airflow" in out
     assert "mig-123" in out
     assert "Dashboard: http://localhost:3000/migrations/mig-123" in out
+    assert "Saved default plan:" not in out
     assert "linked execution plan" not in out
     assert "/v1/migrations/mig-123/plan" not in out
 
@@ -1597,7 +1598,7 @@ def test_migration_create_sets_default_plan_when_linked_plan_becomes_available(
     monkeypatch.setattr(
         cli,
         "_set_default_plan_after_create",
-        lambda plan: saved.update({"id": plan.get("id"), "title": plan.get("title")}),
+        lambda plan, announce=True: saved.update({"id": plan.get("id"), "title": plan.get("title")}),
     )
 
     cli._create_migration_from_payload(

@@ -62,14 +62,15 @@ Keshro drives the full execution loop — picks up the next task, gives the agen
 
 ```bash
 keshro continue                    # execute next task, then the next, then the next
-keshro continue -p <migration-id>  # execute a migration by migration ID
+keshro continue -m <migration-id>  # execute a migration by migration ID
+keshro continue -p <plan-id>       # execute a standalone plan by plan ID
 keshro continue --all              # run everything — parallel agents, each in its own worktree
 keshro continue --all -c 10        # cap at 10 concurrent agents
 keshro continue --dry-run          # preview what would run
 keshro continue --no-parallel --agent codex
 ```
 
-For migration workflows, `-p` accepts the migration ID directly. Keshro resolves it to the linked execution plan behind the scenes.
+For migration workflows, use `-m`. Keshro resolves the migration ID to the linked execution plan behind the scenes. `-p` remains available for standalone plans and backward compatibility.
 
 ## Monitor
 
