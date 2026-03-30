@@ -80,9 +80,7 @@ def _read_context_file(path: str | None) -> str | None:
     try:
         return Path(path).read_text().strip() or None
     except OSError as exc:
-        raise typer.BadParameter(
-            f"Could not read context file {path}: {exc}"
-        ) from exc
+        raise typer.BadParameter(f"Could not read context file {path}: {exc}") from exc
 
 
 def _coding_agent_name() -> str | None:
@@ -2009,7 +2007,7 @@ async def _run_parallel(
 
     claude_bin = shutil.which("claude")
     if not claude_bin:
-        raise SystemExit("claude binary not found. Install Claude Code first.")
+        raise SystemExit("Agent binary not found on PATH. Install your agent first.")
 
     with make_client(_state.api_url, _state.token) as client:
         res = client.get(f"/v1/plans/{resolved_plan_id}")
@@ -2871,9 +2869,8 @@ def _find_migration_template(source: str, target: str) -> str | None:
             tmpl_source = (tmpl.get("source") or "").lower()
             tmpl_target = (tmpl.get("target") or "").lower()
             tmpl_key = tmpl.get("key") or ""
-            if (
-                (s_lower in tmpl_source or tmpl_source in s_lower)
-                and (t_lower in tmpl_target or tmpl_target in t_lower)
+            if (s_lower in tmpl_source or tmpl_source in s_lower) and (
+                t_lower in tmpl_target or tmpl_target in t_lower
             ):
                 return tmpl_key
         return None
@@ -2936,7 +2933,8 @@ def _create_migration(
         Optional[str],
         typer.Option(
             "--path",
-            help="Migration path key, for example aws-batch-to-airflow.",
+            "-p",
+            help="Migration path key, e.g. aws-batch-to-airflow. Run 'keshro migration templates' to see all paths.",
         ),
     ] = None,
     field: Annotated[
@@ -2958,7 +2956,7 @@ def _create_migration(
         ),
     ] = None,
     github_url: Annotated[
-        Optional[str], typer.Option("--github-url", help="GitHub URL to attach.")
+        Optional[str], typer.Option("--github-url", "-g", help="GitHub URL to attach.")
     ] = None,
     resource_url: Annotated[
         Optional[str], typer.Option("--resource-url", help="Reference URL to attach.")
@@ -3053,7 +3051,10 @@ def _create_migration(
             has_description = bool(
                 (context and context.strip())
                 or resource_url
-                or (source_type in ("github_issue", "linear", "jira", "url") and source_value)
+                or (
+                    source_type in ("github_issue", "linear", "jira", "url")
+                    and source_value
+                )
             )
             file_context = _read_context_file(context_file) if context_file else None
             if file_context:
@@ -3061,12 +3062,10 @@ def _create_migration(
 
             if not has_description:
                 if sys.stdout.isatty():
+                    print(f"{CYAN}What do you want to do in this project?{RESET}")
                     print(
-                        f"{CYAN}What do you want to do in this project?{RESET}"
-                    )
-                    print(
-                        f"{DIM}Describe the work — e.g. \"migrate Express to Fastify\", "
-                        f"\"add auth with NextAuth\", \"extract billing into a service\"{RESET}"
+                        f'{DIM}Describe the work — e.g. "migrate Express to Fastify", '
+                        f'"add auth with NextAuth", "extract billing into a service"{RESET}'
                     )
                     try:
                         user_input = input(f"\n{CYAN}>{RESET} ").strip()
@@ -3075,14 +3074,14 @@ def _create_migration(
                     if not user_input:
                         raise SystemExit(
                             "No description provided. Usage:\n"
-                            "  keshro create --context \"migrate Express to Fastify\"\n"
+                            '  keshro create --context "migrate Express to Fastify"\n'
                             "  keshro create https://github.com/org/repo/issues/42"
                         )
                     context = user_input
                 else:
                     raise SystemExit(
                         "No project description provided. Pass one of:\n"
-                        "  keshro create --context \"what you want to do\"\n"
+                        '  keshro create --context "what you want to do"\n'
                         "  keshro create --context-file prd.md\n"
                         "  keshro create https://github.com/org/repo/issues/42\n"
                         "  keshro create https://linear.app/team/issue/PROJ-123"
@@ -3122,7 +3121,7 @@ def _create_migration(
                         f"risk assessment, cost estimates, and step-by-step plans.{RESET}\n"
                     )
                     print(f"  1. Treat as migration {GREEN}(recommended){RESET}")
-                    print(f"  2. Treat as a general project")
+                    print("  2. Treat as a general project")
                     try:
                         choice = input(f"\n  {CYAN}>{RESET} ").strip()
                     except (EOFError, KeyboardInterrupt):
@@ -3217,8 +3216,14 @@ def _create_migration(
                         print(f"     {DIM}{why}{RESET}")
                     if options:
                         for oi, opt in enumerate(options, 1):
-                            rec = f" {GREEN}(recommended){RESET}" if opt.get("recommended") else ""
-                            print(f"     {DIM}{oi}. {opt.get('answer_title', opt.get('value', ''))}{rec}{RESET}")
+                            rec = (
+                                f" {GREEN}(recommended){RESET}"
+                                if opt.get("recommended")
+                                else ""
+                            )
+                            print(
+                                f"     {DIM}{oi}. {opt.get('answer_title', opt.get('value', ''))}{rec}{RESET}"
+                            )
                     try:
                         answer = input(f"  {CYAN}>{RESET} ").strip()
                     except (EOFError, KeyboardInterrupt):
@@ -3703,7 +3708,7 @@ def _config_show():
         print(f"{DIM}Current repo plan:{RESET} {YELLOW}{repo_plan}{RESET}")
         if repo_plan_url:
             print(f"{DIM}Plan URL:{RESET} {CYAN}{repo_plan_url}{RESET}")
-    if default_plan:
+    if default_plan and plan_id != repo_plan_id:
         app_url = _app_url_from_api_url(payload["api_url"])
         plan_url = f"{app_url}/plans/{plan_id}" if plan_id else ""
         print(f"{DIM}Default plan:{RESET} {YELLOW}{default_plan}{RESET}")
@@ -3856,7 +3861,7 @@ def _cmd_plan_templates(
             print(template["key"])
 
 
-@app.command("templates")
+@app.command("templates", hidden=True)
 def _templates_alias(
     template_name: Annotated[
         Optional[str], typer.Argument(help="Template key.")
@@ -3885,6 +3890,22 @@ def _plan_templates(
     ] = False,
 ):
     """List available plan templates, or show details for one"""
+    _cmd_plan_templates(template_name, name, verbose)
+
+
+@migration_app.command("templates")
+def _migration_templates(
+    template_name: Annotated[
+        Optional[str], typer.Argument(help="Template key.")
+    ] = None,
+    name: Annotated[
+        Optional[str], typer.Option("-n", "--name", help="Template key.")
+    ] = None,
+    verbose: Annotated[
+        bool, typer.Option("-v", "--verbose", help="Verbose output.")
+    ] = False,
+):
+    """List available migration templates and path keys"""
     _cmd_plan_templates(template_name, name, verbose)
 
 
@@ -3942,6 +3963,7 @@ def _continue_command(
     ] = False,
 ):
     """Resume execution of a plan. In the shell this is coordinator mode; in an agent it resumes one task."""
+
     # Inside a coding agent (piped stdout), always single-task mode.
     # In user's terminal, default to parallel unless --no-parallel is passed.
     use_parallel = not no_parallel and (sys.stdout.isatty() or dry_run)
@@ -4215,7 +4237,7 @@ def _setup_claude():
         print("You can now use /keshro in any Claude Code session.")
 
 
-@app.command("setup-codex")
+@app.command("setup-codex", hidden=True)
 def _setup_codex():
     """Install global Keshro instructions for Codex"""
     try:
@@ -4226,7 +4248,7 @@ def _setup_codex():
         raise typer.Exit(1) from exc
 
 
-@app.command("setup-cursor")
+@app.command("setup-cursor", hidden=True)
 def _setup_cursor():
     """Install Keshro instructions in .cursorrules for Cursor"""
     try:

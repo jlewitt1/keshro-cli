@@ -4,7 +4,7 @@ Make AI agents execute intelligently. Structured plans, parallel execution, cros
 
 ```bash
 pip install keshro
-keshro login <token>      # from keshro.com/account
+keshro login              # opens browser to authenticate
 keshro create             # scan project, generate plan
 keshro continue --all     # agents execute in parallel
 ```
@@ -63,7 +63,7 @@ keshro rollback <task-id>          # revert to pre-task state
 
 ## Works with
 
-Claude Code, Codex, Cursor, Devin, or any AI agent that runs in a terminal.
+Parallel execution currently requires [Claude Code](https://claude.ai/code). Planning, task tracking, and the web dashboard work with any setup.
 
 ## License
 
