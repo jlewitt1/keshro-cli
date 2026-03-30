@@ -74,6 +74,21 @@ def _clean(value: str | None) -> str:
     return (value or "").strip()
 
 
+def _sanitize_json_payload(value):
+    if isinstance(value, str):
+        return value.encode("utf-8", "replace").decode("utf-8").strip()
+    if isinstance(value, dict):
+        return {
+            _sanitize_json_payload(key): _sanitize_json_payload(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_sanitize_json_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_sanitize_json_payload(item) for item in value)
+    return value
+
+
 class _Spinner:
     """Context manager that shows an animated spinner with elapsed time."""
 
@@ -1706,9 +1721,10 @@ def _create_migration_from_payload(
     migration_id = ""
     linked_plan: dict | None = None
     app_url = _app_url_from_api_url(_state.api_url)
+    sanitized_payload = _sanitize_json_payload(payload)
     with _Spinner(spinner_message):
         with make_client(_state.api_url, _state.token) as client:
-            response = client.post("/v1/migrations", json=payload)
+            response = client.post("/v1/migrations", json=sanitized_payload)
             response.raise_for_status()
             created = response.json() or {}
             migration_id = _clean(created.get("id"))

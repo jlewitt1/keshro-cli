@@ -1609,6 +1609,46 @@ def test_migration_create_sets_default_plan_when_linked_plan_becomes_available(
     assert saved == {"id": "plan-new", "title": "New migration plan"}
 
 
+def test_create_migration_sanitizes_invalid_surrogates_in_payload(monkeypatch):
+    seen = {}
+
+    class _Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, path, json=None):
+            seen["path"] = path
+            seen["json"] = json
+            return _FakeResponse({"id": "mig-123", "status": "analyzing"})
+
+        def get(self, path, params=None):
+            request = httpx.Request("GET", f"http://localhost:8000{path}")
+            raise httpx.ConnectError("connection refused", request=request)
+
+    monkeypatch.setattr(cli, "make_client", lambda api_url=None, token=None: _Client())
+    monkeypatch.setattr(cli, "_state", cli._State(api_url="http://localhost:8000"))
+
+    cli._create_migration_from_payload(
+        {
+            "source_type": "AWS Batch",
+            "target_type": "Airflow",
+            "context": "bad surrogate here \udcc2",
+            "custom_fields": {
+                "__keshro_discovered_context": "other bad text \udcc2",
+            },
+        },
+        {"source": "AWS Batch", "target": "Airflow"},
+    )
+
+    assert seen["path"] == "/v1/migrations"
+    assert seen["json"]["context"].endswith("?")
+    assert seen["json"]["custom_fields"]["__keshro_discovered_context"].endswith("?")
+    assert "\udcc2" not in seen["json"]["context"]
+
+
 def test_migration_create_does_not_retry_linked_plan_poll_on_non_404_http_error(
     monkeypatch,
 ):
