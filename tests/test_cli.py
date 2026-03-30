@@ -1212,7 +1212,7 @@ def test_prompt_for_migration_template_fields_uses_replacement_label_for_preview
 
     out = ANSI_RE.sub("", capsys.readouterr().out)
     assert "Current value:" in out
-    assert prompts == ["  keep current or enter replacement: "]
+    assert prompts == ["  Enter=keep, v=view full, r=replace: "]
 
 
 def test_prompt_for_migration_template_fields_offers_view_for_truncated_textarea(
@@ -1259,6 +1259,44 @@ def test_prompt_for_migration_template_fields_offers_view_for_truncated_textarea
         "  Enter=keep, v=view full, r=replace: ",
         "  Enter=keep, v=view full, r=replace: ",
     ]
+
+
+def test_prompt_for_migration_template_fields_ctrl_c_exits_review(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    prompts = []
+
+    def _fake_input(prompt=""):
+        prompts.append(prompt)
+        if len(prompts) == 1:
+            raise KeyboardInterrupt
+        return ""
+
+    monkeypatch.setattr("builtins.input", _fake_input)
+
+    template = {
+        "fields": [
+            {"id": "batch_workloads", "label": "AWS Batch workloads"},
+            {"id": "compute_envs", "label": "Job definitions / compute environments"},
+        ]
+    }
+
+    result = cli._prompt_for_migration_template_fields(
+        template,
+        {
+            "batch_workloads": "Five scheduled jobs",
+            "compute_envs": "Five Fargate job definitions",
+        },
+    )
+
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+    assert "Job definitions / compute environments" not in out
+    assert prompts == ["  Enter=keep, v=view full, r=replace: "]
+    assert result == {
+        "batch_workloads": "Five scheduled jobs",
+        "compute_envs": "Five Fargate job definitions",
+    }
 
 
 def test_create_interactive_migration_prompt_accepts_no_for_general_project(
@@ -1568,6 +1606,45 @@ def test_migration_create_sets_default_plan_when_linked_plan_becomes_available(
     )
 
     assert saved == {"id": "plan-new", "title": "New migration plan"}
+
+
+def test_migration_create_does_not_retry_linked_plan_poll_on_non_404_http_error(
+    monkeypatch,
+):
+    attempts = {"count": 0}
+
+    class _Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, path, json=None):
+            assert path == "/v1/migrations"
+            return _FakeResponse({"id": "mig-123", "status": "analyzing"})
+
+        def get(self, path, params=None):
+            assert path == "/v1/migrations/mig-123/plan"
+            attempts["count"] += 1
+            request = httpx.Request("GET", f"http://localhost:8000{path}")
+            response = httpx.Response(403, request=request)
+            raise httpx.HTTPStatusError(
+                "forbidden", request=request, response=response
+            )
+
+    monkeypatch.setattr(cli, "make_client", lambda api_url=None, token=None: _Client())
+    monkeypatch.setattr(cli, "_state", cli._State(api_url="http://localhost:8000"))
+    sleeps: list[float] = []
+    monkeypatch.setattr(cli.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    cli._create_migration_from_payload(
+        {"source_type": "AWS Batch", "target_type": "Airflow"},
+        {"source": "AWS Batch", "target": "Airflow"},
+    )
+
+    assert attempts["count"] == 1
+    assert sleeps == []
 
 
 def test_migration_list_json_outputs_machine_readable_rows(fake_client, capsys):

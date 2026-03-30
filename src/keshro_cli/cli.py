@@ -1510,7 +1510,7 @@ def _prompt_for_migration_template_fields(
             prompt_label = "  keep current or choose option"
             if current_value:
                 prompt_label += f" [{current_value}]"
-        elif current_value and show_preview and was_truncated:
+        elif current_value and show_preview:
             prompt_label = "  Enter=keep, v=view full, r=replace"
         elif current_value:
             prompt_label = "  keep current or enter replacement"
@@ -1519,14 +1519,16 @@ def _prompt_for_migration_template_fields(
         while True:
             try:
                 response = input(f"{prompt_label}: ").strip()
-            except (EOFError, KeyboardInterrupt):
+            except EOFError:
                 print()
                 response = ""
                 break
+            except KeyboardInterrupt:
+                print()
+                return prompted
             if (
                 current_value
                 and show_preview
-                and was_truncated
                 and not options
                 and response.lower() in {"v", "view"}
             ):
@@ -1537,15 +1539,17 @@ def _prompt_for_migration_template_fields(
             if (
                 current_value
                 and show_preview
-                and was_truncated
                 and not options
                 and response.lower() in {"r", "replace"}
             ):
                 try:
                     response = input("  enter replacement: ").strip()
-                except (EOFError, KeyboardInterrupt):
+                except EOFError:
                     print()
                     response = ""
+                except KeyboardInterrupt:
+                    print()
+                    return prompted
                 break
             break
         if not response:
@@ -1699,6 +1703,7 @@ def _create_migration_from_payload(
     )
     created: dict = {}
     migration_id = ""
+    linked_plan: dict | None = None
     app_url = _app_url_from_api_url(_state.api_url)
     with _Spinner(spinner_message):
         with make_client(_state.api_url, _state.token) as client:
@@ -1706,7 +1711,6 @@ def _create_migration_from_payload(
             response.raise_for_status()
             created = response.json() or {}
             migration_id = _clean(created.get("id"))
-            linked_plan = None
             if migration_id:
                 for attempt in range(6):
                     try:
@@ -1717,12 +1721,13 @@ def _create_migration_from_payload(
                     except httpx.RequestError:
                         break
                     except httpx.HTTPStatusError as exc:
-                        if exc.response.status_code >= 500:
+                        if exc.response.status_code != 404:
                             break
                     if attempt < 5:
                         time.sleep(0.75)
-            if linked_plan:
-                _set_default_plan_after_create(linked_plan)
+
+    if linked_plan:
+        _set_default_plan_after_create(linked_plan)
 
     if _state.json:
         print_output(dict(created), True)
@@ -3502,7 +3507,6 @@ def _detect_migration_intent(description: str) -> tuple[str, str] | None:
 def _find_migration_template(source: str, target: str) -> str | None:
     """Try to find a matching migration template key for a source/target pair."""
     try:
-        client = make_client()
         import re as _re
 
         def _normalize_name(value: str) -> str:
@@ -3526,49 +3530,50 @@ def _find_migration_template(source: str, target: str) -> str | None:
         desired_source = _normalize_name(source)
         desired_target = _normalize_name(target)
 
-        res = client.get("/v1/plans/templates")
-        if res.status_code == 200:
-            templates = res.json() or []
-            for template in templates:
-                template_source = _normalize_name(
-                    str(template.get("source_type") or "")
-                )
-                template_target = _normalize_name(
-                    str(template.get("target_type") or "")
-                )
-                if (
-                    template_source == desired_source
-                    and template_target == desired_target
-                ):
-                    key = _clean(template.get("key"))
-                    if key:
-                        return key
+        with make_client(_state.api_url, _state.token) as client:
+            res = client.get("/v1/plans/templates")
+            if res.status_code == 200:
+                templates = res.json() or []
+                for template in templates:
+                    template_source = _normalize_name(
+                        str(template.get("source_type") or "")
+                    )
+                    template_target = _normalize_name(
+                        str(template.get("target_type") or "")
+                    )
+                    if (
+                        template_source == desired_source
+                        and template_target == desired_target
+                    ):
+                        key = _clean(template.get("key"))
+                        if key:
+                            return key
 
-        template_key = f"{_slug(desired_source)}-to-{_slug(desired_target)}"
-        resp = client.get(
-            "/v1/migrations/path-template/lookup",
-            params={"template_key": template_key},
-        )
-        if resp.status_code == 200:
+            template_key = f"{_slug(desired_source)}-to-{_slug(desired_target)}"
+            resp = client.get(
+                "/v1/migrations/path-template/lookup",
+                params={"template_key": template_key},
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if data and data.get("template_key"):
+                    return data["template_key"]
+
+            resp = client.get(
+                "/v1/migrations/path-template",
+                params={"source_type": source, "target_type": target},
+            )
+            if resp.status_code != 200:
+                return None
             data = resp.json()
-            if data and data.get("template_key"):
-                return data["template_key"]
-
-        resp = client.get(
-            "/v1/migrations/path-template",
-            params={"source_type": source, "target_type": target},
-        )
-        if resp.status_code != 200:
+            if not data:
+                return None
+            key = data.get("template_key") or ""
+            if data.get("is_auto_generated"):
+                return None
+            if key:
+                return key
             return None
-        data = resp.json()
-        if not data:
-            return None
-        key = data.get("template_key") or ""
-        if data.get("is_auto_generated"):
-            return None
-        if key:
-            return key
-        return None
     except Exception:
         return None
 
