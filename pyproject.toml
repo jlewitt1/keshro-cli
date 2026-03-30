@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "keshro"
-version = "0.1.6"
+version = "0.1.7"
 description = "The intelligent execution layer for AI agents — CLI interface"
 readme = "README.md"
 license = {text = "MIT"}

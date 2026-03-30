@@ -1,5 +1,5 @@
-import base64
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -28,11 +28,17 @@ def _auth_with_plan():
 
 
 class _FakeResponse:
-    def __init__(self, payload):
+    def __init__(self, payload, status_code=200):
         self._payload = payload
+        self.status_code = status_code
 
     def raise_for_status(self):
-        return None
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                f"{self.status_code} error",
+                request=httpx.Request("GET", "https://api.example.test"),
+                response=httpx.Response(self.status_code, request=httpx.Request("GET", "https://api.example.test")),
+            )
 
     def json(self):
         return self._payload
@@ -55,6 +61,8 @@ class _FakeClient:
                 [
                     {
                         "key": "aws-batch-to-airflow",
+                        "source_type": "AWS Batch",
+                        "target_type": "Airflow",
                         "title": "AWS Batch to Airflow",
                         "summary": "Saved migration template for AWS Batch to Airflow.",
                         "why_use_it": "Separate scheduling/orchestration logic from the containerized job payload first.",
@@ -103,7 +111,32 @@ class _FakeClient:
                     "confidence_explanation": "Good source coverage and prior migration matches.",
                     "effort_estimate": {"total_hours": 36},
                     "cost_estimate": {"total_cost_low": 5000, "total_cost_high": 9000},
+                    "risks": [
+                        {"severity": "high", "title": "Scheduler parity gaps"},
+                        {"severity": "medium", "title": "IAM drift during cutover"},
+                    ],
                     "notes": "Pilot DAG first, then full cutover.",
+                    "unknowns": [
+                        {
+                            "id": "u1",
+                            "question": "Which Batch jobs need strict ordering guarantees?",
+                            "priority": "high",
+                        },
+                        {
+                            "id": "u2",
+                            "question": "Do any jobs depend on ECS task role side effects?",
+                            "priority": "medium",
+                            "answer": "Not in the pilot scope.",
+                        },
+                    ],
+                    "assessment_quality": {
+                        "required_validations": [
+                            "Compare Batch and Airflow outputs for the pilot DAG."
+                        ],
+                        "next_actions": [
+                            "Confirm the cutover window with the platform team."
+                        ],
+                    },
                     "migration_steps": [
                         {
                             "order": 1,
@@ -146,13 +179,24 @@ class _FakeClient:
                         "is_auto_generated": False,
                     }
                 )
-            return _FakeResponse({"detail": "not found"})
+            return _FakeResponse({"detail": "not found"}, status_code=404)
         if path == "/v1/migrations/migration-123/plan":
             return _FakeResponse(
                 {
                     "id": "plan-123",
                     "title": "AWS Batch to Airflow pilot",
                     "migration_id": "migration-123",
+                    "status": "active",
+                    "plan_steps": [
+                        {"id": "task-1", "status": "done"},
+                        {"id": "task-2", "status": "in_progress"},
+                        {"id": "task-3", "status": "todo"},
+                    ],
+                    "plan_validation": {
+                        "status": "needs_attention",
+                        "overall_score": 68.0,
+                        "findings": [{"code": "missing_cutover"}],
+                    },
                     "task_feedback_events": [
                         {
                             "event_type": "task_updated",
@@ -187,6 +231,7 @@ class _FakeClient:
                 {
                     "id": "plan-123",
                     "title": "AWS Batch to Airflow pilot",
+                    "migration_id": "migration-123",
                     "status": "ready",
                     "source_type": "AWS Batch",
                     "target_type": "Airflow",
@@ -258,7 +303,7 @@ class _FakeClient:
         if path == "/v1/migrations":
             return _FakeResponse(
                 {
-                    "id": "migration-999",
+                    "id": "migration-123",
                     "status": "analyzing",
                     "source_type": json.get("source_type"),
                     "target_type": json.get("target_type"),
@@ -402,6 +447,7 @@ def test_create_migration_from_path_key_prompts_and_posts_payload(
     fake_client, monkeypatch, capsys
 ):
     monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "1")
+    monkeypatch.setattr(cli, "_set_default_plan_after_create", lambda created: None)
     monkeypatch.setattr(
         "shutil.which",
         lambda name: "/usr/local/bin/claude" if name == "claude" else None,
@@ -432,19 +478,70 @@ def test_create_migration_from_path_key_prompts_and_posts_payload(
         )
 
     monkeypatch.setattr("subprocess.run", _fake_run)
-    monkeypatch.setattr("webbrowser.open", lambda url: None)
     cli.main(["create", "--path", "aws-batch-to-airflow"])
 
     out = capsys.readouterr().out
-    assert "Prepared migration draft for AWS Batch -> Airflow." in out
     clarifier_call = next(
         call for call in fake_client.calls if call[1] == "/v1/migrations/clarifiers"
     )
+    create_call = next(
+        call for call in fake_client.calls if call[1] == "/v1/migrations"
+    )
     payload = clarifier_call[2]
+    created_payload = create_call[2]
     assert payload["input_method"] == "cli_agent"
     assert payload["custom_fields"]["batch_workloads"] == "scheduled ETL jobs"
     assert payload["custom_fields"]["__keshro_discovered_context"]
-    assert "Prepared migration draft for AWS Batch -> Airflow." in out
+    assert created_payload["custom_fields"]["target_airflow_deployment"] == "AWS MWAA"
+    assert "Submitting AWS Batch -> Airflow migration and generating execution plan..." in out
+    assert "Migration created: AWS Batch -> Airflow" in out
+    assert "Dashboard: http://localhost:3000/migrations/migration-123" in out
+    assert "Plan URL:" not in out
+    assert "Analysis is still running." in out
+    assert "keshro continue" not in out
+
+
+def test_create_migration_from_path_key_can_use_codex(fake_client, monkeypatch, capsys):
+    monkeypatch.setenv("CODEX_HOME", "/tmp/codex-home")
+    monkeypatch.setattr(cli, "_set_default_plan_after_create", lambda created: None)
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: "/Applications/Codex.app/Contents/Resources/codex"
+        if name == "codex"
+        else None,
+    )
+
+    def _fake_run(cmd, capture_output, text, cwd, check):
+        assert cmd[:2] == ["/Applications/Codex.app/Contents/Resources/codex", "exec"]
+        assert "--sandbox" in cmd
+        assert "--ephemeral" in cmd
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout="\n".join(
+                [
+                    "## Versions",
+                    "- Source version: 1.0",
+                    "- Target version: 2.9",
+                    "",
+                    "## AWS Batch to Airflow details",
+                    "- AWS Batch workloads: scheduled ETL jobs",
+                    "- Target Airflow deployment: AWS MWAA",
+                    "",
+                    "## Additional context",
+                    "- Anything else that materially affects risk, effort, validation, cutover, rollback, or delivery: none",
+                ]
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    code = cli.main(["create", "--path", "aws-batch-to-airflow", "--agent", "codex"])
+
+    assert code == 0
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+    assert "Migration created: AWS Batch -> Airflow" in out
 
 
 def test_create_migration_from_path_key_applies_shared_clarifiers(
@@ -504,22 +601,17 @@ def test_create_migration_from_path_key_applies_shared_clarifiers(
     monkeypatch.setattr("subprocess.run", _fake_run)
     monkeypatch.setattr(fake_client, "post", _post)
 
-    opened_urls = []
-    monkeypatch.setattr("webbrowser.open", lambda url: opened_urls.append(url))
-
     cli.main(["create", "--path", "aws-batch-to-airflow"])
 
-    assert len(opened_urls) == 1
-    match = re.search(r"draft=([A-Za-z0-9_-]+)", opened_urls[0])
-    assert match
-    encoded = match.group(1)
-    padded = encoded + "=" * ((4 - len(encoded) % 4) % 4)
-    decoded = json.loads(base64.urlsafe_b64decode(padded.encode()).decode())
+    create_call = next(
+        call for call in fake_client.calls if call[1] == "/v1/migrations"
+    )
+    created_payload = create_call[2]
     assert (
-        decoded["custom_fields"]["rollback_strategy"]
+        created_payload["custom_fields"]["rollback_strategy"]
         == "switch back to Batch scheduling immediately"
     )
-    assert "Critical clarifications" in decoded["context"]
+    assert "Critical clarifications" in created_payload["context"]
     assert call_count["count"] == 2
 
 
@@ -561,6 +653,23 @@ def test_continue_prompt_omits_full_skill_boilerplate_in_non_tty_mode(
     out = capsys.readouterr().out
     assert "Do NOT use Keshro MCP tools" not in out
     assert "The current task and plan context are provided below" not in out
+
+
+def test_spinner_truncates_long_messages_but_keeps_animation(monkeypatch, capsys):
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr(
+        "keshro_cli.cli.shutil.get_terminal_size",
+        lambda fallback=(80, 24): os.terminal_size((40, 24)),
+    )
+
+    with cli._Spinner(
+        "Analyzing the current working directory and generating AWS Batch -> Airflow migration inputs and follow-up questions..."
+    ):
+        pass
+
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+    assert "⠋" in out
+    assert "…" in out
 
 
 def test_continue_prompt_mentions_status_tracking_and_blocking_rule(
@@ -688,6 +797,134 @@ def test_continue_prompt_includes_error_guidance(fake_client, monkeypatch, capsy
     assert "If a keshro command fails" in out
 
 
+def test_continue_confirms_when_using_implicit_plan_context(
+    fake_client, monkeypatch, capsys
+):
+    monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
+    monkeypatch.setattr("keshro_cli.cli._current_plan_label", lambda work_dir=None: "AWS Batch to Airflow pilot")
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+
+    prompted = {}
+
+    def _fake_confirm(message, default=True, abort=False):
+        prompted["message"] = message
+        prompted["default"] = default
+        prompted["abort"] = abort
+        return True
+
+    monkeypatch.setattr("typer.confirm", _fake_confirm)
+    monkeypatch.setattr(
+        "keshro_cli.cli.asyncio.run",
+        lambda coro: (coro.close(), None)[1],
+    )
+
+    cli.main(["continue"])
+
+    assert "AWS Batch to Airflow pilot" in prompted["message"]
+    assert "plan-123" in prompted["message"]
+    assert prompted["default"] is True
+    assert prompted["abort"] is False
+
+
+def test_continue_skips_confirmation_when_plan_id_is_explicit(
+    fake_client, monkeypatch, capsys
+):
+    monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+
+    def _fail_confirm(*args, **kwargs):
+        raise AssertionError("should not prompt when plan id is explicit")
+
+    monkeypatch.setattr("typer.confirm", _fail_confirm)
+    monkeypatch.setattr(
+        "keshro_cli.cli.asyncio.run",
+        lambda coro: (coro.close(), None)[1],
+    )
+
+    cli.main(["continue", "-p", "plan-123"])
+
+
+def test_continue_skips_confirmation_when_migration_id_is_explicit(
+    fake_client, monkeypatch, capsys
+):
+    monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+
+    def _fail_confirm(*args, **kwargs):
+        raise AssertionError("should not prompt when migration id is explicit")
+
+    monkeypatch.setattr("typer.confirm", _fail_confirm)
+    monkeypatch.setattr(
+        "keshro_cli.cli.asyncio.run",
+        lambda coro: (coro.close(), None)[1],
+    )
+
+    cli.main(["continue", "-m", "migration-123"])
+
+
+def test_continue_rejects_plan_id_and_migration_id_together(
+    fake_client, monkeypatch, capsys
+):
+    code = cli.main(["continue", "-p", "plan-123", "-m", "migration-123"])
+
+    assert code == 1
+    assert "either --plan-id or --migration-id" in capsys.readouterr().err
+
+
+def test_continue_exits_cleanly_when_implicit_plan_confirmation_is_declined(
+    fake_client, monkeypatch, capsys
+):
+    monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("typer.confirm", lambda *args, **kwargs: False)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "")
+
+    code = cli.main(["continue"])
+
+    assert code == 0
+
+
+def test_continue_can_override_implicit_plan_with_migration_id(
+    fake_client, monkeypatch, capsys
+):
+    monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("typer.confirm", lambda *args, **kwargs: False)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "migration-123")
+    monkeypatch.setattr("keshro_cli.cli._current_plan_label", lambda work_dir=None: "AWS Batch to Airflow pilot")
+    monkeypatch.setattr(
+        "keshro_cli.cli.asyncio.run",
+        lambda coro: (coro.close(), None)[1],
+    )
+
+    original_get = fake_client.get
+
+    def _get(path, params=None, headers=None, timeout=None):
+        if path == "/v1/plans/migration-123":
+            fake_client.calls.append(("GET", path, params))
+            return _FakeResponse({"detail": "not found"}, status_code=404)
+        return original_get(path, params=params, headers=headers, timeout=timeout)
+
+    monkeypatch.setattr(fake_client, "get", _get)
+
+    code = cli.main(["continue"])
+
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+    assert code == 0
+    assert "Using: AWS Batch to Airflow pilot (plan-123)" in out
+    assert ("GET", "/v1/plans/migration-123", None) in fake_client.calls
+    assert ("GET", "/v1/migrations/migration-123/plan", None) in fake_client.calls
+
+
 def test_continue_prompt_does_not_tell_claude_to_refetch(
     fake_client, monkeypatch, capsys
 ):
@@ -708,6 +945,32 @@ def test_continue_exits_when_not_authenticated(fake_client, monkeypatch):
 
     exit_code = cli.main(["continue", "-p", "plan-123"])
     assert exit_code == 1
+
+
+def test_continue_rejects_codex_for_parallel_mode(fake_client, monkeypatch):
+    monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
+
+    exit_code = cli.main(["continue", "--agent", "codex"])
+
+    assert exit_code == 1
+
+
+def test_wrap_prompt_agent_error_suggests_switching_agents(monkeypatch):
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: "/Applications/Codex.app/Contents/Resources/codex"
+        if name == "codex"
+        else None,
+    )
+
+    message = cli._wrap_prompt_agent_error(
+        "You've hit your limit · resets 9pm (Asia/Jerusalem)", "claude"
+    )
+
+    assert "Claude Code hit a usage limit" in message
+    assert "keshro create --agent codex" in message
+    assert "keshro config set --agent codex" in message
 
 
 def test_continue_exits_when_token_expired(fake_client, monkeypatch):
@@ -808,6 +1071,334 @@ def test_create_reads_context_from_file(fake_client, monkeypatch, tmp_path, caps
     assert "Scalability plan" in out
 
 
+def test_resolve_menu_choice_supports_numbers_text_and_aliases():
+    assert cli._resolve_menu_choice("2", ["Migration", "General"]) == "General"
+    assert cli._resolve_menu_choice("general", ["Migration", "General"]) == "General"
+    assert (
+        cli._resolve_menu_choice(
+            "yes",
+            ["Treat as migration", "Treat as a general project"],
+            aliases={
+                "y": "Treat as migration",
+                "yes": "Treat as migration",
+                "n": "Treat as a general project",
+                "no": "Treat as a general project",
+            },
+        )
+        == "Treat as migration"
+    )
+    assert (
+        cli._resolve_menu_choice(
+            "n",
+            ["Treat as migration", "Treat as a general project"],
+            aliases={
+                "y": "Treat as migration",
+                "yes": "Treat as migration",
+                "n": "Treat as a general project",
+                "no": "Treat as a general project",
+            },
+        )
+        == "Treat as a general project"
+    )
+
+
+def test_format_preview_lines_wraps_without_breaking_words():
+    lines, was_truncated = cli._format_preview_lines(
+        "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu",
+        width=20,
+        max_lines=4,
+    )
+
+    assert lines == [
+        "alpha beta gamma",
+        "delta epsilon zeta",
+        "eta theta iota kappa",
+        "lambda mu",
+    ]
+    assert was_truncated is False
+
+
+def test_format_preview_lines_truncates_cleanly():
+    lines, was_truncated = cli._format_preview_lines(
+        "alpha beta gamma. delta epsilon zeta. eta theta iota kappa lambda mu nu xi omicron.",
+        width=20,
+        max_lines=3,
+    )
+
+    assert lines == [
+        "alpha beta gamma.",
+        "delta epsilon zeta.",
+        "eta theta iota...",
+    ]
+    assert was_truncated is True
+
+
+def test_format_recommended_suffix_skips_duplicate_and_styles_marker():
+    assert (
+        cli._format_recommended_suffix("Hybrid orchestrator (Recommended)", True) == ""
+    )
+    assert (
+        cli._format_recommended_suffix("Full replacement", True)
+        == f" {cli.GREEN}(recommended){cli.RESET}"
+    )
+    assert cli._format_recommended_suffix("Scheduling only", False) == ""
+
+
+def test_prompt_for_migration_template_fields_hides_duplicate_suggested_value_for_options(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "")
+
+    template = {
+        "fields": [
+            {
+                "id": "trigger_model",
+                "label": "Current trigger model",
+                "type": "select",
+                "options": [
+                    "EventBridge schedule",
+                    "Application/API triggered",
+                    "Step Functions / workflow engine",
+                    "Mixed / unsure",
+                ],
+            }
+        ]
+    }
+
+    cli._prompt_for_migration_template_fields(
+        template, {"trigger_model": "EventBridge schedule"}
+    )
+
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+    assert "press Enter to keep the current value" in out
+    assert "1. EventBridge schedule [suggested]" in out
+    assert "Suggested value:" not in out
+    assert "Current value:" not in out
+
+
+def test_prompt_for_migration_template_fields_uses_replacement_label_for_previewed_textarea(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    prompts = []
+
+    def _fake_input(prompt=""):
+        prompts.append(prompt)
+        return ""
+
+    monkeypatch.setattr("builtins.input", _fake_input)
+
+    template = {
+        "fields": [
+            {
+                "id": "batch_workloads",
+                "label": "AWS Batch workloads",
+                "type": "textarea",
+                "required": True,
+            }
+        ]
+    }
+
+    cli._prompt_for_migration_template_fields(
+        template,
+        {
+            "batch_workloads": (
+                "5 workloads are defined. Scheduled jobs: acme-daily-sales-etl, "
+                "acme-data-quality-checks, acme-report-generator."
+            )
+        },
+    )
+
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+    assert "Current value:" in out
+    assert prompts == ["  Enter=keep, v=view full, r=replace: "]
+
+
+def test_prompt_for_migration_template_fields_offers_view_for_truncated_textarea(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    prompts = []
+    answers = iter(["v", ""])
+
+    def _fake_input(prompt=""):
+        prompts.append(prompt)
+        return next(answers)
+
+    monkeypatch.setattr("builtins.input", _fake_input)
+
+    template = {
+        "fields": [
+            {
+                "id": "batch_workloads",
+                "label": "AWS Batch workloads",
+                "type": "textarea",
+                "required": True,
+            }
+        ]
+    }
+
+    cli._prompt_for_migration_template_fields(
+        template,
+        {
+            "batch_workloads": (
+                "5 scheduled Batch workloads are defined. Daily chain: "
+                "`acme-daily-sales-etl` at `02:00 UTC` -> `acme-data-quality-checks` "
+                "at `03:00 UTC` -> `acme-report-generator` at `06:00 UTC`. "
+                "Independent job: `acme-inventory-sync` every 6 hours. Weekly job: "
+                "`acme-customer-churn-scoring` runs Mondays at `04:00 UTC`."
+            )
+        },
+    )
+
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+    assert "(truncated; type 'v' to view the full value)" in out
+    assert "Full value:" in out
+    assert prompts == [
+        "  Enter=keep, v=view full, r=replace: ",
+        "  Enter=keep, v=view full, r=replace: ",
+    ]
+
+
+def test_prompt_for_migration_template_fields_ctrl_c_exits_review(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    prompts = []
+
+    def _fake_input(prompt=""):
+        prompts.append(prompt)
+        if len(prompts) == 1:
+            raise KeyboardInterrupt
+        return ""
+
+    monkeypatch.setattr("builtins.input", _fake_input)
+
+    template = {
+        "fields": [
+            {"id": "batch_workloads", "label": "AWS Batch workloads"},
+            {"id": "compute_envs", "label": "Job definitions / compute environments"},
+        ]
+    }
+
+    result = cli._prompt_for_migration_template_fields(
+        template,
+        {
+            "batch_workloads": "Five scheduled jobs",
+            "compute_envs": "Five Fargate job definitions",
+        },
+    )
+
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+    assert "Job definitions / compute environments" not in out
+    assert prompts == ["  Enter=keep, v=view full, r=replace: "]
+    assert result == {
+        "batch_workloads": "Five scheduled jobs",
+        "compute_envs": "Five Fargate job definitions",
+    }
+
+
+def test_create_interactive_migration_prompt_accepts_no_for_general_project(
+    fake_client, monkeypatch, capsys
+):
+    monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
+    monkeypatch.setattr("keshro_cli.cli._collect_generic_discovery", lambda _: None)
+    monkeypatch.setattr("keshro_cli.cli.update_auth", lambda payload: payload)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr(
+        "keshro_cli.cli._detect_migration_intent",
+        lambda _description: ("AWS Batch", "Airflow"),
+    )
+
+    answers = iter(["plan the migration", "no"])
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
+
+    called = {"migration": False}
+
+    def _fake_create_migration_inner(*args, **kwargs):
+        called["migration"] = True
+
+    monkeypatch.setattr(
+        "keshro_cli.cli._create_migration_inner", _fake_create_migration_inner
+    )
+
+    original_post = fake_client.post
+
+    def _post(path, json=None, timeout=None):
+        if path == "/v1/plans/describe/preview":
+            return _FakeResponse({"questions": [], "enrichment_context": ""})
+        if path == "/v1/plans/generate":
+            return _FakeResponse(
+                {
+                    "id": "plan-general-1",
+                    "title": "General project plan",
+                    "status": "draft",
+                    "plan_steps": [],
+                }
+            )
+        return original_post(path, json=json, timeout=timeout)
+
+    fake_client.post = _post
+
+    code = cli.main(["create"])
+
+    assert code == 0
+    assert called["migration"] is False
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+    assert "General project plan" in out
+
+
+def test_create_interactive_migration_prompt_accepts_yes_for_migration(
+    fake_client, monkeypatch
+):
+    monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
+    monkeypatch.setattr("keshro_cli.cli._collect_generic_discovery", lambda _: None)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr(
+        "keshro_cli.cli._detect_migration_intent",
+        lambda _description: ("AWS Batch", "Airflow"),
+    )
+    monkeypatch.setattr(
+        "keshro_cli.cli._find_migration_template",
+        lambda _source, _target: "aws-batch-to-airflow",
+    )
+
+    answers = iter(["plan the migration", "yes"])
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
+
+    captured: dict[str, object] = {}
+
+    def _fake_create_migration_inner(
+        path,
+        provided_answers,
+        context,
+        github_url,
+        resource_url,
+        org_id,
+        work_dir,
+        **kwargs,
+    ):
+        captured["path"] = path
+        captured["context"] = context
+
+    monkeypatch.setattr(
+        "keshro_cli.cli._create_migration_inner", _fake_create_migration_inner
+    )
+
+    code = cli.main(["create"])
+
+    assert code == 0
+    assert captured["path"] == "aws-batch-to-airflow"
+    assert captured["context"] == "plan the migration"
+
+
+def test_find_migration_template_normalizes_apache_airflow(fake_client):
+    template_key = cli._find_migration_template("AWS Batch", "Apache Airflow")
+
+    assert template_key == "aws-batch-to-airflow"
+
+
 def test_plan_create_saves_default_plan_automatically(fake_client, monkeypatch, capsys):
     saved = {}
     monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: {})
@@ -829,6 +1420,23 @@ def test_plan_create_saves_default_plan_automatically(fake_client, monkeypatch, 
     assert "Saved default plan:" in out
     assert saved["default_plan_id"]
     assert saved["default_plan_title"]
+
+
+def test_config_set_saves_default_agent(monkeypatch, capsys):
+    saved = {}
+    monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: {})
+    monkeypatch.setattr("keshro_cli.client.load_auth", lambda: {})
+    monkeypatch.setattr(
+        "keshro_cli.cli.update_auth",
+        lambda payload: saved.update(payload) or saved,
+    )
+
+    code = cli.main(["config", "set", "--agent", "codex"])
+
+    assert code == 0
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+    assert "Saved default agent: codex" in out
+    assert saved["default_agent"] == "codex"
 
 
 def test_plan_create_does_not_save_default_plan_in_json_mode(
@@ -890,10 +1498,27 @@ def test_migration_view_shows_detail(fake_client, capsys, monkeypatch):
     cli.main(["migration", "view", "migration-123"])
     out = capsys.readouterr().out
     assert "migration-123" in out
+    assert "Overview" in out
+    assert "Created:" in out
+    assert "Execution progress:" in out
+    assert "Execution validation:" in out
+    assert "Plan:" not in out
     assert "Confidence explanation:" in out
+    assert "Assessment" in out
     assert "Effort:" in out
     assert "Cost:" in out
+    assert "Risks" in out
+    assert "Risks:" in out
+    assert "Questions" in out
+    assert "Unknowns:" in out
+    assert "Checks" in out
+    assert "Required validations:" in out
+    assert "Next actions:" in out
+    assert "Notes" in out
     assert "Steps:" in out
+    assert "Links" in out
+    assert "Dashboard:" in out
+    assert "Plan dashboard:" not in out
 
 
 def test_migration_delete_hits_endpoint(fake_client, capsys):
@@ -901,6 +1526,166 @@ def test_migration_delete_hits_endpoint(fake_client, capsys):
     out = capsys.readouterr().out.strip()
     assert out == "Deleted migration migration-123."
     assert ("DELETE", "/v1/migrations/migration-123", None) in fake_client.calls
+
+
+def test_migration_create_handles_linked_plan_fetch_request_error(capsys, monkeypatch):
+    class _Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, path, json=None):
+            assert path == "/v1/migrations"
+            return _FakeResponse({"id": "mig-123", "status": "analyzing"})
+
+        def get(self, path, params=None):
+            request = httpx.Request("GET", f"http://localhost:8000{path}")
+            raise httpx.ConnectError("connection refused", request=request)
+
+    monkeypatch.setattr(cli, "make_client", lambda api_url=None, token=None: _Client())
+    monkeypatch.setattr(cli, "_state", cli._State(api_url="http://localhost:8000"))
+
+    cli._create_migration_from_payload(
+        {"source_type": "AWS Batch", "target_type": "Airflow"},
+        {"source": "AWS Batch", "target": "Airflow"},
+    )
+
+    out = capsys.readouterr().out
+    assert "Migration created: AWS Batch -> Airflow" in out
+    assert "mig-123" in out
+    assert "Dashboard: http://localhost:3000/migrations/mig-123" in out
+    assert "Saved default plan:" not in out
+    assert "linked execution plan" not in out
+    assert "/v1/migrations/mig-123/plan" not in out
+
+
+def test_migration_create_sets_default_plan_when_linked_plan_becomes_available(
+    capsys, monkeypatch
+):
+    saved = {}
+
+    class _Client:
+        def __init__(self):
+            self.plan_attempts = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, path, json=None):
+            assert path == "/v1/migrations"
+            return _FakeResponse({"id": "mig-123", "status": "analyzing"})
+
+        def get(self, path, params=None):
+            if path == "/v1/migrations/mig-123/plan":
+                self.plan_attempts += 1
+                if self.plan_attempts < 3:
+                    request = httpx.Request("GET", f"http://localhost:8000{path}")
+                    response = httpx.Response(404, request=request)
+                    raise httpx.HTTPStatusError(
+                        "not ready", request=request, response=response
+                    )
+                return _FakeResponse({"id": "plan-new", "title": "New migration plan"})
+            raise AssertionError(path)
+
+    monkeypatch.setattr(cli, "make_client", lambda api_url=None, token=None: _Client())
+    monkeypatch.setattr(cli, "_state", cli._State(api_url="http://localhost:8000"))
+    monkeypatch.setattr(cli.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        cli,
+        "_set_default_plan_after_create",
+        lambda plan, announce=True: saved.update({"id": plan.get("id"), "title": plan.get("title")}),
+    )
+
+    cli._create_migration_from_payload(
+        {"source_type": "AWS Batch", "target_type": "Airflow"},
+        {"source": "AWS Batch", "target": "Airflow"},
+    )
+
+    assert saved == {"id": "plan-new", "title": "New migration plan"}
+
+
+def test_create_migration_sanitizes_invalid_surrogates_in_payload(monkeypatch):
+    seen = {}
+
+    class _Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, path, json=None):
+            seen["path"] = path
+            seen["json"] = json
+            return _FakeResponse({"id": "mig-123", "status": "analyzing"})
+
+        def get(self, path, params=None):
+            request = httpx.Request("GET", f"http://localhost:8000{path}")
+            raise httpx.ConnectError("connection refused", request=request)
+
+    monkeypatch.setattr(cli, "make_client", lambda api_url=None, token=None: _Client())
+    monkeypatch.setattr(cli, "_state", cli._State(api_url="http://localhost:8000"))
+
+    cli._create_migration_from_payload(
+        {
+            "source_type": "AWS Batch",
+            "target_type": "Airflow",
+            "context": "bad surrogate here \udcc2",
+            "custom_fields": {
+                "__keshro_discovered_context": "other bad text \udcc2",
+            },
+        },
+        {"source": "AWS Batch", "target": "Airflow"},
+    )
+
+    assert seen["path"] == "/v1/migrations"
+    assert seen["json"]["context"].endswith("?")
+    assert seen["json"]["custom_fields"]["__keshro_discovered_context"].endswith("?")
+    assert "\udcc2" not in seen["json"]["context"]
+
+
+def test_migration_create_does_not_retry_linked_plan_poll_on_non_404_http_error(
+    monkeypatch,
+):
+    attempts = {"count": 0}
+
+    class _Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, path, json=None):
+            assert path == "/v1/migrations"
+            return _FakeResponse({"id": "mig-123", "status": "analyzing"})
+
+        def get(self, path, params=None):
+            assert path == "/v1/migrations/mig-123/plan"
+            attempts["count"] += 1
+            request = httpx.Request("GET", f"http://localhost:8000{path}")
+            response = httpx.Response(403, request=request)
+            raise httpx.HTTPStatusError(
+                "forbidden", request=request, response=response
+            )
+
+    monkeypatch.setattr(cli, "make_client", lambda api_url=None, token=None: _Client())
+    monkeypatch.setattr(cli, "_state", cli._State(api_url="http://localhost:8000"))
+    sleeps: list[float] = []
+    monkeypatch.setattr(cli.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    cli._create_migration_from_payload(
+        {"source_type": "AWS Batch", "target_type": "Airflow"},
+        {"source": "AWS Batch", "target": "Airflow"},
+    )
+
+    assert attempts["count"] == 1
+    assert sleeps == []
 
 
 def test_migration_list_json_outputs_machine_readable_rows(fake_client, capsys):
@@ -1156,6 +1941,17 @@ def test_current_plan_id_prefers_repo_resolution_before_cached_default(monkeypat
     assert cli._current_plan_id(None) == "plan-linked"
     assert saved["default_plan_id"] == "plan-linked"
     assert saved["default_plan_title"] == "Repo linked plan"
+
+
+def test_current_plan_id_resolves_explicit_migration_id(monkeypatch):
+    monkeypatch.setattr(
+        "keshro_cli.cli._resolve_plan_or_migration_context",
+        lambda value: ("plan-123", "AWS Batch to Airflow pilot")
+        if value == "migration-123"
+        else (None, None),
+    )
+
+    assert cli._current_plan_id("migration-123") == "plan-123"
 
 
 def test_get_plan_or_exit_clears_stale_cached_default_on_404(monkeypatch):
@@ -1920,6 +2716,29 @@ def test_config_prints_org_memberships(fake_client, monkeypatch, capsys):
     assert "Demo Inc" in out
 
 
+def test_config_prints_current_repo_migration_context(fake_client, monkeypatch, capsys):
+    monkeypatch.setattr(
+        "keshro_cli.cli.load_auth",
+        lambda: {
+            "api_url": "http://localhost:8000",
+            "token": "jwt-123",
+            "default_plan_id": "plan-123",
+            "default_plan_title": "AWS Batch to Airflow",
+            "user": {"email": "cli@example.com", "name": "CLI User"},
+        },
+    )
+    monkeypatch.setattr(
+        "keshro_cli.cli._resolve_repo_linked_plan",
+        lambda work_dir=None: ("plan-123", "AWS Batch to Airflow"),
+    )
+
+    cli.main(["config"])
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+    assert "Current repo migration:" in out
+    assert "Migration URL:" in out
+    assert "/migrations/migration-123" in out
+
+
 def test_auth_login_with_token_prints_human_text_by_default(monkeypatch, capsys):
     saved = {}
 
@@ -2248,10 +3067,7 @@ def test_request_errors_render_connection_help(monkeypatch, capsys):
     code = cli.main(["templates"])
     captured = capsys.readouterr()
     assert code == 1
-    assert (
-        "Could not reach Keshro at http://localhost:8000/v1/plans/templates."
-        in captured.err
-    )
+    assert "Could not reach Keshro at http://localhost:8000." in captured.err
 
 
 # ---------------------------------------------------------------------------
