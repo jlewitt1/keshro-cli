@@ -3002,6 +3002,45 @@ def _create_migration(
             _ensure_authenticated()
             resolved_work_dir = str(Path(work_dir or ".").resolve())
 
+            # If no description provided, prompt for one
+            has_description = bool(
+                (context and context.strip())
+                or resource_url
+                or (source_type in ("github_issue", "linear", "jira", "url") and source_value)
+            )
+            file_context = _read_context_file(context_file) if context_file else None
+            if file_context:
+                has_description = True
+
+            if not has_description:
+                if sys.stdout.isatty():
+                    print(
+                        f"{CYAN}What do you want to do in this project?{RESET}"
+                    )
+                    print(
+                        f"{DIM}Describe the work — e.g. \"migrate Express to Fastify\", "
+                        f"\"add auth with NextAuth\", \"extract billing into a service\"{RESET}"
+                    )
+                    try:
+                        user_input = input(f"\n{CYAN}>{RESET} ").strip()
+                    except (EOFError, KeyboardInterrupt):
+                        raise SystemExit(0)
+                    if not user_input:
+                        raise SystemExit(
+                            "No description provided. Usage:\n"
+                            "  keshro create --context \"migrate Express to Fastify\"\n"
+                            "  keshro create https://github.com/org/repo/issues/42"
+                        )
+                    context = user_input
+                else:
+                    raise SystemExit(
+                        "No project description provided. Pass one of:\n"
+                        "  keshro create --context \"what you want to do\"\n"
+                        "  keshro create --context-file prd.md\n"
+                        "  keshro create https://github.com/org/repo/issues/42\n"
+                        "  keshro create https://linear.app/team/issue/PROJ-123"
+                    )
+
             if not _state.json:
                 source_label = source_value or resolved_work_dir
                 print(f"{CYAN}Creating project from: {source_label}{RESET}")
@@ -3015,13 +3054,13 @@ def _create_migration(
 
             # Build description from context + source info
             desc_parts = []
+            if file_context:
+                desc_parts.append(file_context)
             if context:
                 desc_parts.append(context)
             if resource_url:
                 desc_parts.append(f"Reference: {resource_url}")
-            if not desc_parts and discovered_context:
-                desc_parts.append(f"Project in {resolved_work_dir}")
-            description = "\n\n".join(desc_parts) or f"Project in {resolved_work_dir}"
+            description = "\n\n".join(desc_parts)
 
             client = make_client()
 
