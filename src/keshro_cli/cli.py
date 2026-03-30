@@ -345,7 +345,8 @@ def _current_plan_id(
 ) -> str | None:
     explicit = _clean(plan_id)
     if explicit:
-        return explicit
+        resolved_id, _ = _resolve_plan_or_migration_context(explicit)
+        return resolved_id
     repo_plan_id, repo_plan_title = _resolve_repo_linked_plan(work_dir)
     if repo_plan_id:
         update_auth(
@@ -379,8 +380,15 @@ def _require_plan_context(
     if resolved:
         return resolved
     raise SystemExit(
-        "Plan ID required. Pass <plan-id> or run `keshro config set --plan-id <plan-id>` from the repo you want to link."
+        "Plan or migration ID required. Pass -p <plan-id-or-migration-id> or run `keshro config set --plan-id <plan-id-or-migration-id>` from the repo you want to link."
     )
+
+
+def _execution_context_arg(plan: dict | None = None, plan_id: str | None = None) -> str:
+    migration_id = _clean((plan or {}).get("migration_id"))
+    if migration_id:
+        return migration_id
+    return _clean(plan_id) or _clean((plan or {}).get("id")) or ""
 
 
 def _set_default_plan_after_create(plan: dict) -> None:
@@ -407,6 +415,36 @@ def _resolve_plan_context(plan_id: str | None) -> tuple[str | None, str | None]:
         res.raise_for_status()
         plan = res.json()
     return explicit_id, _clean(plan.get("title")) or explicit_id
+
+
+def _load_plan_context_details(plan_id: str | None) -> dict[str, str | None]:
+    resolved_plan_id = _clean(plan_id)
+    if not resolved_plan_id:
+        return {
+            "plan_id": None,
+            "plan_title": None,
+            "migration_id": None,
+            "kind": None,
+        }
+    try:
+        with make_client(_state.api_url, _state.token) as client:
+            res = client.get(f"/v1/plans/{resolved_plan_id}")
+            res.raise_for_status()
+            plan = res.json()
+    except Exception:
+        return {
+            "plan_id": resolved_plan_id,
+            "plan_title": None,
+            "migration_id": None,
+            "kind": "plan",
+        }
+    migration_id = _clean(plan.get("migration_id"))
+    return {
+        "plan_id": resolved_plan_id,
+        "plan_title": _clean(plan.get("title")) or resolved_plan_id,
+        "migration_id": migration_id,
+        "kind": "migration" if migration_id else "plan",
+    }
 
 
 def _resolve_plan_or_migration_context(
@@ -2860,6 +2898,7 @@ async def _run_parallel(
         ]
 
         if blocked_steps:
+            continue_arg = _execution_context_arg(plan, resolved_plan_id)
             print(f"\n{RED}{'─' * 50}{RESET}")
             print(
                 f"{RED}{len(blocked_steps)} task(s) blocked — needs your attention:{RESET}\n"
@@ -2874,7 +2913,7 @@ async def _run_parallel(
                     f"    {DIM}Unblock: keshro task unblock {tid} -p {resolved_plan_id}{RESET}"
                 )
             print(
-                f"\n{DIM}After unblocking, run: keshro continue -p {resolved_plan_id}{RESET}"
+                f"\n{DIM}After unblocking, run: keshro continue -p {continue_arg}{RESET}"
             )
             print(f"{RED}{'─' * 50}{RESET}")
 
@@ -2944,7 +2983,7 @@ def _continue_with_claude(
     resolved_plan_id = _current_plan_id(plan_id)
     if not resolved_plan_id:
         raise SystemExit(
-            "Plan context required. Pass --plan-id <plan-id> or save one with `keshro config set --plan-id <plan-id>`."
+            "Plan or migration context required. Pass --plan-id <plan-id-or-migration-id> or save one with `keshro config set --plan-id <plan-id-or-migration-id>`."
         )
     plan = _get_plan_or_exit(resolved_plan_id)
 
@@ -2953,6 +2992,7 @@ def _continue_with_claude(
     if plan_status == "draft" and not confirm:
         steps = sorted(plan.get("plan_steps") or [], key=lambda s: s.get("order", 0))
         migration_id = _clean(plan.get("migration_id"))
+        continue_arg = _execution_context_arg(plan, resolved_plan_id)
         app_url = _app_url_from_api_url(_state.api_url)
         print(
             f"\n{YELLOW}This plan is in draft. Review the tasks before executing:{RESET}\n"
@@ -2975,7 +3015,7 @@ def _continue_with_claude(
         print()
         if migration_id:
             print(f"  Review or edit: {app_url}/migrations/{migration_id}?tab=plan")
-        print(f"\n  To execute: keshro continue -p {resolved_plan_id} --confirm\n")
+        print(f"\n  To execute: keshro continue -p {continue_arg} --confirm\n")
         raise SystemExit(0)
 
     # Mark draft plan as active on first confirmed execution
@@ -4379,6 +4419,13 @@ def _config_show():
         "user": auth.get("user") or {},
         "orgs": orgs,
     }
+    plan_id = payload.get("default_plan_id") or ""
+    repo_context = _load_plan_context_details(repo_plan_id) if repo_plan_id else {}
+    default_context_details = _load_plan_context_details(plan_id) if plan_id else {}
+    payload["repo_context_kind"] = repo_context.get("kind")
+    payload["repo_context_migration_id"] = repo_context.get("migration_id")
+    payload["default_context_kind"] = default_context_details.get("kind")
+    payload["default_context_migration_id"] = default_context_details.get("migration_id")
     if _state.json:
         print_output(payload, True)
         return
@@ -4396,19 +4443,32 @@ def _config_show():
     repo_plan = payload["repo_plan_title"] or payload["repo_plan_id"]
     default_plan = payload["default_plan_title"] or payload["default_plan_id"]
     repo_plan_id = payload.get("repo_plan_id") or ""
-    plan_id = payload.get("default_plan_id") or ""
     if repo_plan:
         app_url = _app_url_from_api_url(payload["api_url"])
-        repo_plan_url = f"{app_url}/plans/{repo_plan_id}" if repo_plan_id else ""
-        print(f"{DIM}Current repo plan:{RESET} {YELLOW}{repo_plan}{RESET}")
-        if repo_plan_url:
-            print(f"{DIM}Plan URL:{RESET} {CYAN}{repo_plan_url}{RESET}")
+        repo_migration_id = payload.get("repo_context_migration_id") or ""
+        if repo_migration_id:
+            print(f"{DIM}Current repo migration:{RESET} {YELLOW}{repo_plan}{RESET}")
+            print(
+                f"{DIM}Migration URL:{RESET} {CYAN}{app_url}/migrations/{repo_migration_id}{RESET}"
+            )
+        else:
+            repo_plan_url = f"{app_url}/plans/{repo_plan_id}" if repo_plan_id else ""
+            print(f"{DIM}Current repo plan:{RESET} {YELLOW}{repo_plan}{RESET}")
+            if repo_plan_url:
+                print(f"{DIM}Plan URL:{RESET} {CYAN}{repo_plan_url}{RESET}")
     if default_plan and plan_id != repo_plan_id:
         app_url = _app_url_from_api_url(payload["api_url"])
-        plan_url = f"{app_url}/plans/{plan_id}" if plan_id else ""
-        print(f"{DIM}Default plan:{RESET} {YELLOW}{default_plan}{RESET}")
-        if plan_url:
-            print(f"{DIM}Plan URL:{RESET} {CYAN}{plan_url}{RESET}")
+        default_migration_id = payload.get("default_context_migration_id") or ""
+        if default_migration_id:
+            print(f"{DIM}Default migration:{RESET} {YELLOW}{default_plan}{RESET}")
+            print(
+                f"{DIM}Migration URL:{RESET} {CYAN}{app_url}/migrations/{default_migration_id}{RESET}"
+            )
+        else:
+            plan_url = f"{app_url}/plans/{plan_id}" if plan_id else ""
+            print(f"{DIM}Default plan:{RESET} {YELLOW}{default_plan}{RESET}")
+            if plan_url:
+                print(f"{DIM}Plan URL:{RESET} {CYAN}{plan_url}{RESET}")
     if user.get("email"):
         print(f"{DIM}User:{RESET} {CYAN}{user['email']}{RESET}")
     if user.get("name"):
@@ -4483,7 +4543,7 @@ def _config_set(
         updates["default_plan_title"] = None
     elif plan_id is not None:
         _ensure_authenticated()
-        resolved_plan_id, resolved_plan_title = _resolve_plan_context(plan_id)
+        resolved_plan_id, resolved_plan_title = _resolve_plan_or_migration_context(plan_id)
         updates["default_plan_id"] = resolved_plan_id
         updates["default_plan_title"] = resolved_plan_title
     auth = update_auth(updates)

@@ -225,6 +225,7 @@ class _FakeClient:
                 {
                     "id": "plan-123",
                     "title": "AWS Batch to Airflow pilot",
+                    "migration_id": "migration-123",
                     "status": "ready",
                     "source_type": "AWS Batch",
                     "target_type": "Airflow",
@@ -822,6 +823,26 @@ def test_continue_skips_confirmation_when_plan_id_is_explicit(
     )
 
     cli.main(["continue", "-p", "plan-123"])
+
+
+def test_continue_skips_confirmation_when_migration_id_is_explicit(
+    fake_client, monkeypatch, capsys
+):
+    monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+
+    def _fail_confirm(*args, **kwargs):
+        raise AssertionError("should not prompt when migration id is explicit")
+
+    monkeypatch.setattr("typer.confirm", _fail_confirm)
+    monkeypatch.setattr(
+        "keshro_cli.cli.asyncio.run",
+        lambda coro: (coro.close(), None)[1],
+    )
+
+    cli.main(["continue", "-p", "migration-123"])
 
 
 def test_continue_exits_cleanly_when_implicit_plan_confirmation_is_declined(
@@ -1760,6 +1781,17 @@ def test_current_plan_id_prefers_repo_resolution_before_cached_default(monkeypat
     assert saved["default_plan_title"] == "Repo linked plan"
 
 
+def test_current_plan_id_resolves_explicit_migration_id(monkeypatch):
+    monkeypatch.setattr(
+        "keshro_cli.cli._resolve_plan_or_migration_context",
+        lambda value: ("plan-123", "AWS Batch to Airflow pilot")
+        if value == "migration-123"
+        else (None, None),
+    )
+
+    assert cli._current_plan_id("migration-123") == "plan-123"
+
+
 def test_get_plan_or_exit_clears_stale_cached_default_on_404(monkeypatch):
     saved = {}
     monkeypatch.setattr(
@@ -2520,6 +2552,29 @@ def test_config_prints_org_memberships(fake_client, monkeypatch, capsys):
     assert "Organizations:" in out
     assert "Acme" in out
     assert "Demo Inc" in out
+
+
+def test_config_prints_current_repo_migration_context(fake_client, monkeypatch, capsys):
+    monkeypatch.setattr(
+        "keshro_cli.cli.load_auth",
+        lambda: {
+            "api_url": "http://localhost:8000",
+            "token": "jwt-123",
+            "default_plan_id": "plan-123",
+            "default_plan_title": "AWS Batch to Airflow",
+            "user": {"email": "cli@example.com", "name": "CLI User"},
+        },
+    )
+    monkeypatch.setattr(
+        "keshro_cli.cli._resolve_repo_linked_plan",
+        lambda work_dir=None: ("plan-123", "AWS Batch to Airflow"),
+    )
+
+    cli.main(["config"])
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+    assert "Current repo migration:" in out
+    assert "Migration URL:" in out
+    assert "/migrations/migration-123" in out
 
 
 def test_auth_login_with_token_prints_human_text_by_default(monkeypatch, capsys):
