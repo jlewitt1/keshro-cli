@@ -1,36 +1,52 @@
 # Keshro
 
-Make AI agents execute intelligently. Structured plans, parallel execution, cross-task learning.
+Migration execution for AI coding agents. Structured plans, parallel execution, and cross-task learning for complex stack moves.
 
 ```bash
 pip install keshro
 keshro login              # opens browser to authenticate
 keshro create             # scan project, generate plan
+keshro config set --agent codex  # optional: default prompt agent
 keshro continue --all     # agents execute in parallel
 ```
 
 ## The problem
 
-Your AI agent is great at one task at a time. But real projects have 10-20 tasks with dependencies, shared context, and files that shouldn't be edited by two agents at once.
+Your AI agent is good at one task at a time. Migrations are not one task.
 
-Run them manually and you're the bottleneck. Run them in parallel and they conflict. The more edge cases a project has, the worse this gets.
+An AWS Batch to Airflow move, Terraform to Pulumi rewrite, or Jenkins to GitHub Actions cutover usually means:
+- discovery across the repo and infrastructure definitions
+- migration-specific risks and open questions
+- staged execution with dependency ordering
+- multiple agents touching related code without stepping on each other
+
+Run that manually and you're the bottleneck. Run it in parallel without coordination and agents conflict. The more edge cases the migration has, the worse this gets.
 
 ## What it's built for
 
-- **Stack migrations** — Express to Fastify, Terraform to Pulumi, Jenkins to GitHub Actions, and more. Framework-specific gotchas, config differences, and breaking changes that cascade if ordered wrong.
-- **Monolith decomposition** — extracting services from a shared codebase. Shared database tables, cross-module signals, feature flag dependencies, and more.
-- **Infrastructure overhauls** — adding autoscaling, PDBs, topology constraints to Helm charts, and more. Interactions between components that silently break in production.
-- **Auth refactors** — replacing custom JWT with NextAuth across dozens of routes, and more. Cookie vs header auth, SSR compatibility, role migration, token scheme changes.
-- **Any multi-task engineering project** where the edge cases compound across tasks and one agent session can't hold all the context.
+- **Stack and platform migrations** — Express to Fastify, Terraform to Pulumi, Jenkins to GitHub Actions, AWS Batch to Airflow, Docker Compose to Kubernetes, and similar moves where configuration, runtime behavior, and rollout sequencing all change together.
+- **Migration planning with execution attached** — not just “what should we do,” but “what are the blockers, what still needs answering, and what should run first.”
+- **Adjacent multi-task engineering work** — monolith decomposition, infrastructure overhauls, auth refactors, and other projects where one agent session cannot hold all the context.
 
 ## What Keshro does
 
-1. **Plans the work** — generates a dependency graph with task ordering, file assignments, acceptance criteria, and risk flags
+1. **Builds a migration-aware plan** — generates a dependency graph with task ordering, file assignments, acceptance criteria, migration risks, and open questions
 2. **Runs agents in parallel** — each in an isolated git worktree, respecting dependency order
 3. **Shares context across tasks** — when one agent discovers something, related future tasks inherit that knowledge
 4. **Tracks everything** — git checkpoints before each task, decision audit trails, one-command rollback
 
-## Create from anything
+## Create a migration
+
+```bash
+keshro create --path aws-batch-to-airflow               # migration template
+keshro create --path aws-batch-to-airflow --agent codex # use Codex for discovery
+keshro create                                           # detect migration intent from repo + prompt
+```
+
+Keshro scans the project, asks follow-up questions, and creates a migration with analysis, risks, open questions, and a linked execution plan.
+Use `--agent claude`, `--agent codex`, or save a default with `keshro config set --agent ...`.
+
+## Create from other inputs
 
 ```bash
 keshro create                                         # current directory
@@ -38,8 +54,7 @@ keshro create https://github.com/org/repo             # GitHub repo
 keshro create https://github.com/org/repo/issues/42   # GitHub issue
 keshro create https://linear.app/team/issue/PROJ-123  # Linear issue
 ```
-
-Your AI agent scans the project, answers clarifying questions, and generates the plan.
+Keshro can still create general execution plans from issues, repos, and freeform project descriptions, but migrations are the primary workflow.
 
 ## Execute
 
@@ -50,6 +65,7 @@ keshro continue                    # execute next task, then the next, then the 
 keshro continue --all              # run everything — parallel agents, each in its own worktree
 keshro continue --all -c 10        # cap at 10 concurrent agents
 keshro continue --dry-run          # preview what would run
+keshro continue --no-parallel --agent codex
 ```
 
 ## Monitor
@@ -57,13 +73,14 @@ keshro continue --dry-run          # preview what would run
 ```bash
 keshro status                      # progress summary
 keshro status --tui                # live terminal dashboard
+keshro migration view <id>         # migration detail, risks, unknowns, linked plan
 keshro explain <task-id>           # decision audit trail
 keshro rollback <task-id>          # revert to pre-task state
 ```
 
 ## Works with
 
-Parallel execution currently requires [Claude Code](https://claude.ai/code). Planning, task tracking, and the web dashboard work with any setup.
+Parallel execution currently requires [Claude Code](https://claude.ai/code). Planning, migration intake, single-task resume prompts, task tracking, and the web dashboard work with any setup. If Claude is rate-limited during prompt-based flows, Keshro now suggests switching agents and supports a saved default via `keshro config set --agent ...`.
 
 ## License
 

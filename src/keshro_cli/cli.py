@@ -1,17 +1,17 @@
 import asyncio
-import base64
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import textwrap
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Optional
-from urllib.parse import urlencode
 
 import click
 import httpx
@@ -74,6 +74,43 @@ def _clean(value: str | None) -> str:
     return (value or "").strip()
 
 
+class _Spinner:
+    """Context manager that shows an animated spinner with elapsed time."""
+
+    def __init__(self, message: str):
+        self._message = message
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self):
+        if _state.json or not sys.stdout.isatty():
+            print(self._message)
+            return self
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=1)
+
+    def _spin(self):
+        frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        i = 0
+        start = time.time()
+        while not self._stop.is_set():
+            elapsed = int(time.time() - start)
+            print(
+                f"\r  {CYAN}{frames[i % len(frames)]}{RESET} {self._message} {DIM}{elapsed}s{RESET}",
+                end="",
+                flush=True,
+            )
+            self._stop.wait(0.1)
+            i += 1
+        print("\r" + " " * (len(self._message) + 20) + "\r", end="", flush=True)
+
+
 def _read_context_file(path: str | None) -> str | None:
     if not path:
         return None
@@ -95,6 +132,11 @@ def _coding_agent_name() -> str | None:
 
 def _inside_coding_agent() -> bool:
     return _coding_agent_name() is not None
+
+
+def _default_agent_preference() -> str:
+    value = _clean(load_auth().get("default_agent")).lower()
+    return value if value in {"auto", "claude", "codex"} else "auto"
 
 
 def _parse_timestamp(value: str | None) -> datetime | None:
@@ -367,6 +409,33 @@ def _resolve_plan_context(plan_id: str | None) -> tuple[str | None, str | None]:
     return explicit_id, _clean(plan.get("title")) or explicit_id
 
 
+def _resolve_plan_or_migration_context(
+    value: str | None,
+) -> tuple[str | None, str | None]:
+    explicit_id = _clean(value)
+    if not explicit_id:
+        return None, None
+    with make_client(_state.api_url, _state.token) as client:
+        try:
+            res = client.get(f"/v1/plans/{explicit_id}")
+            res.raise_for_status()
+            plan = res.json()
+            return explicit_id, _clean(plan.get("title")) or explicit_id
+        except Exception:
+            pass
+        try:
+            res = client.get(f"/v1/migrations/{explicit_id}/plan")
+            res.raise_for_status()
+            plan = res.json()
+            plan_id = _clean(plan.get("id")) or explicit_id
+            return plan_id, _clean(plan.get("title")) or plan_id
+        except Exception:
+            pass
+    raise SystemExit(
+        f"Could not resolve '{explicit_id}' to a plan or migration-linked plan."
+    )
+
+
 def _resolve_org_context(
     org_id: str | None = None, org_name: str | None = None
 ) -> tuple[str | None, str | None]:
@@ -422,7 +491,10 @@ def _print_table(headers: list[str], rows: list[list[str]]) -> None:
 
 
 def _print_migration_summary(
-    migration: dict, verbose: bool = False, context_label: str | None = None
+    migration: dict,
+    verbose: bool = False,
+    context_label: str | None = None,
+    show_id: bool = True,
 ) -> None:
     migration_id = migration.get("id", "")
     status = _clean(migration.get("status") or "pending") or "pending"
@@ -431,8 +503,9 @@ def _print_migration_summary(
     created_at = _clean(migration.get("created_at"))
     date_part = f"  {DIM}{created_at}{RESET}" if created_at else ""
     suffix = f"  {DIM}for org {context_label}{RESET}" if context_label else ""
+    prefix = f"{CYAN}{migration_id}{RESET}  " if show_id and migration_id else ""
     print(
-        f"{CYAN}{migration_id}{RESET}  {source} -> {target}  {DIM}[{status}]{RESET}{date_part}{suffix}"
+        f"{prefix}{source} -> {target}  {DIM}[{status}]{RESET}{date_part}{suffix}"
     )
     if verbose:
         if migration.get("outcome_status"):
@@ -441,21 +514,104 @@ def _print_migration_summary(
             print(f"  {DIM}Confidence:{RESET} {migration['confidence_score']}")
 
 
-def _print_migration_detail(migration: dict, context_label: str | None = None) -> None:
-    _print_migration_summary(migration, verbose=True, context_label=context_label)
+def _summarize_plan_progress(plan: dict | None) -> str | None:
+    if not isinstance(plan, dict):
+        return None
+    steps = plan.get("plan_steps") or []
+    if not isinstance(steps, list) or not steps:
+        return None
+
+    counts = {"done": 0, "in_progress": 0, "blocked": 0, "todo": 0}
+    for step in steps:
+        status = _clean((step or {}).get("status") or "todo") or "todo"
+        if status in counts:
+            counts[status] += 1
+        else:
+            counts["todo"] += 1
+    total = len(steps)
+    parts = [f"{counts['done']}/{total} done"]
+    if counts["in_progress"]:
+        parts.append(f"{counts['in_progress']} in progress")
+    if counts["blocked"]:
+        parts.append(f"{counts['blocked']} blocked")
+    if counts["todo"]:
+        parts.append(f"{counts['todo']} todo")
+    return ", ".join(parts)
+
+
+def _print_wrapped_block(
+    label: str,
+    value: str,
+    *,
+    indent: str = "",
+    width: int = 88,
+) -> None:
+    text = _clean(value)
+    if not text:
+        return
+    prefix = f"{indent}{DIM}{label}:{RESET} "
+    wrapped = textwrap.wrap(text, width=width, subsequent_indent=" " * len(prefix))
+    if not wrapped:
+        return
+    print(prefix + wrapped[0])
+    for line in wrapped[1:]:
+        print(" " * len(prefix) + line)
+
+
+def _print_migration_detail(
+    migration: dict,
+    *,
+    context_label: str | None = None,
+    linked_plan: dict | None = None,
+    api_url: str | None = None,
+) -> None:
+    _print_migration_summary(
+        migration, verbose=True, context_label=context_label, show_id=False
+    )
+    print()
+    print("Overview")
+    created_at = _format_verbose_timestamp(_clean(migration.get("created_at")))
+    if created_at:
+        print(f"{DIM}Created:{RESET} {created_at}")
     if migration.get("migration_mode"):
         print(f"{DIM}Mode:{RESET} {migration['migration_mode']}")
     if migration.get("input_method"):
         print(f"{DIM}Input method:{RESET} {migration['input_method']}")
+    if migration.get("outcome_status"):
+        print(f"{DIM}Outcome:{RESET} {migration['outcome_status']}")
+    if migration.get("analysis_revision") is not None:
+        print(f"{DIM}Analysis revision:{RESET} {migration['analysis_revision']}")
     if migration.get("org_id"):
         print(f"{DIM}Org:{RESET} {migration['org_id']}")
+    if linked_plan:
+        progress = _summarize_plan_progress(linked_plan)
+        if progress:
+            print(f"{DIM}Execution progress:{RESET} {progress}")
+        plan_validation = linked_plan.get("plan_validation") or {}
+        if isinstance(plan_validation, dict) and plan_validation.get("status"):
+            validation_bits = [_clean(plan_validation.get("status"))]
+            if plan_validation.get("overall_score") is not None:
+                validation_bits.append(f"score {plan_validation['overall_score']:.1f}")
+            findings = plan_validation.get("findings") or []
+            if findings:
+                validation_bits.append(f"{len(findings)} finding(s)")
+            print(f"{DIM}Execution validation:{RESET} {', '.join(validation_bits)}")
     if migration.get("github_url"):
         print(f"{DIM}GitHub URL:{RESET} {migration['github_url']}")
     if migration.get("resource_url"):
         print(f"{DIM}Resource URL:{RESET} {migration['resource_url']}")
-    if migration.get("confidence_explanation"):
+    source_files = migration.get("source_files") or []
+    if source_files:
+        print(f"{DIM}Source files:{RESET} {len(source_files)} attached")
+    if migration.get("custom_fields"):
         print(
-            f"{DIM}Confidence explanation:{RESET} {migration['confidence_explanation']}"
+            f"{DIM}Migration inputs:{RESET} {len(migration['custom_fields'])} captured"
+        )
+    if migration.get("confidence_explanation"):
+        print()
+        print("Assessment")
+        _print_wrapped_block(
+            "Confidence explanation", migration["confidence_explanation"]
         )
     if migration.get("error_message"):
         print(f"{DIM}Error:{RESET} {migration['error_message']}")
@@ -467,17 +623,84 @@ def _print_migration_detail(migration: dict, context_label: str | None = None) -
     high = cost.get("total_cost_high")
     if low is not None or high is not None:
         print(f"{DIM}Cost:{RESET} {low} - {high}")
+    risks = migration.get("risks") or []
+    if risks:
+        print()
+        print("Risks")
+        high_risk_count = sum(
+            1
+            for risk in risks
+            if _clean((risk or {}).get("severity")).lower() in {"critical", "high"}
+        )
+        print(
+            f"{DIM}Risks:{RESET} {len(risks)} total"
+            + (f" ({high_risk_count} high/critical)" if high_risk_count else "")
+        )
+        for risk in risks[:3]:
+            title = _clean((risk or {}).get("title")) or "Untitled risk"
+            severity = _clean((risk or {}).get("severity")).upper() or "?"
+            print(f"  - [{severity}] {title}")
+    unknowns = migration.get("unknowns") or []
+    if unknowns:
+        print()
+        print("Questions")
+        pending = [item for item in unknowns if not _clean((item or {}).get("answer"))]
+        answered = len(unknowns) - len(pending)
+        print(
+            f"{DIM}Unknowns:{RESET} {len(unknowns)} total, {len(pending)} pending, {answered} answered"
+        )
+        for item in pending[:3]:
+            question = _truncate_text(_clean((item or {}).get("question")), limit=120)
+            if question:
+                print(f"  - {question}")
+    quality = migration.get("assessment_quality") or {}
+    if isinstance(quality, dict):
+        required_validations = quality.get("required_validations") or []
+        if required_validations:
+            print()
+            print("Checks")
+            print(f"{DIM}Required validations:{RESET}")
+            for item in required_validations[:3]:
+                print(f"  - {_truncate_text(str(item), limit=120)}")
+        next_actions = quality.get("next_actions") or []
+        if next_actions:
+            print(f"{DIM}Next actions:{RESET}")
+            for item in next_actions[:3]:
+                print(f"  - {_truncate_text(str(item), limit=120)}")
     if migration.get("notes"):
-        print(f"{DIM}Notes:{RESET} {migration['notes']}")
+        print()
+        print("Notes")
+        note_lines = [
+            line.strip()
+            for line in str(migration["notes"]).splitlines()
+            if line.strip()
+        ]
+        for line in note_lines[:10]:
+            print(f"  {line}")
+        if len(note_lines) > 10:
+            print("  …")
     steps = migration.get("migration_steps") or []
     if steps:
+        print()
         print(f"{DIM}Steps:{RESET}")
         for step in steps:
             title = step.get("title") or "Untitled step"
             order = step.get("order", "?")
             print(f"  {order}. {title}")
             if step.get("description"):
-                print(f"     {step['description']}")
+                for line in textwrap.wrap(
+                    str(step["description"]),
+                    width=82,
+                    initial_indent="     ",
+                    subsequent_indent="     ",
+                ):
+                    print(line)
+    app_url = _app_url_from_api_url(api_url) if api_url else ""
+    migration_id = _clean(migration.get("id"))
+    print()
+    print("Links")
+    if app_url and migration_id:
+        print(f"{DIM}Dashboard:{RESET} {app_url}/migrations/{migration_id}")
 
 
 def _print_plan_summary(
@@ -792,6 +1015,96 @@ def _match_select_option(field: dict, value: str) -> str:
     return value.strip()
 
 
+def _resolve_menu_choice(
+    value: str,
+    options: list[str],
+    *,
+    aliases: dict[str, str] | None = None,
+) -> str:
+    """Resolve a menu answer to a canonical option label when possible."""
+    raw = value.strip()
+    if not raw:
+        return raw
+    normalized_options = [
+        str(option).strip() for option in options if str(option).strip()
+    ]
+    if not normalized_options:
+        return raw
+    if raw.isdigit():
+        option_index = int(raw) - 1
+        if 0 <= option_index < len(normalized_options):
+            return normalized_options[option_index]
+    lowered = raw.lower()
+    if aliases and lowered in aliases:
+        alias_target = aliases[lowered]
+        for option in normalized_options:
+            if option == alias_target:
+                return option
+    for option in normalized_options:
+        option_lower = option.lower()
+        if lowered == option_lower:
+            return option
+    for option in normalized_options:
+        option_lower = option.lower()
+        if lowered in option_lower or option_lower in lowered:
+            return option
+    return raw
+
+
+def _format_preview_lines(
+    value: str, *, width: int = 88, max_lines: int = 4
+) -> tuple[list[str], bool]:
+    """Wrap preview text for interactive prompts without breaking words."""
+    preview = value.replace("\n", " ").strip()
+    if not preview:
+        return ([], False)
+    chunks = [
+        chunk.strip() for chunk in re.split(r"(?<=[.;!?])\s+", preview) if chunk.strip()
+    ]
+    wrapped: list[str] = []
+    for chunk in chunks or [preview]:
+        wrapped.extend(
+            textwrap.wrap(
+                chunk,
+                width=width,
+                break_long_words=False,
+                break_on_hyphens=False,
+            )
+            or [chunk]
+        )
+    if len(wrapped) <= max_lines:
+        return (wrapped, False)
+    trimmed = wrapped[: max_lines - 1]
+    remainder = " ".join(wrapped[max_lines - 1 :]).strip()
+    trimmed.append(textwrap.shorten(remainder, width=width, placeholder="..."))
+    return (trimmed, True)
+
+
+def _format_full_value_lines(value: str, *, width: int = 88) -> list[str]:
+    """Wrap a full value for terminal display without truncating it."""
+    text = value.strip()
+    if not text:
+        return []
+    lines: list[str] = []
+    for raw_line in text.splitlines() or [text]:
+        wrapped = textwrap.wrap(
+            raw_line,
+            width=width,
+            break_long_words=False,
+            break_on_hyphens=False,
+        )
+        lines.extend(wrapped or [""])
+    return lines
+
+
+def _format_recommended_suffix(title: str, recommended: bool) -> str:
+    if not recommended:
+        return ""
+    if "recommended" in title.lower():
+        return ""
+    return f" {GREEN}(recommended){RESET}"
+
+
 def _build_path_discovery_prompt(template: dict) -> str:
     source = _clean(template.get("source")) or "Source"
     target = _clean(template.get("target")) or "Target"
@@ -858,10 +1171,10 @@ def _build_agent_discovery_prompt(template: dict) -> str:
 
 
 def _collect_discovery_answer_from_claude(
-    template: dict, work_dir: str | None = None
+    template: dict, work_dir: str | None = None, agent: str = "auto"
 ) -> str:
     prompt = _build_agent_discovery_prompt(template)
-    return _run_prompt_in_claude(
+    return _run_prompt_in_agent(
         prompt,
         missing_env_message=(
             "This command needs to run inside a coding agent so it can scan your codebase.\n"
@@ -871,12 +1184,54 @@ def _collect_discovery_answer_from_claude(
             "Could not find a coding agent binary. Make sure you're running this from within your agent's terminal."
         ),
         failure_message_prefix=("Coding agent returned an error: "),
-        empty_message="Claude agent returned no discovery response.",
+        empty_message="Coding agent returned no discovery response.",
         work_dir=work_dir,
+        agent=agent,
     )
 
 
-def _run_prompt_in_claude(
+def _resolve_prompt_agent(agent: str) -> tuple[str, str]:
+    requested = _clean(agent).lower() or _default_agent_preference() or "auto"
+    if requested not in {"auto", "claude", "codex"}:
+        raise SystemExit(
+            "Unsupported agent. Use --agent auto, --agent claude, or --agent codex."
+        )
+    if requested in {"auto", "claude"}:
+        claude_bin = shutil.which("claude")
+        if claude_bin:
+            return ("claude", claude_bin)
+        if requested == "claude":
+            raise SystemExit("Could not find the Claude Code binary on PATH.")
+    if requested in {"auto", "codex"}:
+        codex_bin = shutil.which("codex")
+        if codex_bin:
+            return ("codex", codex_bin)
+        if requested == "codex":
+            raise SystemExit("Could not find the Codex binary on PATH.")
+    raise SystemExit("Could not find a supported coding agent binary on PATH.")
+
+
+def _wrap_prompt_agent_error(detail: str, agent_name: str) -> str:
+    lowered = detail.lower()
+    if "hit your limit" in lowered or "quota" in lowered:
+        if agent_name == "claude" and shutil.which("codex"):
+            return (
+                "Claude Code hit a usage limit while Keshro was gathering migration or project context.\n"
+                f"Agent message: {detail}\n"
+                "Try again with `keshro create --agent codex`, or make Codex the default with "
+                "`keshro config set --agent codex`."
+            )
+        if agent_name == "codex" and shutil.which("claude"):
+            return (
+                "Codex hit a usage limit while Keshro was gathering migration or project context.\n"
+                f"Agent message: {detail}\n"
+                "Try again with `keshro create --agent claude`, or make Claude the default with "
+                "`keshro config set --agent claude`."
+            )
+    return detail
+
+
+def _run_prompt_in_agent(
     prompt: str,
     *,
     missing_env_message: str,
@@ -884,16 +1239,15 @@ def _run_prompt_in_claude(
     failure_message_prefix: str,
     empty_message: str,
     work_dir: str | None = None,
+    agent: str = "auto",
 ) -> str:
-    if not _inside_coding_agent():
-        raise SystemExit(missing_env_message)
-    claude_bin = shutil.which("claude")
-    if not claude_bin:
+    agent_name, agent_bin = _resolve_prompt_agent(agent)
+    if not agent_bin:
         raise SystemExit(missing_binary_message)
     resolved_dir = str(Path(work_dir).resolve()) if work_dir else os.getcwd()
-    result = subprocess.run(
-        [
-            claude_bin,
+    if agent_name == "claude":
+        command = [
+            agent_bin,
             "-p",
             prompt,
             "--output-format",
@@ -903,7 +1257,25 @@ def _run_prompt_in_claude(
             "--add-dir",
             resolved_dir,
             "--no-session-persistence",
-        ],
+        ]
+    else:
+        command = [
+            agent_bin,
+            "exec",
+            prompt,
+            "--cd",
+            resolved_dir,
+            "--sandbox",
+            "workspace-write",
+            "--skip-git-repo-check",
+            "--add-dir",
+            resolved_dir,
+            "--color",
+            "never",
+            "--ephemeral",
+        ]
+    result = subprocess.run(
+        command,
         capture_output=True,
         text=True,
         cwd=resolved_dir,
@@ -913,6 +1285,7 @@ def _run_prompt_in_claude(
         detail = (
             _clean(result.stderr) or _clean(result.stdout) or "Coding agent failed."
         )
+        detail = _wrap_prompt_agent_error(detail, agent_name)
         raise SystemExit(f"{failure_message_prefix}{detail}")
     answer = _clean(result.stdout)
     if not answer:
@@ -1009,12 +1382,16 @@ def _build_clarifier_prompt(
 
 
 def _collect_clarifier_answers_from_claude(
-    template: dict, payload: dict, questions: list[dict], work_dir: str | None = None
+    template: dict,
+    payload: dict,
+    questions: list[dict],
+    work_dir: str | None = None,
+    agent: str = "auto",
 ) -> dict[str, str]:
     if not questions:
         return {}
     prompt = _build_clarifier_prompt(template, payload, questions)
-    raw = _run_prompt_in_claude(
+    raw = _run_prompt_in_agent(
         prompt,
         missing_env_message=(
             "This command needs to run inside a coding agent so it can scan your codebase.\n"
@@ -1026,6 +1403,7 @@ def _collect_clarifier_answers_from_claude(
         failure_message_prefix="Coding agent returned an error: ",
         empty_message="Coding agent returned no clarifier answers.",
         work_dir=work_dir,
+        agent=agent,
     )
     parsed = _parse_discovery_key_values(raw)
     answers: dict[str, str] = {}
@@ -1045,6 +1423,98 @@ def _collect_clarifier_answers_from_claude(
             if recommended_value:
                 answers[question_id] = recommended_value
     return answers
+
+
+def _prompt_for_migration_template_fields(
+    template: dict, answers: dict[str, str]
+) -> dict[str, str]:
+    if _state.json or not sys.stdout.isatty():
+        return answers
+    prompted = dict(answers)
+    fields = list(template.get("fields") or [])
+    if not fields:
+        return prompted
+    print(
+        f"\n{CYAN}Review migration inputs{RESET} {DIM}(press Enter to keep the current value){RESET}"
+    )
+    for index, field in enumerate(fields, 1):
+        field_id = _clean(field.get("id"))
+        label = _clean(field.get("label")) or field_id or f"Field {index}"
+        if not field_id:
+            continue
+        current_value = _clean(prompted.get(field_id))
+        required = bool(field.get("required"))
+        suffix = f" {YELLOW}(required){RESET}" if required else ""
+        print(f"\n  {CYAN}{index}.{RESET} {label}{suffix}")
+        options = list(field.get("options") or [])
+        if options:
+            for option_index, option in enumerate(options, 1):
+                marker = " [suggested]" if _clean(str(option)) == current_value else ""
+                print(f"     {DIM}{option_index}. {option}{marker}{RESET}")
+        show_preview = bool(current_value) and not (
+            options and any(_clean(str(option)) == current_value for option in options)
+        )
+        if show_preview:
+            preview_lines, was_truncated = _format_preview_lines(current_value)
+            print(f"     {DIM}Current value:{RESET}")
+            for line in preview_lines:
+                print(f"     {DIM}{line}{RESET}")
+            if was_truncated:
+                print(f"     {DIM}(truncated; type 'v' to view the full value){RESET}")
+        if options:
+            prompt_label = "  keep current or choose option"
+            if current_value:
+                prompt_label += f" [{current_value}]"
+        elif current_value and show_preview and was_truncated:
+            prompt_label = "  Enter=keep, v=view full, r=replace"
+        elif current_value:
+            prompt_label = "  keep current or enter replacement"
+        else:
+            prompt_label = "  enter value"
+        while True:
+            try:
+                response = input(f"{prompt_label}: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                response = ""
+                break
+            if (
+                current_value
+                and show_preview
+                and was_truncated
+                and not options
+                and response.lower() in {"v", "view"}
+            ):
+                print(f"     {DIM}Full value:{RESET}")
+                for line in _format_full_value_lines(current_value):
+                    print(f"     {DIM}{line}{RESET}")
+                continue
+            if (
+                current_value
+                and show_preview
+                and was_truncated
+                and not options
+                and response.lower() in {"r", "replace"}
+            ):
+                try:
+                    response = input("  enter replacement: ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    response = ""
+                break
+            break
+        if not response:
+            continue
+        if options:
+            response = _resolve_menu_choice(
+                response, [str(option) for option in options]
+            )
+        prompted[field_id] = (
+            _match_select_option(field, response)
+            if str(field.get("type") or "").strip() == "select"
+            else response
+        )
+    return prompted
 
 
 def _merge_clarifier_answers(
@@ -1096,45 +1566,141 @@ def _current_app_url() -> str:
     return _app_url_from_api_url(api_url)
 
 
-def _encode_prefill_draft(payload: dict) -> str:
-    encoded = base64.urlsafe_b64encode(
-        json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    ).decode("ascii")
-    return encoded.rstrip("=")
+def _prompt_for_migration_clarifiers(
+    questions: list[dict], suggested_answers: dict[str, str]
+) -> dict[str, str]:
+    if _state.json or not sys.stdout.isatty() or not questions:
+        return suggested_answers
+    answers = dict(suggested_answers)
+    print(
+        f"\n{CYAN}Follow-up questions{RESET} {DIM}(press Enter to keep the suggested answer){RESET}"
+    )
+    for index, question in enumerate(questions, 1):
+        question_id = _clean(question.get("id")) or f"q{index}"
+        prompt_text = _clean(question.get("question")) or question_id
+        why = _clean(question.get("why_this_matters"))
+        options = list(question.get("answers") or [])
+        current_value = _clean(answers.get(question_id))
+        print(f"\n  {CYAN}{index}.{RESET} {prompt_text}")
+        if why:
+            print(f"     {DIM}{why}{RESET}")
+        if options:
+            for option_index, option in enumerate(options, 1):
+                title = _clean(option.get("answer_title")) or _clean(
+                    option.get("value")
+                )
+                value = _clean(option.get("value"))
+                marker = " (suggested)" if value and value == current_value else ""
+                rec = _format_recommended_suffix(title, bool(option.get("recommended")))
+                print(f"     {DIM}{option_index}. {title}{rec}{marker}{RESET}")
+        prompt_label = "  keep or enter answer"
+        if current_value:
+            prompt_label += f" [{current_value}]"
+        try:
+            response = input(f"{prompt_label}: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not response:
+            continue
+        if options:
+            option_map = {
+                _clean(option.get("answer_title"))
+                or _clean(option.get("value")): _clean(option.get("value"))
+                or _clean(option.get("answer_title"))
+                for option in options
+                if _clean(option.get("answer_title")) or _clean(option.get("value"))
+            }
+            selected = _resolve_menu_choice(response, list(option_map))
+            response = option_map.get(selected, response)
+        answers[question_id] = response
+    return answers
 
 
-def _render_prefill_handoff(
+def _prompt_for_optional_cli_context(subject: str, context: str | None) -> str | None:
+    if _state.json or not sys.stdout.isatty():
+        return context
+    existing = _clean(context)
+    print(
+        f"\n{CYAN}Additional context for {subject}?{RESET} {DIM}(optional; press Enter to skip){RESET}"
+    )
+    if existing:
+        print(f"{DIM}Current context:{RESET} {existing}")
+    try:
+        response = input("  > ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return context
+    if not response:
+        return context
+    return "\n\n".join(part for part in [existing, response] if part)
+
+
+def _create_migration_from_payload(
     payload: dict, template: dict, work_dir: str | None = None
 ) -> None:
-    if _state.json:
-        print_output(payload, True)
-        return
-    source = _clean(template.get("source")) or "Unknown source"
-    target = _clean(template.get("target")) or "Unknown target"
-    print(f"\nPrepared migration draft for {source} -> {target}.")
-    query = urlencode(
-        {
-            "source": source,
-            "target": target,
-            "draft": _encode_prefill_draft(payload),
-            "clarify": "true",
-        }
+    source = (
+        _clean(template.get("source"))
+        or _clean(payload.get("source_type"))
+        or "Unknown source"
     )
-    url = f"{_app_url_from_api_url(_state.api_url)}/new?{query}"
-    import webbrowser
+    target = (
+        _clean(template.get("target"))
+        or _clean(payload.get("target_type"))
+        or "Unknown target"
+    )
+    spinner_message = (
+        f"Submitting {source} -> {target} migration and generating execution plan..."
+    )
+    created: dict = {}
+    migration_id = ""
+    app_url = _app_url_from_api_url(_state.api_url)
+    with _Spinner(spinner_message):
+        with make_client(_state.api_url, _state.token) as client:
+            response = client.post("/v1/migrations", json=payload)
+            response.raise_for_status()
+            created = response.json() or {}
+            migration_id = _clean(created.get("id"))
+            linked_plan = None
+            if migration_id:
+                for attempt in range(6):
+                    try:
+                        plan_res = client.get(f"/v1/migrations/{migration_id}/plan")
+                        plan_res.raise_for_status()
+                        linked_plan = plan_res.json() or {}
+                        break
+                    except httpx.RequestError:
+                        break
+                    except httpx.HTTPStatusError as exc:
+                        if exc.response.status_code >= 500:
+                            break
+                    if attempt < 5:
+                        time.sleep(0.75)
+            if linked_plan:
+                _set_default_plan_after_create(linked_plan)
 
-    try:
-        webbrowser.open(url)
-    except Exception:
-        pass
-    base = f"{_app_url_from_api_url(_state.api_url)}/new"
-    print(
-        f"\nContinue here to answer follow-up questions and start the analysis:\n{base}?...\n"
-    )
-    print(f"Full URL (if browser didn't open):\n{url}\n")
+    if _state.json:
+        print_output(dict(created), True)
+        return
+
+    status = _clean(created.get("status") or "pending") or "pending"
+    print(f"\nMigration created: {source} -> {target}")
+    if migration_id:
+        print(f"  ID: {migration_id}")
+    print(f"  Status: {status}")
+    if migration_id:
+        print(f"\n  {DIM}Dashboard: {app_url}/migrations/{migration_id}{RESET}")
+    normalized_status = status.lower()
+    if normalized_status in {"analyzing", "queued", "pending"}:
+        print(
+            f"  {DIM}Analysis is still running. Open the dashboard or run "
+            f"{CYAN}keshro migration view {migration_id}{RESET}{DIM} until it is ready.{RESET}"
+        )
+    else:
+        print(f"  Run {CYAN}keshro continue{RESET} to start executing.")
     if not work_dir:
         print(
-            "Tip: Use --dir to point to your project directory for better auto-discovery."
+            "\nTip: Use --dir to point to your project directory for better auto-discovery."
         )
 
 
@@ -2365,6 +2931,7 @@ def _continue_with_claude(
     auto_continue: bool = False,
     parallel: bool = True,
     confirm: bool = False,
+    agent: str = "auto",
 ) -> None:
     import uuid as _uuid
 
@@ -2468,6 +3035,37 @@ def _continue_with_claude(
                 session_id=session_id,
             )
         )
+
+
+def _confirm_implicit_continue_plan(
+    resolved_plan_id: str, work_dir: str | None = None
+) -> str:
+    if _state.json or not sys.stdout.isatty():
+        return resolved_plan_id
+    plan_label = _current_plan_label(work_dir=work_dir) or resolved_plan_id
+    confirmed = typer.confirm(
+        f"Continue with plan '{plan_label}' ({resolved_plan_id})?",
+        default=True,
+    )
+    if confirmed:
+        return resolved_plan_id
+    print(
+        f"{DIM}Enter a plan ID or migration ID to continue with a different execution context, or press Enter to cancel.{RESET}"
+    )
+    try:
+        override = input("  > ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        raise SystemExit(0)
+    if not override:
+        raise SystemExit(0)
+    override_plan_id, override_title = _resolve_plan_or_migration_context(override)
+    if not override_plan_id:
+        raise SystemExit(0)
+    if not _state.json:
+        label = override_title or override_plan_id
+        print(f"{DIM}Using:{RESET} {label} ({override_plan_id})")
+    return override_plan_id
 
 
 def _view_task(plan_id: str | None, task_id: str) -> None:
@@ -2858,21 +3456,72 @@ def _find_migration_template(source: str, target: str) -> str | None:
     """Try to find a matching migration template key for a source/target pair."""
     try:
         client = make_client()
-        resp = client.get("/v1/migrations/path-templates")
+        import re as _re
+
+        def _normalize_name(value: str) -> str:
+            cleaned = _clean(value).lower()
+            if not cleaned:
+                return ""
+            for prefix in ("apache ", "amazon ", "aws ", "google ", "gcp "):
+                if cleaned.startswith(prefix):
+                    cleaned = cleaned[len(prefix) :].strip()
+                    break
+            cleaned = cleaned.replace("&", " and ")
+            cleaned = re.sub(r"[^a-z0-9]+", " ", cleaned).strip()
+            synonyms = {
+                "apache airflow": "airflow",
+                "mwaa": "airflow",
+            }
+            return synonyms.get(cleaned, cleaned)
+
+        def _slug(v: str) -> str:
+            return _re.sub(r"[^a-z0-9]+", "-", v.strip().lower()).strip("-")
+
+        desired_source = _normalize_name(source)
+        desired_target = _normalize_name(target)
+
+        res = client.get("/v1/plans/templates")
+        if res.status_code == 200:
+            templates = res.json() or []
+            for template in templates:
+                template_source = _normalize_name(
+                    str(template.get("source_type") or "")
+                )
+                template_target = _normalize_name(
+                    str(template.get("target_type") or "")
+                )
+                if (
+                    template_source == desired_source
+                    and template_target == desired_target
+                ):
+                    key = _clean(template.get("key"))
+                    if key:
+                        return key
+
+        template_key = f"{_slug(desired_source)}-to-{_slug(desired_target)}"
+        resp = client.get(
+            "/v1/migrations/path-template/lookup",
+            params={"template_key": template_key},
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data and data.get("template_key"):
+                return data["template_key"]
+
+        resp = client.get(
+            "/v1/migrations/path-template",
+            params={"source_type": source, "target_type": target},
+        )
         if resp.status_code != 200:
             return None
-        templates = resp.json()
-        # Normalize for matching
-        s_lower = source.lower()
-        t_lower = target.lower()
-        for tmpl in templates:
-            tmpl_source = (tmpl.get("source") or "").lower()
-            tmpl_target = (tmpl.get("target") or "").lower()
-            tmpl_key = tmpl.get("key") or ""
-            if (s_lower in tmpl_source or tmpl_source in s_lower) and (
-                t_lower in tmpl_target or tmpl_target in t_lower
-            ):
-                return tmpl_key
+        data = resp.json()
+        if not data:
+            return None
+        key = data.get("template_key") or ""
+        if data.get("is_auto_generated"):
+            return None
+        if key:
+            return key
         return None
     except Exception:
         return None
@@ -2987,6 +3636,13 @@ def _create_migration(
             help="Skip clarifying questions and generate the plan immediately.",
         ),
     ] = False,
+    agent: Annotated[
+        str,
+        typer.Option(
+            "--agent",
+            help="Coding agent to use for discovery and clarifying questions: auto, claude, or codex.",
+        ),
+    ] = "auto",
 ):
     """Create a project. Pass a directory, GitHub URL, Linear URL, or any URL — Keshro figures out the rest."""
     file_context = _read_context_file(context_file)
@@ -3030,6 +3686,7 @@ def _create_migration(
         work_dir = clone_dir
 
     try:
+        context_entered_interactively = False
         if path:
             # Migration mode — use the existing migration flow
             answers = _parse_field_assignments(field)
@@ -3041,6 +3698,9 @@ def _create_migration(
                 resource_url,
                 org_id,
                 work_dir,
+                skip_questions=skip_questions,
+                prompt_for_context=not bool(context and context.strip()),
+                agent=agent,
             )
         else:
             # Generic project mode — scan, get questions, agent answers, generate plan
@@ -3078,6 +3738,7 @@ def _create_migration(
                             "  keshro create https://github.com/org/repo/issues/42"
                         )
                     context = user_input
+                    context_entered_interactively = True
                 else:
                     raise SystemExit(
                         "No project description provided. Pass one of:\n"
@@ -3087,21 +3748,21 @@ def _create_migration(
                         "  keshro create https://linear.app/team/issue/PROJ-123"
                     )
 
-            if not _state.json:
-                source_label = source_value or resolved_work_dir
-                print(f"{CYAN}Creating project from: {source_label}{RESET}")
+            if not context_entered_interactively:
+                context = _prompt_for_optional_cli_context("this project", context)
 
             # Step 1: Collect codebase context if we have a directory
             discovered_context = None
             if os.path.isdir(resolved_work_dir):
                 if not _state.json:
-                    print(f"Scanning {resolved_work_dir}...")
+                    print(f"{CYAN}Scanning project: {resolved_work_dir}{RESET}")
                 discovered_context = _collect_generic_discovery(resolved_work_dir)
+            elif not _state.json:
+                source_label = source_value or resolved_work_dir
+                print(f"{CYAN}Creating project from: {source_label}{RESET}")
 
             # Build description from context + source info
             desc_parts = []
-            if file_context:
-                desc_parts.append(file_context)
             if context:
                 desc_parts.append(context)
             if resource_url:
@@ -3118,24 +3779,33 @@ def _create_migration(
                     )
                     print(
                         f"{DIM}Keshro has enhanced analysis for migrations — "
-                        f"risk assessment, cost estimates, and step-by-step plans.{RESET}\n"
+                        f"repo-based input discovery, migration-specific follow-up questions, "
+                        f"risk and cost estimates, and step-by-step tasks.{RESET}\n"
                     )
-                    print(f"  1. Treat as migration {GREEN}(recommended){RESET}")
-                    print("  2. Treat as a general project")
+                    migration_choice = "Treat as migration"
+                    general_choice = "Treat as a general project"
+                    print(f"  1. {migration_choice} {GREEN}(recommended){RESET}")
+                    print(f"  2. {general_choice}")
                     try:
                         choice = input(f"\n  {CYAN}>{RESET} ").strip()
                     except (EOFError, KeyboardInterrupt):
-                        choice = "1"
-                    if choice != "2":
+                        choice = migration_choice
+                    choice = _resolve_menu_choice(
+                        choice,
+                        [migration_choice, general_choice],
+                        aliases={
+                            "y": migration_choice,
+                            "yes": migration_choice,
+                            "n": general_choice,
+                            "no": general_choice,
+                        },
+                    )
+                    if choice != general_choice:
                         # Try to find a matching template
                         template_key = _find_migration_template(
                             source_tech, target_tech
                         )
                         if template_key:
-                            if not _state.json:
-                                print(
-                                    f"\n{CYAN}Using migration template: {template_key}{RESET}"
-                                )
                             answers = _parse_field_assignments(field)
                             return _create_migration_inner(
                                 template_key,
@@ -3145,6 +3815,9 @@ def _create_migration(
                                 resource_url,
                                 org_id,
                                 work_dir,
+                                skip_questions=skip_questions,
+                                prompt_for_context=not context_entered_interactively,
+                                agent=agent,
                             )
                         else:
                             # No template found — continue with generic but flag as migration
@@ -3193,7 +3866,11 @@ def _create_migration(
                         f"{CYAN}Asking AI agent to answer {len(questions)} clarifying questions...{RESET}"
                     )
                 answered = _answer_questions_via_agent(
-                    questions, description, discovered_context, resolved_work_dir
+                    questions,
+                    description,
+                    discovered_context,
+                    resolved_work_dir,
+                    agent=agent,
                 )
                 if not _state.json:
                     answered_count = sum(
@@ -3262,43 +3939,15 @@ def _create_migration(
             if org_id:
                 generate_payload["org_id"] = org_id
 
-            # Spinner while generating
-            import threading
-
-            stop_spinner = threading.Event()
-
-            def _spin():
-                frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-                i = 0
-                start = time.time()
-                while not stop_spinner.is_set():
-                    elapsed = int(time.time() - start)
-                    print(
-                        f"\r  {CYAN}{frames[i % len(frames)]}{RESET} Generating execution plan... {DIM}{elapsed}s{RESET}",
-                        end="",
-                        flush=True,
+            with _Spinner("Generating execution plan..."):
+                try:
+                    resp = client.post(
+                        "/v1/plans/generate", json=generate_payload, timeout=120
                     )
-                    stop_spinner.wait(0.1)
-                    i += 1
-                print("\r" + " " * 60 + "\r", end="", flush=True)
-
-            if not _state.json and sys.stdout.isatty():
-                spinner_thread = threading.Thread(target=_spin, daemon=True)
-                spinner_thread.start()
-            elif not _state.json:
-                print(f"{CYAN}Generating execution plan...{RESET}")
-
-            try:
-                resp = client.post(
-                    "/v1/plans/generate", json=generate_payload, timeout=120
-                )
-                resp.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                stop_spinner.set()
-                _print_http_error(exc)
-                raise typer.Exit(1) from exc
-            finally:
-                stop_spinner.set()
+                    resp.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    _print_http_error(exc)
+                    raise typer.Exit(1) from exc
 
             plan = resp.json()
             plan_id = plan.get("id", "")
@@ -3369,6 +4018,7 @@ def _answer_questions_via_agent(
     description: str,
     discovered_context: str | None,
     work_dir: str,
+    agent: str = "auto",
 ) -> dict[str, str]:
     """Use the coding agent to answer clarifying questions about the project."""
     q_lines = []
@@ -3405,13 +4055,14 @@ Questions:
 {chr(10).join(q_lines)}"""
 
     try:
-        raw = _run_prompt_in_claude(
+        raw = _run_prompt_in_agent(
             prompt,
             missing_env_message="Not inside a coding agent — skipping auto-answers.",
             missing_binary_message="Claude binary not found — skipping auto-answers.",
             failure_message_prefix="Agent failed to answer questions: ",
             empty_message="",
             work_dir=work_dir,
+            agent=agent,
         )
     except SystemExit:
         return {}
@@ -3442,6 +4093,9 @@ def _create_migration_inner(
     resource_url: str | None,
     org_id: str | None,
     work_dir: str | None,
+    skip_questions: bool = False,
+    prompt_for_context: bool = True,
+    agent: str = "auto",
 ) -> None:
     with make_client(_state.api_url, _state.token) as client:
         template_res = client.get(
@@ -3452,18 +4106,31 @@ def _create_migration_inner(
         source = _clean(template.get("source"))
         target = _clean(template.get("target"))
 
-        if not _state.json:
-            print(f"Collecting migration context for {source} -> {target}...")
-
         resolved_work_dir = str(Path(work_dir).resolve()) if work_dir else None
-        discovered_answer = _collect_discovery_answer_from_claude(
-            template, work_dir=resolved_work_dir
-        )
+        scan_target = "the current working directory"
+        if resolved_work_dir:
+            cwd = str(Path.cwd().resolve())
+            scan_target = (
+                "the current working directory"
+                if resolved_work_dir == cwd
+                else f"the project directory ({resolved_work_dir})"
+            )
+
+        with _Spinner(
+            f"Analyzing {scan_target} and generating {source} -> {target} "
+            "migration inputs and follow-up questions "
+            "(workloads, schedules, target setup)..."
+        ):
+            discovered_answer = _collect_discovery_answer_from_claude(
+                template, work_dir=resolved_work_dir, agent=agent
+            )
+
         extracted = _extract_discovery_answers(template, discovered_answer)
         # Don't overwrite manually provided -f values with empty extracted values
         for key, value in extracted.items():
             if key not in answers or not answers[key]:
                 answers[key] = value
+        answers = _prompt_for_migration_template_fields(template, answers)
 
         required_fields = [
             _clean(item.get("label")) or _clean(item.get("id"))
@@ -3475,6 +4142,8 @@ def _create_migration_inner(
                 f"Some fields couldn't be discovered automatically: {', '.join(required_fields)}"
             )
 
+        if prompt_for_context:
+            context = _prompt_for_optional_cli_context(f"{source} -> {target}", context)
         merged_context = f"CLI bootstrap for {source} -> {target}."
         if _clean(context):
             merged_context = (
@@ -3516,21 +4185,33 @@ def _create_migration_inner(
             ),
             "custom_fields": custom_fields or None,
         }
-        if not _state.json:
-            print("Checking for high-impact follow-up questions...")
-        clarifier_questions = _get_migration_clarifiers(client, payload)
-        if clarifier_questions:
-            if not _state.json:
-                print("Collecting follow-up answers...")
-            clarifier_answers = _collect_clarifier_answers_from_claude(
-                template, payload, clarifier_questions, work_dir=resolved_work_dir
-            )
-            payload = _merge_clarifier_answers(
-                payload, clarifier_questions, clarifier_answers
-            )
-        elif not _state.json:
-            print("No additional follow-up questions needed.")
-    _render_prefill_handoff(payload, template, work_dir=resolved_work_dir)
+        if not skip_questions:
+            with _Spinner(
+                "Checking for high-impact follow-up questions (this can take a bit)..."
+            ):
+                clarifier_questions = _get_migration_clarifiers(client, payload)
+            if clarifier_questions:
+                suggested_answers: dict[str, str] = {}
+                if _inside_coding_agent():
+                    with _Spinner(
+                        "Collecting follow-up answers (this can take a bit)..."
+                    ):
+                        suggested_answers = _collect_clarifier_answers_from_claude(
+                            template,
+                            payload,
+                            clarifier_questions,
+                            work_dir=resolved_work_dir,
+                            agent=agent,
+                        )
+                clarifier_answers = _prompt_for_migration_clarifiers(
+                    clarifier_questions, suggested_answers
+                )
+                payload = _merge_clarifier_answers(
+                    payload, clarifier_questions, clarifier_answers
+                )
+            elif not _state.json:
+                print("No additional follow-up questions needed.")
+    _create_migration_from_payload(payload, template, work_dir=resolved_work_dir)
 
 
 @migration_app.command("list")
@@ -3605,8 +4286,20 @@ def _migration_view(
         if _state.json:
             print_output(migration, True)
             return
+        linked_plan = None
+        try:
+            plan_res = client.get(f"/v1/migrations/{migration_id}/plan")
+            plan_res.raise_for_status()
+            linked_plan = plan_res.json()
+        except Exception:
+            linked_plan = None
         context_label = _current_context_label() if _current_org_id() else None
-        _print_migration_detail(migration, context_label=context_label)
+        _print_migration_detail(
+            migration,
+            context_label=context_label,
+            linked_plan=linked_plan,
+            api_url=_state.api_url,
+        )
 
 
 @migration_app.command("history")
@@ -3676,6 +4369,7 @@ def _config_show():
     payload = {
         "api_url": auth.get("api_url") or DEFAULT_API_URL,
         "authenticated": authenticated,
+        "default_agent": _clean(auth.get("default_agent")).lower() or "auto",
         "default_org_id": auth.get("default_org_id"),
         "default_org_name": auth.get("default_org_name"),
         "default_plan_id": auth.get("default_plan_id"),
@@ -3694,6 +4388,7 @@ def _config_show():
         f"{DIM}Authenticated:{RESET} "
         f"{GREEN if payload['authenticated'] else CYAN}{'yes' if payload['authenticated'] else 'no'}{RESET}"
     )
+    print(f"{DIM}Default agent:{RESET} {YELLOW}{payload['default_agent']}{RESET}")
     default_context = (
         payload["default_org_name"] or payload["default_org_id"] or "personal"
     )
@@ -3743,6 +4438,13 @@ def _config_set(
     api_url: Annotated[
         Optional[str], typer.Option("--api-url", "-u", help="Keshro API URL.")
     ] = None,
+    agent: Annotated[
+        Optional[str],
+        typer.Option(
+            "--agent",
+            help="Default coding agent for create/continue: auto, claude, or codex.",
+        ),
+    ] = None,
     personal: Annotated[
         bool, typer.Option("--personal", help="Use personal context.")
     ] = False,
@@ -3762,6 +4464,13 @@ def _config_set(
         )
     if api_url is not None:
         updates["api_url"] = _clean(api_url) or DEFAULT_API_URL
+    if agent is not None:
+        normalized_agent = _clean(agent).lower() or "auto"
+        if normalized_agent not in {"auto", "claude", "codex"}:
+            raise SystemExit(
+                "Unsupported agent. Use --agent auto, --agent claude, or --agent codex."
+            )
+        updates["default_agent"] = normalized_agent
     if personal:
         updates["default_org_id"] = None
         updates["default_org_name"] = None
@@ -3786,6 +4495,7 @@ def _config_set(
         )
     payload = {
         "api_url": auth.get("api_url") or DEFAULT_API_URL,
+        "default_agent": _clean(auth.get("default_agent")).lower() or "auto",
         "default_org_id": auth.get("default_org_id"),
         "default_org_name": auth.get("default_org_name"),
         "default_plan_id": auth.get("default_plan_id"),
@@ -3798,6 +4508,8 @@ def _config_set(
     print(f"Saved default context: {org_label}")
     if api_url is not None:
         print(f"Saved API URL: {auth.get('api_url') or DEFAULT_API_URL}")
+    if agent is not None:
+        print(f"Saved default agent: {auth.get('default_agent') or 'auto'}")
     plan_label = auth.get("default_plan_title") or auth.get("default_plan_id")
     if plan_label:
         print(f"Saved default plan: {plan_label}")
@@ -3961,26 +4673,53 @@ def _continue_command(
             help="Show what would be launched without actually running agents.",
         ),
     ] = False,
+    agent: Annotated[
+        str,
+        typer.Option(
+            "--agent",
+            help="Coding agent to use for prompt-based resume flows: auto, claude, or codex.",
+        ),
+    ] = "auto",
 ):
     """Resume execution of a plan. In the shell this is coordinator mode; in an agent it resumes one task."""
+
+    resolved_plan_id = plan_id
+    if not _clean(plan_id):
+        resolved_plan_id = _current_plan_id(None, work_dir=work_dir)
+        if resolved_plan_id:
+            resolved_plan_id = _confirm_implicit_continue_plan(
+                resolved_plan_id, work_dir=work_dir
+            )
 
     # Inside a coding agent (piped stdout), always single-task mode.
     # In user's terminal, default to parallel unless --no-parallel is passed.
     use_parallel = not no_parallel and (sys.stdout.isatty() or dry_run)
+    resolved_agent = _clean(agent).lower() or _default_agent_preference() or "auto"
+    if resolved_agent not in {"auto", "claude", "codex"}:
+        raise SystemExit(
+            "Unsupported agent. Use --agent auto, --agent claude, or --agent codex."
+        )
     if not use_parallel:
         _continue_with_claude(
-            plan_id,
+            resolved_plan_id,
             work_dir=work_dir,
             auto_continue=auto_continue,
             parallel=False,
             confirm=confirm,
+            agent=resolved_agent,
         )
     else:
+        if resolved_agent == "codex":
+            raise SystemExit(
+                "Parallel execution currently requires Claude Code. Use "
+                "`keshro continue --agent claude`, `keshro continue --agent auto`, "
+                "or `keshro continue --no-parallel --agent codex`."
+            )
         _ensure_authenticated()
         concurrency = max(1, min(concurrency, 30))
         asyncio.run(
             _run_parallel(
-                plan_id,
+                resolved_plan_id,
                 work_dir=work_dir,
                 max_concurrency=concurrency,
                 run_all=auto_continue,
@@ -6487,22 +7226,25 @@ def _plan_import(
 
                 if options:
                     for idx, opt in enumerate(options, 1):
-                        rec = " (recommended)" if opt.get("recommended") else ""
-                        print(
-                            f"    {idx}. {opt.get('answer_title', opt.get('value', ''))}{rec}"
+                        title = opt.get("answer_title", opt.get("value", ""))
+                        rec = _format_recommended_suffix(
+                            str(title), bool(opt.get("recommended"))
                         )
+                        print(f"    {idx}. {title}{rec}")
                     raw = input(
                         f"  {DIM}Enter number or type answer [{placeholder or 'skip'}]: {RESET}"
                     ).strip()
                     if raw:
-                        try:
-                            choice_idx = int(raw) - 1
-                            if 0 <= choice_idx < len(options):
-                                answers[qid] = options[choice_idx].get("value", raw)
-                            else:
-                                answers[qid] = raw
-                        except ValueError:
-                            answers[qid] = raw
+                        option_map = {
+                            _clean(opt.get("answer_title"))
+                            or _clean(opt.get("value")): _clean(opt.get("value"))
+                            or _clean(opt.get("answer_title"))
+                            for opt in options
+                            if _clean(opt.get("answer_title"))
+                            or _clean(opt.get("value"))
+                        }
+                        selected = _resolve_menu_choice(raw, list(option_map))
+                        answers[qid] = option_map.get(selected, raw)
                 else:
                     raw = input(
                         f"  {DIM}Answer [{placeholder or 'skip'}]: {RESET}"
@@ -6785,8 +7527,11 @@ def _print_http_error(exc: httpx.HTTPStatusError) -> None:
 
 
 def _print_request_error(exc: httpx.RequestError) -> None:
-    url = str(exc.request.url) if exc.request else _state.api_url
-    detail = f"Could not reach Keshro at {url}. Check that the API is running and your --api-url is correct."
+    base_url = _clean(_state.api_url) or DEFAULT_API_URL
+    detail = (
+        f"Could not reach Keshro at {base_url}. "
+        "Check that the API is running and your --api-url is correct."
+    )
     payload = {"status": "error", "detail": detail}
     if _state.json:
         print_output(payload, True)
