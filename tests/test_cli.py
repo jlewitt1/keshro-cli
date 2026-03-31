@@ -951,10 +951,12 @@ def test_create_migration_from_path_key_applies_shared_clarifiers(
     fake_client, monkeypatch, capsys
 ):
     monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "1")
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
     monkeypatch.setattr(
         "shutil.which",
         lambda name: "/usr/local/bin/claude" if name == "claude" else None,
     )
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "")
 
     call_count = {"count": 0}
 
@@ -1035,7 +1037,7 @@ def test_continue_prints_prompt_with_task_context(fake_client, monkeypatch, caps
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     _bypass_auth(monkeypatch)
 
-    cli.main(["continue"])
+    cli.main(["continue", "--no-parallel"])
 
     out = capsys.readouterr().out
     assert "Task: Review EventBridge schedules" in out
@@ -1051,7 +1053,7 @@ def test_continue_prompt_omits_full_skill_boilerplate_in_non_tty_mode(
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     _bypass_auth(monkeypatch)
 
-    cli.main(["continue"])
+    cli.main(["continue", "--no-parallel"])
 
     out = capsys.readouterr().out
     assert "Do NOT use Keshro MCP tools" not in out
@@ -1082,7 +1084,7 @@ def test_continue_prompt_mentions_status_tracking_and_blocking_rule(
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     _bypass_auth(monkeypatch)
 
-    cli.main(["continue"])
+    cli.main(["continue", "--no-parallel"])
 
     out = capsys.readouterr().out
     assert "keshro status -p plan-123 --watch" in out
@@ -1131,7 +1133,7 @@ def test_continue_prompt_surfaces_plan_risks_unknowns_and_ui_link(
         return _FakeResponse(plan)
 
     fake_client.get = _get
-    cli.main(["continue"])
+    cli.main(["continue", "--no-parallel"])
     out = ANSI_RE.sub("", capsys.readouterr().out)
     assert "Top plan risks:" in out
     assert "Open questions:" in out
@@ -1182,7 +1184,7 @@ def test_continue_in_agent_mode_resumes_in_progress_task_before_next_todo(
 
     monkeypatch.setattr(fake_client, "get", _get)
 
-    cli.main(["continue"])
+    cli.main(["continue", "--no-parallel"])
 
     out = capsys.readouterr().out
     assert "Task: Set up MWAA environment with Terraform" in out
@@ -1194,7 +1196,7 @@ def test_continue_prompt_includes_error_guidance(fake_client, monkeypatch, capsy
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     _bypass_auth(monkeypatch)
 
-    cli.main(["continue"])
+    cli.main(["continue", "--no-parallel"])
 
     out = capsys.readouterr().out
     assert "If a keshro command fails" in out
@@ -1226,7 +1228,7 @@ def test_continue_confirms_when_using_implicit_plan_context(
         lambda coro: (coro.close(), None)[1],
     )
 
-    cli.main(["continue"])
+    cli.main(["continue", "--no-parallel"])
 
     assert "AWS Batch to Airflow pilot" in prompted["message"]
     assert "plan-123" in prompted["message"]
@@ -1328,7 +1330,7 @@ def test_continue_prompt_does_not_tell_claude_to_refetch(
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     _bypass_auth(monkeypatch)
 
-    cli.main(["continue"])
+    cli.main(["continue", "--no-parallel"])
 
     out = capsys.readouterr().out
     assert "Do not re-fetch them" in out
