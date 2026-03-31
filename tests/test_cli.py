@@ -2,6 +2,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 
 import click
@@ -26,6 +27,356 @@ def _auth_with_plan():
         "default_plan_id": "plan-123",
         "default_plan_title": "AWS Batch to Airflow pilot",
     }
+
+
+def test_build_agent_exec_command_omits_add_dir_for_codex():
+    command = cli._build_agent_exec_command(
+        "codex",
+        "codex",
+        "do the thing",
+        task_title="Test task",
+        work_dir="/tmp/demo",
+        worktree_name="keshro-demo",
+    )
+
+    assert "--add-dir" not in command
+    assert command[:3] == ["codex", "exec", "do the thing"]
+
+
+def test_merge_codex_worktree_changes_applies_worktree_diff():
+    with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as worktree_parent:
+        subprocess.run(["git", "init"], cwd=repo_dir, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_dir, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo_dir, check=True, capture_output=True, text=True)
+
+        target = Path(repo_dir) / "demo.txt"
+        target.write_text("base\n")
+        subprocess.run(["git", "add", "demo.txt"], cwd=repo_dir, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=repo_dir, check=True, capture_output=True, text=True)
+
+        base_rev = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_dir,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+        worktree_dir = os.path.join(worktree_parent, "codex-worktree")
+        branch_name = "keshro-test-branch"
+        subprocess.run(
+            ["git", "worktree", "add", "-b", branch_name, worktree_dir, base_rev],
+            cwd=repo_dir,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        try:
+            Path(worktree_dir, "demo.txt").write_text("updated\n")
+            import asyncio
+
+            asyncio.run(
+                cli._merge_codex_worktree_changes(
+                    repo_dir,
+                    worktree_dir,
+                    base_rev,
+                    "task-123",
+                )
+            )
+            assert target.read_text() == "updated\n"
+        finally:
+            subprocess.run(
+                ["git", "worktree", "remove", "--force", worktree_dir],
+                cwd=repo_dir,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "branch", "-D", branch_name],
+                cwd=repo_dir,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+
+def test_merge_codex_worktree_changes_resets_repo_after_apply_failure(monkeypatch):
+    import asyncio
+
+    calls = []
+
+    class _FakeProc:
+        def __init__(self, returncode=0, stdout=b"", stderr=b""):
+            self.returncode = returncode
+            self._stdout = stdout
+            self._stderr = stderr
+
+        async def communicate(self, _input=None):
+            return self._stdout, self._stderr
+
+    async def _fake_git_stdout(*args, cwd):
+        calls.append(("git_stdout", args, cwd))
+        if args[:3] == ("git", "status", "--short"):
+            return "M file.txt"
+        if args[:3] == ("git", "rev-parse", "HEAD"):
+            return "worktree-head"
+        return ""
+
+    async def _fake_create_subprocess_exec(*args, **kwargs):
+        calls.append(("subprocess", args, kwargs.get("cwd")))
+        if args[:2] == ("git", "commit"):
+            return _FakeProc(returncode=0)
+        if args[:2] == ("git", "diff"):
+            return _FakeProc(returncode=0, stdout=b"patch-bytes")
+        if args[:3] == ("git", "apply", "--3way"):
+            return _FakeProc(returncode=1, stderr=b"apply failed")
+        if args[:4] == ("git", "reset", "--hard", "HEAD"):
+            return _FakeProc(returncode=0)
+        raise AssertionError(f"Unexpected subprocess args: {args}")
+
+    monkeypatch.setattr(cli, "_git_stdout", _fake_git_stdout)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+
+    with pytest.raises(RuntimeError, match="apply failed"):
+        asyncio.run(
+            cli._merge_codex_worktree_changes(
+                "/tmp/repo", "/tmp/worktree", "base-rev", "task-123"
+            )
+        )
+
+    assert any(
+        call[0] == "subprocess" and call[1][:4] == ("git", "reset", "--hard", "HEAD")
+        for call in calls
+    )
+
+
+def test_launch_single_agent_marks_task_blocked_when_codex_merge_fails(monkeypatch):
+    import asyncio
+
+    class _FakeProc:
+        def __init__(self, returncode=0, stdout=b"", stderr=b""):
+            self.returncode = returncode
+            self._stdout = stdout
+            self._stderr = stderr
+
+        async def communicate(self, _input=None):
+            return self._stdout, self._stderr
+
+    class _FakeAsyncClient:
+        def __init__(self):
+            self.posts = []
+
+        async def post(self, path, json=None):
+            self.posts.append((path, json))
+            return None
+
+    task_updates = []
+
+    async def _fake_mark_task_status_async(client, plan_id, task_id, status, notes=None, blocked_reason=None):
+        task_updates.append(
+            {
+                "plan_id": plan_id,
+                "task_id": task_id,
+                "status": status,
+                "notes": notes,
+                "blocked_reason": blocked_reason,
+            }
+        )
+
+    async def _fake_git_stdout(*args, cwd):
+        if args[:3] == ("git", "rev-parse", "HEAD"):
+            return "base-rev"
+        return ""
+
+    async def _fake_cleanup_worktree(repo_dir, worktree_path):
+        return None
+
+    async def _fake_merge_codex_worktree_changes(repo_dir, worktree_path, base_rev, task_id):
+        raise RuntimeError("apply failed")
+
+    async def _fake_create_subprocess_exec(*args, **kwargs):
+        if args[:3] == ("git", "worktree", "add"):
+            return _FakeProc(returncode=0)
+        if args and args[0] == "codex":
+            return _FakeProc(returncode=0, stdout=b"codex finished", stderr=b"")
+        if args[:3] == ("git", "branch", "-D"):
+            return _FakeProc(returncode=0)
+        raise AssertionError(f"Unexpected subprocess args: {args}")
+
+    monkeypatch.setattr(cli, "_resolve_prompt_agent", lambda agent: ("codex", "codex"))
+    monkeypatch.setattr(cli, "_build_parallel_prompt", lambda plan, task, total_agents, work_dir=None: "prompt")
+    monkeypatch.setattr(cli, "_mark_task_status_async", _fake_mark_task_status_async)
+    monkeypatch.setattr(cli, "_git_stdout", _fake_git_stdout)
+    monkeypatch.setattr(cli, "_cleanup_worktree", _fake_cleanup_worktree)
+    monkeypatch.setattr(cli, "_merge_codex_worktree_changes", _fake_merge_codex_worktree_changes)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+
+    result = asyncio.run(
+        cli._launch_single_agent(
+            {"id": "task-1", "title": "Test task"},
+            {"id": "plan-1"},
+            "plan-1",
+            "/tmp/project",
+            1,
+            asyncio.Semaphore(1),
+            _FakeAsyncClient(),
+            session_id="session-1",
+            agent="codex",
+        )
+    )
+
+    assert result.exit_code == 1
+    assert any(update["status"] == "blocked" for update in task_updates)
+    assert not any(update["status"] == "completed" for update in task_updates)
+
+
+def test_launch_single_agent_marks_task_blocked_when_codex_worktree_create_fails(
+    monkeypatch,
+):
+    import asyncio
+
+    class _FakeProc:
+        def __init__(self, returncode=0, stdout=b"", stderr=b""):
+            self.returncode = returncode
+            self._stdout = stdout
+            self._stderr = stderr
+
+        async def communicate(self, _input=None):
+            return self._stdout, self._stderr
+
+    class _FakeAsyncClient:
+        def __init__(self):
+            self.posts = []
+
+        async def post(self, path, json=None):
+            self.posts.append((path, json))
+            return None
+
+    task_updates = []
+
+    async def _fake_mark_task_status_async(
+        client, plan_id, task_id, status, notes=None, blocked_reason=None
+    ):
+        task_updates.append(
+            {
+                "plan_id": plan_id,
+                "task_id": task_id,
+                "status": status,
+                "notes": notes,
+                "blocked_reason": blocked_reason,
+            }
+        )
+
+    async def _fake_git_stdout(*args, cwd):
+        if args[:3] == ("git", "rev-parse", "HEAD"):
+            return "base-rev"
+        return ""
+
+    async def _fake_create_subprocess_exec(*args, **kwargs):
+        if args[:3] == ("git", "worktree", "add"):
+            return _FakeProc(returncode=1, stderr=b"fatal: worktree add failed")
+        raise AssertionError(f"Unexpected subprocess args: {args}")
+
+    monkeypatch.setattr(cli, "_resolve_prompt_agent", lambda agent: ("codex", "codex"))
+    monkeypatch.setattr(
+        cli, "_build_parallel_prompt", lambda plan, task, total_agents, work_dir=None: "prompt"
+    )
+    monkeypatch.setattr(cli, "_mark_task_status_async", _fake_mark_task_status_async)
+    monkeypatch.setattr(cli, "_git_stdout", _fake_git_stdout)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+
+    result = asyncio.run(
+        cli._launch_single_agent(
+            {"id": "task-1", "title": "Test task"},
+            {"id": "plan-1"},
+            "plan-1",
+            "/tmp/project",
+            1,
+            asyncio.Semaphore(1),
+            _FakeAsyncClient(),
+            session_id="session-1",
+            agent="codex",
+        )
+    )
+
+    assert result.exit_code == 1
+    assert any(update["status"] == "blocked" for update in task_updates)
+    assert "worktree add failed" in (task_updates[-1]["blocked_reason"] or "")
+
+
+def test_launch_single_agent_deletes_codex_branch_when_subprocess_launch_fails(
+    monkeypatch,
+):
+    import asyncio
+
+    calls = []
+
+    class _FakeProc:
+        def __init__(self, returncode=0, stdout=b"", stderr=b""):
+            self.returncode = returncode
+            self._stdout = stdout
+            self._stderr = stderr
+
+        async def communicate(self, _input=None):
+            return self._stdout, self._stderr
+
+    class _FakeAsyncClient:
+        async def post(self, path, json=None):
+            return None
+
+    async def _fake_mark_task_status_async(
+        client, plan_id, task_id, status, notes=None, blocked_reason=None
+    ):
+        return None
+
+    async def _fake_git_stdout(*args, cwd):
+        if args[:3] == ("git", "rev-parse", "HEAD"):
+            return "base-rev"
+        return ""
+
+    async def _fake_cleanup_worktree(repo_dir, worktree_path):
+        calls.append(("cleanup", repo_dir, worktree_path))
+
+    async def _fake_create_subprocess_exec(*args, **kwargs):
+        calls.append(("subprocess", args, kwargs.get("cwd")))
+        if args[:3] == ("git", "worktree", "add"):
+            return _FakeProc(returncode=0)
+        if args and args[:3] == ("git", "branch", "-D"):
+            return _FakeProc(returncode=0)
+        if args and args[0] == "codex":
+            raise RuntimeError("spawn failed")
+        raise AssertionError(f"Unexpected subprocess args: {args}")
+
+    monkeypatch.setattr(cli, "_resolve_prompt_agent", lambda agent: ("codex", "codex"))
+    monkeypatch.setattr(
+        cli, "_build_parallel_prompt", lambda plan, task, total_agents, work_dir=None: "prompt"
+    )
+    monkeypatch.setattr(cli, "_mark_task_status_async", _fake_mark_task_status_async)
+    monkeypatch.setattr(cli, "_git_stdout", _fake_git_stdout)
+    monkeypatch.setattr(cli, "_cleanup_worktree", _fake_cleanup_worktree)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+
+    result = asyncio.run(
+        cli._launch_single_agent(
+            {"id": "task-1", "title": "Test task"},
+            {"id": "plan-1"},
+            "plan-1",
+            "/tmp/project",
+            1,
+            asyncio.Semaphore(1),
+            _FakeAsyncClient(),
+            session_id="session-1",
+            agent="codex",
+        )
+    )
+
+    assert result.exit_code == 1
+    assert any(call[0] == "cleanup" for call in calls)
+    assert any(
+        call[0] == "subprocess" and call[1][:3] == ("git", "branch", "-D")
+        for call in calls
+    )
 
 
 class _FakeResponse:
@@ -668,7 +1019,7 @@ def test_continue_prompt_omits_full_skill_boilerplate_in_non_tty_mode(
 
 
 def test_spinner_truncates_long_messages_but_keeps_animation(monkeypatch, capsys):
-    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("keshro_cli.cli._stdout_is_tty", lambda: True)
     monkeypatch.setattr(
         "keshro_cli.cli.shutil.get_terminal_size",
         lambda fallback=(80, 24): os.terminal_size((40, 24)),
@@ -819,7 +1170,7 @@ def test_continue_confirms_when_using_implicit_plan_context(
         "keshro_cli.cli._current_plan_label",
         lambda work_dir=None: "AWS Batch to Airflow pilot",
     )
-    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("keshro_cli.cli._stdout_is_tty", lambda: True)
 
     prompted = {}
 
@@ -849,7 +1200,7 @@ def test_continue_skips_confirmation_when_plan_id_is_explicit(
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
-    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("keshro_cli.cli._stdout_is_tty", lambda: True)
 
     def _fail_confirm(*args, **kwargs):
         raise AssertionError("should not prompt when plan id is explicit")
@@ -869,7 +1220,7 @@ def test_continue_skips_confirmation_when_migration_id_is_explicit(
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
-    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("keshro_cli.cli._stdout_is_tty", lambda: True)
 
     def _fail_confirm(*args, **kwargs):
         raise AssertionError("should not prompt when migration id is explicit")
@@ -897,7 +1248,7 @@ def test_continue_exits_cleanly_when_implicit_plan_confirmation_is_declined(
 ):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
-    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("keshro_cli.cli._stdout_is_tty", lambda: True)
     monkeypatch.setattr("typer.confirm", lambda *args, **kwargs: False)
     monkeypatch.setattr("builtins.input", lambda prompt="": "")
 
@@ -911,18 +1262,6 @@ def test_continue_can_override_implicit_plan_with_migration_id(
 ):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
-    monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
-    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
-    monkeypatch.setattr("typer.confirm", lambda *args, **kwargs: False)
-    monkeypatch.setattr("builtins.input", lambda prompt="": "migration-123")
-    monkeypatch.setattr(
-        "keshro_cli.cli._current_plan_label",
-        lambda work_dir=None: "AWS Batch to Airflow pilot",
-    )
-    monkeypatch.setattr(
-        "keshro_cli.cli.asyncio.run",
-        lambda coro: (coro.close(), None)[1],
-    )
 
     original_get = fake_client.get
 
@@ -934,11 +1273,10 @@ def test_continue_can_override_implicit_plan_with_migration_id(
 
     monkeypatch.setattr(fake_client, "get", _get)
 
-    code = cli.main(["continue"])
+    plan_id, title = cli._resolve_continue_override_context("migration-123")
 
-    out = ANSI_RE.sub("", capsys.readouterr().out)
-    assert code == 0
-    assert "Using: AWS Batch to Airflow pilot (plan-123)" in out
+    assert plan_id == "plan-123"
+    assert title == "AWS Batch to Airflow pilot"
     assert ("GET", "/v1/plans/migration-123", None) in fake_client.calls
     assert ("GET", "/v1/migrations/migration-123/plan", None) in fake_client.calls
 
@@ -965,13 +1303,29 @@ def test_continue_exits_when_not_authenticated(fake_client, monkeypatch):
     assert exit_code == 1
 
 
-def test_continue_rejects_codex_for_parallel_mode(fake_client, monkeypatch):
+def test_continue_allows_codex_for_parallel_mode(fake_client, monkeypatch, capsys):
+    """Codex should be accepted for parallel mode (no longer rejected)."""
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
+    monkeypatch.setattr("keshro_cli.cli._current_plan_label", lambda work_dir=None: "Test plan")
+    monkeypatch.setattr("typer.confirm", lambda *a, **kw: True)
+    monkeypatch.setattr("keshro_cli.cli._stdout_is_tty", lambda: True)
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+
+    parallel_called = {}
+
+    monkeypatch.setattr(
+        "keshro_cli.cli.asyncio.run",
+        lambda coro: (parallel_called.update({"yes": True}), coro.close())[1],
+    )
 
     exit_code = cli.main(["continue", "--agent", "codex"])
+    out = ANSI_RE.sub("", capsys.readouterr().out)
 
-    assert exit_code == 1
+    assert exit_code == 0
+    assert parallel_called.get("yes")
+    assert "Using Codex" in out
 
 
 def test_wrap_prompt_agent_error_suggests_switching_agents(monkeypatch):

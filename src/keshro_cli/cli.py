@@ -8,6 +8,7 @@ import sys
 import textwrap
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,6 +30,8 @@ CYAN = "\033[36m"
 GREEN = "\033[32m"
 YELLOW = "\033[33m"
 RED = "\033[31m"
+
+_codex_merge_lock = asyncio.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +77,10 @@ def _clean(value: str | None) -> str:
     return (value or "").strip()
 
 
+def _stdout_is_tty() -> bool:
+    return sys.stdout.isatty()
+
+
 def _sanitize_json_payload(value):
     if isinstance(value, str):
         return value.encode("utf-8", "replace").decode("utf-8").strip()
@@ -98,7 +105,7 @@ class _Spinner:
         self._thread: threading.Thread | None = None
 
     def __enter__(self):
-        if _state.json or not sys.stdout.isatty():
+        if _state.json or not _stdout_is_tty():
             print(self._message)
             return self
         self._thread = threading.Thread(target=self._spin, daemon=True)
@@ -1333,8 +1340,6 @@ def _run_prompt_in_agent(
             "--sandbox",
             "workspace-write",
             "--skip-git-repo-check",
-            "--add-dir",
-            resolved_dir,
             "--color",
             "never",
             "--ephemeral",
@@ -2422,6 +2427,156 @@ async def _mark_task_status_async(
         print(f"  {DIM}[warn] status update failed: {exc}{RESET}", file=sys.stderr)
 
 
+async def _cleanup_worktree(repo_dir: str, worktree_path: str) -> None:
+    """Remove a manually-created git worktree."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "worktree", "remove", "--force", worktree_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=repo_dir,
+        )
+        await proc.communicate()
+    except Exception:
+        pass
+
+
+async def _git_stdout(*args: str, cwd: str) -> str:
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError((stderr or b"").decode(errors="replace").strip() or "git command failed")
+    return (stdout or b"").decode(errors="replace").strip()
+
+
+def _build_agent_exec_command(
+    agent_name: str,
+    agent_bin: str,
+    prompt: str,
+    *,
+    task_title: str,
+    work_dir: str,
+    worktree_name: str,
+) -> list[str]:
+    if agent_name == "codex":
+        return [
+            agent_bin,
+            "exec",
+            prompt,
+            "--cd",
+            work_dir,
+            "--sandbox",
+            "workspace-write",
+            "--skip-git-repo-check",
+            "--color",
+            "never",
+            "--ephemeral",
+        ]
+    return [
+        agent_bin,
+        "-p",
+        prompt,
+        "--worktree",
+        worktree_name,
+        "--output-format",
+        "json",
+        "--permission-mode",
+        "auto",
+        "--no-session-persistence",
+        "--name",
+        f"keshro: {task_title[:40]}",
+        "--add-dir",
+        work_dir,
+    ]
+
+
+async def _merge_codex_worktree_changes(
+    repo_dir: str,
+    worktree_path: str,
+    base_rev: str,
+    task_id: str,
+) -> None:
+    await _git_stdout("git", "add", "-A", cwd=worktree_path)
+    status = await _git_stdout("git", "status", "--short", cwd=worktree_path)
+    if status:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "commit",
+            "-m",
+            f"keshro parallel agent result: {task_id}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=worktree_path,
+        )
+        _stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(
+                (stderr or b"").decode(errors="replace").strip() or "failed to commit Codex worktree changes"
+            )
+
+    head_rev = await _git_stdout("git", "rev-parse", "HEAD", cwd=worktree_path)
+    if head_rev == base_rev:
+        return
+    diff_proc = await asyncio.create_subprocess_exec(
+        "git",
+        "diff",
+        "--binary",
+        f"{base_rev}..{head_rev}",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=worktree_path,
+    )
+    patch_bytes, stderr = await diff_proc.communicate()
+    if diff_proc.returncode != 0:
+        raise RuntimeError(
+            (stderr or b"").decode(errors="replace").strip() or "failed to build Codex worktree patch"
+        )
+    if not patch_bytes:
+        return
+    async with _codex_merge_lock:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "apply",
+            "--3way",
+            "-",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=repo_dir,
+        )
+        _stdout, stderr = await proc.communicate(patch_bytes)
+        if proc.returncode != 0:
+            reset_proc = await asyncio.create_subprocess_exec(
+                "git",
+                "reset",
+                "--hard",
+                "HEAD",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=repo_dir,
+            )
+            _reset_stdout, reset_stderr = await reset_proc.communicate()
+            reset_error = (
+                (reset_stderr or b"").decode(errors="replace").strip()
+                if reset_proc.returncode != 0
+                else ""
+            )
+            apply_error = (
+                (stderr or b"").decode(errors="replace").strip()
+                or "failed to apply Codex worktree patch"
+            )
+            if reset_error:
+                raise RuntimeError(f"{apply_error} (cleanup failed: {reset_error})")
+            raise RuntimeError(
+                apply_error
+            )
+
+
 async def _launch_single_agent(
     task: dict,
     plan: dict,
@@ -2431,22 +2586,15 @@ async def _launch_single_agent(
     semaphore: asyncio.Semaphore,
     api_client: httpx.AsyncClient,
     session_id: str = "",
+    agent: str = "auto",
 ) -> AgentResult:
     task_id = _clean(task.get("id")) or "unknown"
     task_title = _clean(task.get("title")) or "Untitled"
     worktree_name = f"keshro-{task_id[:8]}"
     prompt = _build_parallel_prompt(plan, task, total_agents, work_dir=work_dir)
 
-    claude_bin = shutil.which("claude")
-    if not claude_bin:
-        return AgentResult(
-            task_id=task_id,
-            task_title=task_title,
-            exit_code=127,
-            stdout="",
-            stderr="claude binary not found",
-            duration_seconds=0,
-        )
+    # Resolve agent binary (_resolve_prompt_agent raises SystemExit if not found)
+    agent_name, agent_bin = _resolve_prompt_agent(agent)
 
     async with semaphore:
         print(f"  {YELLOW}▶{RESET} {task_title} {DIM}starting...{RESET}")
@@ -2475,30 +2623,104 @@ async def _launch_single_agent(
         except Exception:
             collab_active = False
 
+        # For Codex, create a manual git worktree for isolation and merge the
+        # resulting changes back into the main repo after the run succeeds.
+        codex_worktree_path = ""
+        codex_worktree_base_rev = ""
+        codex_worktree_branch = ""
+        if agent_name == "codex":
+            import tempfile
+
+            codex_worktree_path = os.path.join(
+                tempfile.gettempdir(), f"keshro-{worktree_name}"
+            )
+            codex_worktree_branch = f"keshro-{task_id[:8]}-{uuid.uuid4().hex[:6]}"
+            try:
+                codex_worktree_base_rev = await _git_stdout(
+                    "git", "rev-parse", "HEAD", cwd=work_dir
+                )
+                wt_proc = await asyncio.create_subprocess_exec(
+                    "git", "worktree", "add", "-b",
+                    codex_worktree_branch,
+                    codex_worktree_path,
+                    codex_worktree_base_rev,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=work_dir,
+                )
+                wt_stdout, wt_stderr = await wt_proc.communicate()
+                if wt_proc.returncode != 0:
+                    err_msg = (wt_stderr or b"").decode(errors="replace").strip()
+                    blocked_reason = f"Failed to create worktree for Codex: {err_msg}"
+                    await _mark_task_status_async(
+                        api_client,
+                        plan_id,
+                        task_id,
+                        "blocked",
+                        blocked_reason=blocked_reason,
+                    )
+                    return AgentResult(
+                        task_id=task_id,
+                        task_title=task_title,
+                        exit_code=1,
+                        stdout="",
+                        stderr=blocked_reason,
+                        duration_seconds=0,
+                    )
+            except Exception as exc:
+                blocked_reason = f"Failed to create worktree for Codex: {exc}"
+                await _mark_task_status_async(
+                    api_client,
+                    plan_id,
+                    task_id,
+                    "blocked",
+                    blocked_reason=blocked_reason,
+                )
+                return AgentResult(
+                    task_id=task_id,
+                    task_title=task_title,
+                    exit_code=1,
+                    stdout="",
+                    stderr=blocked_reason,
+                    duration_seconds=0,
+                )
+
         start = time.monotonic()
         try:
-            proc = await asyncio.create_subprocess_exec(
-                claude_bin,
-                "-p",
+            exec_dir = codex_worktree_path if agent_name == "codex" else work_dir
+            command = _build_agent_exec_command(
+                agent_name,
+                agent_bin,
                 prompt,
-                "--worktree",
-                worktree_name,
-                "--output-format",
-                "json",
-                "--permission-mode",
-                "auto",
-                "--no-session-persistence",
-                "--name",
-                f"keshro: {task_title[:40]}",
-                "--add-dir",
-                work_dir,
+                task_title=task_title,
+                work_dir=exec_dir,
+                worktree_name=worktree_name,
+            )
+            proc = await asyncio.create_subprocess_exec(
+                *command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=work_dir,
+                cwd=exec_dir,
             )
             stdout_bytes, stderr_bytes = await proc.communicate()
             exit_code = proc.returncode or 0
         except Exception as exc:
+            if codex_worktree_path:
+                await _cleanup_worktree(work_dir, codex_worktree_path)
+            if codex_worktree_branch:
+                try:
+                    branch_proc = await asyncio.create_subprocess_exec(
+                        "git",
+                        "branch",
+                        "-D",
+                        codex_worktree_branch,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        cwd=work_dir,
+                    )
+                    await branch_proc.communicate()
+                except Exception:
+                    pass
             if collab_active:
                 try:
                     session_end(collab_session_id)
@@ -2517,7 +2739,7 @@ async def _launch_single_agent(
         stdout_text = (stdout_bytes or b"").decode(errors="replace").strip()
         stderr_text = (stderr_bytes or b"").decode(errors="replace").strip()
 
-        # Parse cost and token data from Claude's JSON output
+        # Parse cost and token data from agent's JSON output (Claude only)
         cost_usd = 0.0
         tokens_used = 0
         model_name = ""
@@ -2560,6 +2782,18 @@ async def _launch_single_agent(
                 )
             except Exception:
                 pass
+
+        if exit_code == 0 and codex_worktree_path and codex_worktree_base_rev:
+            try:
+                await _merge_codex_worktree_changes(
+                    work_dir,
+                    codex_worktree_path,
+                    codex_worktree_base_rev,
+                    task_id,
+                )
+            except Exception as exc:
+                exit_code = 1
+                stderr_text = str(exc)
 
         if exit_code == 0:
             # Build a detailed completion note
@@ -2607,6 +2841,16 @@ async def _launch_single_agent(
             except Exception:
                 pass
 
+        if codex_worktree_path:
+            await _cleanup_worktree(work_dir, codex_worktree_path)
+            if codex_worktree_branch:
+                try:
+                    await _git_stdout(
+                        "git", "branch", "-D", codex_worktree_branch, cwd=work_dir
+                    )
+                except Exception:
+                    pass
+
         return AgentResult(
             task_id=task_id,
             task_title=task_title,
@@ -2631,6 +2875,7 @@ async def _run_parallel(
     max_concurrency: int,
     run_all: bool,
     dry_run: bool,
+    agent: str = "auto",
 ) -> None:
     import uuid as _uuid
 
@@ -2638,9 +2883,8 @@ async def _run_parallel(
     resolved_dir = str(Path(work_dir).resolve()) if work_dir else os.getcwd()
     session_id = f"agent-{_uuid.uuid4().hex[:8]}"
 
-    claude_bin = shutil.which("claude")
-    if not claude_bin:
-        raise SystemExit("Agent binary not found on PATH. Install your agent first.")
+    # Verify that the resolved agent binary exists (raises SystemExit if not found)
+    _resolve_prompt_agent(agent)
 
     with make_client(_state.api_url, _state.token) as client:
         res = client.get(f"/v1/plans/{resolved_plan_id}")
@@ -2774,6 +3018,7 @@ async def _run_parallel(
                     semaphore,
                     api_client,
                     session_id=session_id,
+                    agent=agent,
                 )
                 for task in actionable
             ]
@@ -2951,7 +3196,9 @@ async def _run_parallel(
                 remaining = total_count - done_count - succeeded
                 if remaining > 0:
                     print(
-                        f"\n{DIM}{remaining} task(s) remaining. Run with --all to auto-continue through waves.{RESET}"
+                        f"\n{DIM}{remaining} task(s) remaining.{RESET}\n"
+                        f"{DIM}  keshro continue        — run the next task{RESET}\n"
+                        f"{DIM}  keshro continue --all  — auto-continue through all remaining waves{RESET}"
                     )
             break
 
@@ -3084,7 +3331,7 @@ def _continue_with_claude(
         return
     task_title = _clean(task.get("title")) or "next task"
     is_parallel_task = task.get("parallelizable", False)
-    if sys.stdout.isatty():
+    if _stdout_is_tty():
         progress = f"[{done_count}/{total_count}]"
         parallel_note = (
             f" {GREEN}(parallelizable — will split into sub-tasks){RESET}"
@@ -3109,7 +3356,7 @@ def _continue_with_claude(
 def _confirm_implicit_continue_plan(
     resolved_plan_id: str, work_dir: str | None = None
 ) -> str:
-    if _state.json or not sys.stdout.isatty():
+    if _state.json or not _stdout_is_tty():
         return resolved_plan_id
     plan_label = _current_plan_label(work_dir=work_dir) or resolved_plan_id
     plan_url = f"{_current_app_url()}/plans/{resolved_plan_id}"
@@ -3134,13 +3381,34 @@ def _confirm_implicit_continue_plan(
         raise SystemExit(0)
     if not override:
         raise SystemExit(0)
-    override_plan_id, override_title = _resolve_plan_or_migration_context(override)
+    override_plan_id, override_title = _resolve_continue_override_context(override)
     if not override_plan_id:
         raise SystemExit(0)
     if not _state.json:
         label = override_title or override_plan_id
         print(f"{DIM}Using:{RESET} {label} ({override_plan_id})")
     return override_plan_id
+
+
+def _resolve_continue_override_context(value: str | None) -> tuple[str | None, str | None]:
+    explicit_id = _clean(value)
+    if not explicit_id:
+        return None, None
+    with make_client(_state.api_url, _state.token) as client:
+        plan_res = client.get(f"/v1/plans/{explicit_id}")
+        if plan_res.status_code < 400:
+            plan = plan_res.json()
+            return explicit_id, _clean(plan.get("title")) or explicit_id
+
+        migration_plan_res = client.get(f"/v1/migrations/{explicit_id}/plan")
+        if migration_plan_res.status_code < 400:
+            plan = migration_plan_res.json()
+            plan_id = _clean(plan.get("id")) or explicit_id
+            return plan_id, _clean(plan.get("title")) or plan_id
+
+    raise SystemExit(
+        f"Could not resolve '{explicit_id}' to a plan or migration-linked plan."
+    )
 
 
 def _view_task(plan_id: str | None, task_id: str) -> None:
@@ -4812,7 +5080,7 @@ def _continue_command(
 
     # Inside a coding agent (piped stdout), always single-task mode.
     # In user's terminal, default to parallel unless --no-parallel is passed.
-    use_parallel = not no_parallel and (sys.stdout.isatty() or dry_run)
+    use_parallel = not no_parallel and (_stdout_is_tty() or dry_run)
     resolved_agent = _clean(agent).lower() or _default_agent_preference() or "auto"
     if resolved_agent not in {"auto", "claude", "codex"}:
         raise SystemExit(
@@ -4828,14 +5096,10 @@ def _continue_command(
             agent=resolved_agent,
         )
     else:
-        if resolved_agent == "codex":
-            raise SystemExit(
-                "Parallel execution currently requires Claude Code. Use "
-                "`keshro continue --agent claude`, `keshro continue --agent auto`, "
-                "or `keshro continue --no-parallel --agent codex`."
-            )
         _ensure_authenticated()
         concurrency = max(1, min(concurrency, 30))
+        if not _state.json:
+            print(f"{DIM}Using {_prompt_agent_display_name(resolved_agent)}{RESET}\n")
         asyncio.run(
             _run_parallel(
                 resolved_plan_id,
@@ -4843,6 +5107,7 @@ def _continue_command(
                 max_concurrency=concurrency,
                 run_all=auto_continue,
                 dry_run=dry_run,
+                agent=resolved_agent,
             )
         )
 
@@ -4864,7 +5129,7 @@ The command is `keshro login`. There is no `auth` subcommand.
 ```bash
 keshro create
 ```
-Run from the project directory. Keshro scans the project, generates clarifying questions (which you answer automatically), and produces a structured execution plan.
+Run from the project directory. Keshro scans the project, detects if it's a migration (and offers the migration pipeline with risk/cost analysis), generates clarifying questions (which you answer automatically), and produces a structured execution plan.
 
 Also accepts URLs:
 ```bash
@@ -4900,13 +5165,17 @@ keshro plan import jira --project <project-key>
 
 ## Execute
 ```bash
-keshro continue
+keshro continue              # runs next wave of tasks in parallel (default)
+keshro continue --all        # auto-continue through all remaining waves
+keshro continue --no-parallel # single-task mode (one at a time)
+keshro continue -m <migration-id>  # continue a specific migration's plan
 ```
-Prints the next task with full context. Follow the instructions, then mark done.
+By default, `keshro continue` launches parallel agents in isolated git worktrees — one per ready task. Use `--all` to keep going through waves automatically.
 
 ## Status
 ```bash
 keshro status
+keshro status --tui          # live-updating terminal dashboard
 ```
 
 ## During task execution
@@ -4957,20 +5226,12 @@ Keshro remembers your active plan. No need to pass `-p` every time.
 **User says "plan and run this" or "execute this" (explicitly wants execution):**
 1. Run `keshro create`
 2. Run `keshro status`
-3. Run `keshro continue --confirm` — start first task
-4. Execute the task, writing notes along the way
-5. Run `keshro task done <task-id>` when complete
-6. Run `keshro status` — show progress
-7. Run `keshro continue` for the next task
-8. Repeat steps 4-7 until all tasks are done or blocked
-
-When the user explicitly asks to run the plan, you should continue through all tasks automatically — completing one, then pulling the next — without stopping to ask permission between each task. Only stop if a task is blocked or an error occurs.
+3. Run `keshro continue --confirm --all` — parallel agents work through all waves automatically
+4. Only intervene if a task is blocked or an error occurs
 
 **User says "continue" or "keep going":**
 1. Run `keshro status` — show where things stand
-2. Run `keshro continue`
-3. After completing the task, run `keshro continue` again for the next one
-4. Keep going through tasks until done or blocked
+2. Run `keshro continue --all` — auto-continue through remaining waves
 
 **User says "status" or "what's happening":**
 1. Run `keshro status`
