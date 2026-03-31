@@ -3969,6 +3969,40 @@ def _find_migration_template(source: str, target: str) -> str | None:
         return None
 
 
+def _resolve_explicit_migration_context(
+    description: str,
+    *,
+    as_migration: bool,
+    source_type: str | None,
+    target_type: str | None,
+) -> tuple[str, str, str | None] | None:
+    explicit_source = _clean(source_type)
+    explicit_target = _clean(target_type)
+    explicit_requested = as_migration or bool(explicit_source or explicit_target)
+
+    if not explicit_requested:
+        return None
+    if bool(explicit_source) != bool(explicit_target):
+        raise SystemExit(
+            "Pass both --source-type and --target-type together when forcing migration mode."
+        )
+    if explicit_source and explicit_target:
+        return explicit_source, explicit_target, None
+
+    detected = _detect_migration_intent(description)
+    if detected:
+        if len(detected) == 2:
+            source_tech, target_tech = detected
+            return source_tech, target_tech, None
+        source_tech, target_tech, driver = detected
+        return source_tech, target_tech, driver
+
+    raise SystemExit(
+        "Could not determine the migration source and target from the provided context. "
+        "Pass --source-type and --target-type, or use --path <template-key>."
+    )
+
+
 def _classify_source(source: str | None) -> tuple[str, str | None]:
     """Classify a positional source argument into (source_type, value).
 
@@ -4078,6 +4112,27 @@ def _create_migration(
             help="Skip clarifying questions and generate the plan immediately.",
         ),
     ] = False,
+    as_migration: Annotated[
+        bool,
+        typer.Option(
+            "--as-migration",
+            help="Force migration mode. Requires source/target detection or explicit --source-type/--target-type.",
+        ),
+    ] = False,
+    source_type_override: Annotated[
+        Optional[str],
+        typer.Option(
+            "--source-type",
+            help="Explicit source technology when forcing migration mode.",
+        ),
+    ] = None,
+    target_type_override: Annotated[
+        Optional[str],
+        typer.Option(
+            "--target-type",
+            help="Explicit target technology when forcing migration mode.",
+        ),
+    ] = None,
     agent: Annotated[
         str,
         typer.Option(
@@ -4087,6 +4142,15 @@ def _create_migration(
     ] = "auto",
 ):
     """Create a project. Pass a directory, GitHub URL, Linear URL, or any URL — Keshro figures out the rest."""
+    if path and (
+        as_migration
+        or _clean(source_type_override)
+        or _clean(target_type_override)
+    ):
+        raise SystemExit(
+            "--path already selects migration mode. Do not combine it with --as-migration, --source-type, or --target-type."
+        )
+
     file_context = _read_context_file(context_file)
     if file_context:
         context = "\n\n".join(
@@ -4214,6 +4278,36 @@ def _create_migration(
             if resource_url:
                 desc_parts.append(f"Reference: {resource_url}")
             description = "\n\n".join(desc_parts)
+
+            explicit_migration = _resolve_explicit_migration_context(
+                description,
+                as_migration=as_migration,
+                source_type=source_type_override,
+                target_type=target_type_override,
+            )
+            if explicit_migration:
+                source_tech, target_tech, detected_driver = explicit_migration
+                template_key = _find_migration_template(source_tech, target_tech)
+                if not template_key:
+                    raise SystemExit(
+                        f"No migration template found for {source_tech} → {target_tech}. "
+                        "Pass --path <template-key> or add a matching migration template."
+                    )
+                answers = _parse_field_assignments(field)
+                if detected_driver:
+                    answers["__detected_driver"] = detected_driver
+                return _create_migration_inner(
+                    template_key,
+                    answers,
+                    context,
+                    github_url,
+                    resource_url,
+                    org_id,
+                    work_dir,
+                    skip_questions=skip_questions,
+                    prompt_for_context=not context_entered_interactively,
+                    agent=agent,
+                )
 
             # Detect migration intent and offer the migration pipeline
             migration_match = _detect_migration_intent(description)

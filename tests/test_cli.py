@@ -1814,6 +1814,83 @@ def test_create_interactive_migration_prompt_accepts_yes_for_migration(
     assert captured["context"] == "plan the migration"
 
 
+def test_create_as_migration_uses_explicit_source_and_target(
+    fake_client, monkeypatch
+):
+    monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
+    monkeypatch.setattr("keshro_cli.cli._collect_generic_discovery", lambda _: None)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: False)
+    monkeypatch.setattr(
+        "keshro_cli.cli._find_migration_template",
+        lambda source, target: (
+            "aws-batch-to-airflow"
+            if (source, target) == ("AWS Batch", "Airflow")
+            else None
+        ),
+    )
+
+    captured: dict[str, object] = {}
+
+    def _fake_create_migration_inner(
+        path,
+        provided_answers,
+        context,
+        github_url,
+        resource_url,
+        org_id,
+        work_dir,
+        **kwargs,
+    ):
+        captured["path"] = path
+        captured["context"] = context
+
+    monkeypatch.setattr(
+        "keshro_cli.cli._create_migration_inner", _fake_create_migration_inner
+    )
+
+    code = cli.main(
+        [
+            "create",
+            "--as-migration",
+            "--source-type",
+            "AWS Batch",
+            "--target-type",
+            "Airflow",
+            "--context",
+            "move orchestration to MWAA",
+        ]
+    )
+
+    assert code == 0
+    assert captured["path"] == "aws-batch-to-airflow"
+    assert captured["context"] == "move orchestration to MWAA"
+
+
+def test_create_as_migration_requires_both_source_and_target(monkeypatch, capsys):
+    monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
+    code = cli.main(
+        ["create", "--as-migration", "--source-type", "AWS Batch", "--context", "x"]
+    )
+
+    assert code == 1
+    assert "Pass both --source-type and --target-type together" in capsys.readouterr().err
+
+
+def test_create_as_migration_fails_when_detection_cannot_infer_path(
+    fake_client, monkeypatch, capsys
+):
+    monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
+    monkeypatch.setattr("keshro_cli.cli._collect_generic_discovery", lambda _: None)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: False)
+    monkeypatch.setattr("keshro_cli.cli._detect_migration_intent", lambda _: None)
+
+    code = cli.main(["create", "--as-migration", "--context", "move things around"])
+
+    assert code == 1
+    assert "Could not determine the migration source and target" in capsys.readouterr().err
+
+
 def test_find_migration_template_normalizes_apache_airflow(fake_client):
     template_key = cli._find_migration_template("AWS Batch", "Apache Airflow")
 
