@@ -3192,7 +3192,9 @@ async def _run_parallel(
                 remaining = total_count - done_count - succeeded
                 if remaining > 0:
                     print(
-                        f"\n{DIM}{remaining} task(s) remaining. Run with --all to auto-continue through waves.{RESET}"
+                        f"\n{DIM}{remaining} task(s) remaining.{RESET}\n"
+                        f"{DIM}  keshro continue        — run the next task{RESET}\n"
+                        f"{DIM}  keshro continue --all  — auto-continue through all remaining waves{RESET}"
                     )
             break
 
@@ -5071,6 +5073,8 @@ def _continue_command(
     else:
         _ensure_authenticated()
         concurrency = max(1, min(concurrency, 30))
+        if not _state.json:
+            print(f"{DIM}Using {_prompt_agent_display_name(resolved_agent)}{RESET}\n")
         asyncio.run(
             _run_parallel(
                 resolved_plan_id,
