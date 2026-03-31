@@ -1277,7 +1277,16 @@ def _resolve_prompt_agent(agent: str) -> tuple[str, str]:
 
 
 def _prompt_agent_display_name(agent: str) -> str:
-    resolved, _ = _resolve_prompt_agent(agent)
+    requested = _clean(agent).lower() or _default_agent_preference() or "auto"
+    fallback_names = {
+        "claude": "Claude Code",
+        "codex": "Codex",
+        "auto": "Claude Code",
+    }
+    try:
+        resolved, _ = _resolve_prompt_agent(agent)
+    except SystemExit:
+        return fallback_names.get(requested, "Claude Code")
     if resolved == "claude":
         return "Claude Code"
     if resolved == "codex":
@@ -4116,7 +4125,7 @@ def _create_migration(
         bool,
         typer.Option(
             "--as-migration",
-            help="Force migration mode. Requires source/target detection or explicit --source-type/--target-type.",
+            help="Force migration mode. Detects source/target from context unless --source-type and --target-type are provided explicitly.",
         ),
     ] = False,
     source_type_override: Annotated[
