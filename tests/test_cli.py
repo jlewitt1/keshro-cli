@@ -2,6 +2,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 
 import click
@@ -26,6 +27,78 @@ def _auth_with_plan():
         "default_plan_id": "plan-123",
         "default_plan_title": "AWS Batch to Airflow pilot",
     }
+
+
+def test_build_agent_exec_command_omits_add_dir_for_codex():
+    command = cli._build_agent_exec_command(
+        "codex",
+        "codex",
+        "do the thing",
+        task_title="Test task",
+        work_dir="/tmp/demo",
+        worktree_name="keshro-demo",
+    )
+
+    assert "--add-dir" not in command
+    assert command[:3] == ["codex", "exec", "do the thing"]
+
+
+def test_merge_codex_worktree_changes_applies_worktree_diff():
+    with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as worktree_parent:
+        subprocess.run(["git", "init"], cwd=repo_dir, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_dir, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo_dir, check=True, capture_output=True, text=True)
+
+        target = Path(repo_dir) / "demo.txt"
+        target.write_text("base\n")
+        subprocess.run(["git", "add", "demo.txt"], cwd=repo_dir, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=repo_dir, check=True, capture_output=True, text=True)
+
+        base_rev = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_dir,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+        worktree_dir = os.path.join(worktree_parent, "codex-worktree")
+        branch_name = "keshro-test-branch"
+        subprocess.run(
+            ["git", "worktree", "add", "-b", branch_name, worktree_dir, base_rev],
+            cwd=repo_dir,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        try:
+            Path(worktree_dir, "demo.txt").write_text("updated\n")
+            import asyncio
+
+            asyncio.run(
+                cli._merge_codex_worktree_changes(
+                    repo_dir,
+                    worktree_dir,
+                    base_rev,
+                    "task-123",
+                )
+            )
+            assert target.read_text() == "updated\n"
+        finally:
+            subprocess.run(
+                ["git", "worktree", "remove", "--force", worktree_dir],
+                cwd=repo_dir,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "branch", "-D", branch_name],
+                cwd=repo_dir,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
 
 
 class _FakeResponse:

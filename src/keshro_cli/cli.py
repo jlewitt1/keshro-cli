@@ -8,6 +8,7 @@ import sys
 import textwrap
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1333,8 +1334,6 @@ def _run_prompt_in_agent(
             "--sandbox",
             "workspace-write",
             "--skip-git-repo-check",
-            "--add-dir",
-            resolved_dir,
             "--color",
             "never",
             "--ephemeral",
@@ -2436,6 +2435,120 @@ async def _cleanup_worktree(repo_dir: str, worktree_path: str) -> None:
         pass
 
 
+async def _git_stdout(*args: str, cwd: str) -> str:
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError((stderr or b"").decode(errors="replace").strip() or "git command failed")
+    return (stdout or b"").decode(errors="replace").strip()
+
+
+def _build_agent_exec_command(
+    agent_name: str,
+    agent_bin: str,
+    prompt: str,
+    *,
+    task_title: str,
+    work_dir: str,
+    worktree_name: str,
+) -> list[str]:
+    if agent_name == "codex":
+        return [
+            agent_bin,
+            "exec",
+            prompt,
+            "--cd",
+            work_dir,
+            "--sandbox",
+            "workspace-write",
+            "--skip-git-repo-check",
+            "--color",
+            "never",
+            "--ephemeral",
+        ]
+    return [
+        agent_bin,
+        "-p",
+        prompt,
+        "--worktree",
+        worktree_name,
+        "--output-format",
+        "json",
+        "--permission-mode",
+        "auto",
+        "--no-session-persistence",
+        "--name",
+        f"keshro: {task_title[:40]}",
+        "--add-dir",
+        work_dir,
+    ]
+
+
+async def _merge_codex_worktree_changes(
+    repo_dir: str,
+    worktree_path: str,
+    base_rev: str,
+    task_id: str,
+) -> None:
+    await _git_stdout("git", "add", "-A", cwd=worktree_path)
+    status = await _git_stdout("git", "status", "--short", cwd=worktree_path)
+    if status:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "commit",
+            "-m",
+            f"keshro parallel agent result: {task_id}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=worktree_path,
+        )
+        _stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(
+                (stderr or b"").decode(errors="replace").strip() or "failed to commit Codex worktree changes"
+            )
+
+    head_rev = await _git_stdout("git", "rev-parse", "HEAD", cwd=worktree_path)
+    if head_rev == base_rev:
+        return
+    diff_proc = await asyncio.create_subprocess_exec(
+        "git",
+        "diff",
+        "--binary",
+        f"{base_rev}..{head_rev}",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=worktree_path,
+    )
+    patch_bytes, stderr = await diff_proc.communicate()
+    if diff_proc.returncode != 0:
+        raise RuntimeError(
+            (stderr or b"").decode(errors="replace").strip() or "failed to build Codex worktree patch"
+        )
+    if not patch_bytes:
+        return
+    proc = await asyncio.create_subprocess_exec(
+        "git",
+        "apply",
+        "--3way",
+        "-",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=repo_dir,
+    )
+    _stdout, stderr = await proc.communicate(patch_bytes)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            (stderr or b"").decode(errors="replace").strip() or "failed to apply Codex worktree patch"
+        )
+
+
 async def _launch_single_agent(
     task: dict,
     plan: dict,
@@ -2482,19 +2595,27 @@ async def _launch_single_agent(
         except Exception:
             collab_active = False
 
-        # For Codex, create a manual git worktree for isolation
+        # For Codex, create a manual git worktree for isolation and merge the
+        # resulting changes back into the main repo after the run succeeds.
         codex_worktree_path = ""
+        codex_worktree_base_rev = ""
+        codex_worktree_branch = ""
         if agent_name == "codex":
             import tempfile
 
             codex_worktree_path = os.path.join(
                 tempfile.gettempdir(), f"keshro-{worktree_name}"
             )
+            codex_worktree_branch = f"keshro-{task_id[:8]}-{uuid.uuid4().hex[:6]}"
             try:
+                codex_worktree_base_rev = await _git_stdout(
+                    "git", "rev-parse", "HEAD", cwd=work_dir
+                )
                 wt_proc = await asyncio.create_subprocess_exec(
-                    "git", "worktree", "add", "-d",
+                    "git", "worktree", "add", "-b",
+                    codex_worktree_branch,
                     codex_worktree_path,
-                    "HEAD",
+                    codex_worktree_base_rev,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     cwd=work_dir,
@@ -2522,46 +2643,21 @@ async def _launch_single_agent(
 
         start = time.monotonic()
         try:
-            if agent_name == "codex":
-                exec_dir = codex_worktree_path
-                proc = await asyncio.create_subprocess_exec(
-                    agent_bin,
-                    "exec",
-                    prompt,
-                    "--cd",
-                    exec_dir,
-                    "--sandbox",
-                    "workspace-write",
-                    "--skip-git-repo-check",
-                    "--add-dir",
-                    exec_dir,
-                    "--color",
-                    "never",
-                    "--ephemeral",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    cwd=exec_dir,
-                )
-            else:
-                proc = await asyncio.create_subprocess_exec(
-                    agent_bin,
-                    "-p",
-                    prompt,
-                    "--worktree",
-                    worktree_name,
-                    "--output-format",
-                    "json",
-                    "--permission-mode",
-                    "auto",
-                    "--no-session-persistence",
-                    "--name",
-                    f"keshro: {task_title[:40]}",
-                    "--add-dir",
-                    work_dir,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    cwd=work_dir,
-                )
+            exec_dir = codex_worktree_path if agent_name == "codex" else work_dir
+            command = _build_agent_exec_command(
+                agent_name,
+                agent_bin,
+                prompt,
+                task_title=task_title,
+                work_dir=exec_dir,
+                worktree_name=worktree_name,
+            )
+            proc = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=exec_dir,
+            )
             stdout_bytes, stderr_bytes = await proc.communicate()
             exit_code = proc.returncode or 0
         except Exception as exc:
@@ -2580,10 +2676,6 @@ async def _launch_single_agent(
                 stderr=str(exc),
                 duration_seconds=time.monotonic() - start,
             )
-
-        # Clean up manual worktree for Codex
-        if codex_worktree_path:
-            await _cleanup_worktree(work_dir, codex_worktree_path)
 
         duration = time.monotonic() - start
         stdout_text = (stdout_bytes or b"").decode(errors="replace").strip()
@@ -2634,6 +2726,17 @@ async def _launch_single_agent(
                 pass
 
         if exit_code == 0:
+            if codex_worktree_path and codex_worktree_base_rev:
+                try:
+                    await _merge_codex_worktree_changes(
+                        work_dir,
+                        codex_worktree_path,
+                        codex_worktree_base_rev,
+                        task_id,
+                    )
+                except Exception as exc:
+                    exit_code = 1
+                    stderr_text = str(exc)
             # Build a detailed completion note
             cost_parts = [f"{duration:.0f}s"]
             if tokens_used > 0:
@@ -2678,6 +2781,16 @@ async def _launch_single_agent(
                     notify(f"✗ {task_title[:50]} blocked")
             except Exception:
                 pass
+
+        if codex_worktree_path:
+            await _cleanup_worktree(work_dir, codex_worktree_path)
+            if codex_worktree_branch:
+                try:
+                    await _git_stdout(
+                        "git", "branch", "-D", codex_worktree_branch, cwd=work_dir
+                    )
+                except Exception:
+                    pass
 
         return AgentResult(
             task_id=task_id,
