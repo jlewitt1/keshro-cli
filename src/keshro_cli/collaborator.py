@@ -84,6 +84,27 @@ def session_end(session_id: str) -> bool:
     return result is not None
 
 
+def launch_terminal(
+    command: str,
+    cwd: str,
+    title: str = "",
+    session_id: str = "",
+) -> str | None:
+    """Launch a visible terminal tile in Conductor running a command.
+
+    Returns the tile ID on success, or None if the RPC is unavailable.
+    """
+    params: dict = {"command": command, "cwd": cwd}
+    if title:
+        params["title"] = title
+    if session_id:
+        params["session_id"] = session_id
+    result = _rpc_call("canvas.launchTerminal", params)
+    if result and isinstance(result, dict):
+        return result.get("tileId")
+    return None
+
+
 def notify(body: str, title: str = "Keshro") -> bool:
     """Send a native macOS notification via Collaborator."""
     result = _rpc_call(

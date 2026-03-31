@@ -45,14 +45,40 @@ def test_build_agent_exec_command_omits_add_dir_for_codex():
 
 def test_merge_codex_worktree_changes_applies_worktree_diff():
     with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as worktree_parent:
-        subprocess.run(["git", "init"], cwd=repo_dir, check=True, capture_output=True, text=True)
-        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_dir, check=True, capture_output=True, text=True)
-        subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo_dir, check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["git", "init"], cwd=repo_dir, check=True, capture_output=True, text=True
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"],
+            cwd=repo_dir,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test User"],
+            cwd=repo_dir,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
 
         target = Path(repo_dir) / "demo.txt"
         target.write_text("base\n")
-        subprocess.run(["git", "add", "demo.txt"], cwd=repo_dir, check=True, capture_output=True, text=True)
-        subprocess.run(["git", "commit", "-m", "base"], cwd=repo_dir, check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["git", "add", "demo.txt"],
+            cwd=repo_dir,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "base"],
+            cwd=repo_dir,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
 
         base_rev = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -173,7 +199,9 @@ def test_launch_single_agent_marks_task_blocked_when_codex_merge_fails(monkeypat
 
     task_updates = []
 
-    async def _fake_mark_task_status_async(client, plan_id, task_id, status, notes=None, blocked_reason=None):
+    async def _fake_mark_task_status_async(
+        client, plan_id, task_id, status, notes=None, blocked_reason=None
+    ):
         task_updates.append(
             {
                 "plan_id": plan_id,
@@ -192,7 +220,9 @@ def test_launch_single_agent_marks_task_blocked_when_codex_merge_fails(monkeypat
     async def _fake_cleanup_worktree(repo_dir, worktree_path):
         return None
 
-    async def _fake_merge_codex_worktree_changes(repo_dir, worktree_path, base_rev, task_id):
+    async def _fake_merge_codex_worktree_changes(
+        repo_dir, worktree_path, base_rev, task_id
+    ):
         raise RuntimeError("apply failed")
 
     async def _fake_create_subprocess_exec(*args, **kwargs):
@@ -205,11 +235,17 @@ def test_launch_single_agent_marks_task_blocked_when_codex_merge_fails(monkeypat
         raise AssertionError(f"Unexpected subprocess args: {args}")
 
     monkeypatch.setattr(cli, "_resolve_prompt_agent", lambda agent: ("codex", "codex"))
-    monkeypatch.setattr(cli, "_build_parallel_prompt", lambda plan, task, total_agents, work_dir=None: "prompt")
+    monkeypatch.setattr(
+        cli,
+        "_build_parallel_prompt",
+        lambda plan, task, total_agents, work_dir=None: "prompt",
+    )
     monkeypatch.setattr(cli, "_mark_task_status_async", _fake_mark_task_status_async)
     monkeypatch.setattr(cli, "_git_stdout", _fake_git_stdout)
     monkeypatch.setattr(cli, "_cleanup_worktree", _fake_cleanup_worktree)
-    monkeypatch.setattr(cli, "_merge_codex_worktree_changes", _fake_merge_codex_worktree_changes)
+    monkeypatch.setattr(
+        cli, "_merge_codex_worktree_changes", _fake_merge_codex_worktree_changes
+    )
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
 
     result = asyncio.run(
@@ -280,7 +316,9 @@ def test_launch_single_agent_marks_task_blocked_when_codex_worktree_create_fails
 
     monkeypatch.setattr(cli, "_resolve_prompt_agent", lambda agent: ("codex", "codex"))
     monkeypatch.setattr(
-        cli, "_build_parallel_prompt", lambda plan, task, total_agents, work_dir=None: "prompt"
+        cli,
+        "_build_parallel_prompt",
+        lambda plan, task, total_agents, work_dir=None: "prompt",
     )
     monkeypatch.setattr(cli, "_mark_task_status_async", _fake_mark_task_status_async)
     monkeypatch.setattr(cli, "_git_stdout", _fake_git_stdout)
@@ -350,7 +388,9 @@ def test_launch_single_agent_deletes_codex_branch_when_subprocess_launch_fails(
 
     monkeypatch.setattr(cli, "_resolve_prompt_agent", lambda agent: ("codex", "codex"))
     monkeypatch.setattr(
-        cli, "_build_parallel_prompt", lambda plan, task, total_agents, work_dir=None: "prompt"
+        cli,
+        "_build_parallel_prompt",
+        lambda plan, task, total_agents, work_dir=None: "prompt",
     )
     monkeypatch.setattr(cli, "_mark_task_status_async", _fake_mark_task_status_async)
     monkeypatch.setattr(cli, "_git_stdout", _fake_git_stdout)
@@ -1308,7 +1348,9 @@ def test_continue_allows_codex_for_parallel_mode(fake_client, monkeypatch, capsy
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
-    monkeypatch.setattr("keshro_cli.cli._current_plan_label", lambda work_dir=None: "Test plan")
+    monkeypatch.setattr(
+        "keshro_cli.cli._current_plan_label", lambda work_dir=None: "Test plan"
+    )
     monkeypatch.setattr("typer.confirm", lambda *a, **kw: True)
     monkeypatch.setattr("keshro_cli.cli._stdout_is_tty", lambda: True)
     monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
@@ -1902,9 +1944,19 @@ def test_migration_view_shows_detail(fake_client, capsys, monkeypatch):
 
 def test_confirm_implicit_continue_plan_shows_dashboard_link(monkeypatch):
     monkeypatch.setattr(cli._state, "json", False)
-    monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: True)
     monkeypatch.setattr(cli, "_current_plan_label", lambda work_dir=None: "Plan A")
     monkeypatch.setattr(cli, "_current_app_url", lambda: "http://localhost:3000")
+    monkeypatch.setattr(
+        cli,
+        "_load_plan_context_details",
+        lambda plan_id: {
+            "plan_id": plan_id,
+            "plan_title": "Plan A",
+            "migration_id": "",
+            "kind": "plan",
+        },
+    )
     captured = {}
 
     def _confirm(message, default=True):
@@ -1914,15 +1966,59 @@ def test_confirm_implicit_continue_plan_shows_dashboard_link(monkeypatch):
     monkeypatch.setattr(cli.typer, "confirm", _confirm)
 
     assert cli._confirm_implicit_continue_plan("plan-123") == "plan-123"
+    assert "Continue with plan 'Plan A' (plan-123)?" in captured["message"]
     assert "Dashboard:" in captured["message"]
     assert "http://localhost:3000/plans/plan-123" in captured["message"]
 
 
+def test_confirm_implicit_continue_plan_uses_migration_label_and_url(monkeypatch):
+    monkeypatch.setattr(cli._state, "json", False)
+    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: True)
+    monkeypatch.setattr(
+        cli, "_current_plan_label", lambda work_dir=None: "AWS Batch to Airflow"
+    )
+    monkeypatch.setattr(cli, "_current_app_url", lambda: "http://localhost:3000")
+    monkeypatch.setattr(
+        cli,
+        "_load_plan_context_details",
+        lambda plan_id: {
+            "plan_id": plan_id,
+            "plan_title": "AWS Batch to Airflow",
+            "migration_id": "mig-123",
+            "kind": "migration",
+        },
+    )
+    captured = {}
+
+    def _confirm(message, default=True):
+        captured["message"] = message
+        return True
+
+    monkeypatch.setattr(cli.typer, "confirm", _confirm)
+
+    assert cli._confirm_implicit_continue_plan("plan-123") == "plan-123"
+    assert (
+        "Continue with migration 'AWS Batch to Airflow' (plan-123)?"
+        in captured["message"]
+    )
+    assert "http://localhost:3000/migrations/mig-123" in captured["message"]
+
+
 def test_confirm_implicit_continue_plan_ctrl_c_exits_cleanly(monkeypatch, capsys):
     monkeypatch.setattr(cli._state, "json", False)
-    monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: True)
     monkeypatch.setattr(cli, "_current_plan_label", lambda work_dir=None: "Plan A")
     monkeypatch.setattr(cli, "_current_app_url", lambda: "http://localhost:3000")
+    monkeypatch.setattr(
+        cli,
+        "_load_plan_context_details",
+        lambda plan_id: {
+            "plan_id": plan_id,
+            "plan_title": "Plan A",
+            "migration_id": "",
+            "kind": "plan",
+        },
+    )
 
     def _confirm(message, default=True):
         raise click.Abort()
