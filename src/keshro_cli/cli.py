@@ -129,7 +129,9 @@ class _Spinner:
             )
             self._stop.wait(0.1)
             i += 1
-        clear_width = max(len(self._message) + 20, shutil.get_terminal_size(fallback=(80, 24)).columns)
+        clear_width = max(
+            len(self._message) + 20, shutil.get_terminal_size(fallback=(80, 24)).columns
+        )
         print("\r" + " " * clear_width + "\r", end="", flush=True)
 
 
@@ -565,9 +567,7 @@ def _print_migration_summary(
     date_part = f"  {DIM}{created_at}{RESET}" if created_at else ""
     suffix = f"  {DIM}for org {context_label}{RESET}" if context_label else ""
     prefix = f"{CYAN}{migration_id}{RESET}  " if show_id and migration_id else ""
-    print(
-        f"{prefix}{source} -> {target}  {DIM}[{status}]{RESET}{date_part}{suffix}"
-    )
+    print(f"{prefix}{source} -> {target}  {DIM}[{status}]{RESET}{date_part}{suffix}")
     if verbose:
         if migration.get("outcome_status"):
             print(f"  {DIM}Outcome:{RESET} {migration['outcome_status']}")
@@ -3505,10 +3505,10 @@ def _logout_alias():
 # ---------------------------------------------------------------------------
 
 
-def _detect_migration_intent(description: str) -> tuple[str, str] | None:
+def _detect_migration_intent(description: str) -> tuple[str, str, str | None] | None:
     """Ask the LLM whether a description is about a technology/platform migration.
 
-    Returns (source_tech, target_tech) or None.
+    Returns (source_tech, target_tech, driver) or None.
     """
     try:
         client = make_client()
@@ -3521,7 +3521,7 @@ def _detect_migration_intent(description: str) -> tuple[str, str] | None:
             return None
         data = resp.json()
         if data.get("is_migration") and data.get("source") and data.get("target"):
-            return (data["source"], data["target"])
+            return (data["source"], data["target"], data.get("driver"))
         return None
     except Exception:
         return None
@@ -3850,7 +3850,7 @@ def _create_migration(
             # Detect migration intent and offer the migration pipeline
             migration_match = _detect_migration_intent(description)
             if migration_match and not path:
-                source_tech, target_tech = migration_match
+                source_tech, target_tech, detected_driver = migration_match
                 if sys.stdout.isatty() and not _state.json:
                     print(
                         f"\n{CYAN}This looks like a migration ({source_tech} → {target_tech}).{RESET}"
@@ -3885,6 +3885,8 @@ def _create_migration(
                         )
                         if template_key:
                             answers = _parse_field_assignments(field)
+                            if detected_driver:
+                                answers["__detected_driver"] = detected_driver
                             return _create_migration_inner(
                                 template_key,
                                 answers,
@@ -4461,7 +4463,9 @@ def _config_show():
     payload["repo_context_kind"] = repo_context.get("kind")
     payload["repo_context_migration_id"] = repo_context.get("migration_id")
     payload["default_context_kind"] = default_context_details.get("kind")
-    payload["default_context_migration_id"] = default_context_details.get("migration_id")
+    payload["default_context_migration_id"] = default_context_details.get(
+        "migration_id"
+    )
     if _state.json:
         print_output(payload, True)
         return
@@ -4579,7 +4583,9 @@ def _config_set(
         updates["default_plan_title"] = None
     elif plan_id is not None:
         _ensure_authenticated()
-        resolved_plan_id, resolved_plan_title = _resolve_plan_or_migration_context(plan_id)
+        resolved_plan_id, resolved_plan_title = _resolve_plan_or_migration_context(
+            plan_id
+        )
         updates["default_plan_id"] = resolved_plan_id
         updates["default_plan_title"] = resolved_plan_title
     auth = update_auth(updates)
@@ -4722,13 +4728,17 @@ def _continue_command(
     plan_id: Annotated[
         Optional[str],
         typer.Option(
-            "--plan-id", "-p", help="Standalone plan ID. Uses saved execution context if omitted."
+            "--plan-id",
+            "-p",
+            help="Standalone plan ID. Uses saved execution context if omitted.",
         ),
     ] = None,
     migration_id: Annotated[
         Optional[str],
         typer.Option(
-            "--migration-id", "-m", help="Migration ID. Keshro resolves it to the linked execution plan."
+            "--migration-id",
+            "-m",
+            help="Migration ID. Keshro resolves it to the linked execution plan.",
         ),
     ] = None,
     work_dir: Annotated[

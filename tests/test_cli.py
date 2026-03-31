@@ -38,7 +38,10 @@ class _FakeResponse:
             raise httpx.HTTPStatusError(
                 f"{self.status_code} error",
                 request=httpx.Request("GET", "https://api.example.test"),
-                response=httpx.Response(self.status_code, request=httpx.Request("GET", "https://api.example.test")),
+                response=httpx.Response(
+                    self.status_code,
+                    request=httpx.Request("GET", "https://api.example.test"),
+                ),
             )
 
     def json(self):
@@ -496,7 +499,10 @@ def test_create_migration_from_path_key_prompts_and_posts_payload(
     assert payload["custom_fields"]["batch_workloads"] == "scheduled ETL jobs"
     assert payload["custom_fields"]["__keshro_discovered_context"]
     assert created_payload["custom_fields"]["target_airflow_deployment"] == "AWS MWAA"
-    assert "Submitting AWS Batch -> Airflow migration and generating execution plan..." in out
+    assert (
+        "Submitting AWS Batch -> Airflow migration and generating execution plan..."
+        in out
+    )
     assert "Migration created: AWS Batch -> Airflow" in out
     assert "Dashboard:" in out
     assert "migration-123" in out
@@ -809,7 +815,10 @@ def test_continue_confirms_when_using_implicit_plan_context(
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
-    monkeypatch.setattr("keshro_cli.cli._current_plan_label", lambda work_dir=None: "AWS Batch to Airflow pilot")
+    monkeypatch.setattr(
+        "keshro_cli.cli._current_plan_label",
+        lambda work_dir=None: "AWS Batch to Airflow pilot",
+    )
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
 
     prompted = {}
@@ -906,7 +915,10 @@ def test_continue_can_override_implicit_plan_with_migration_id(
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
     monkeypatch.setattr("typer.confirm", lambda *args, **kwargs: False)
     monkeypatch.setattr("builtins.input", lambda prompt="": "migration-123")
-    monkeypatch.setattr("keshro_cli.cli._current_plan_label", lambda work_dir=None: "AWS Batch to Airflow pilot")
+    monkeypatch.setattr(
+        "keshro_cli.cli._current_plan_label",
+        lambda work_dir=None: "AWS Batch to Airflow pilot",
+    )
     monkeypatch.setattr(
         "keshro_cli.cli.asyncio.run",
         lambda coro: (coro.close(), None)[1],
@@ -1047,7 +1059,9 @@ def test_create_reads_context_from_file(fake_client, monkeypatch, tmp_path, caps
     monkeypatch.setattr("keshro_cli.cli.update_auth", lambda payload: payload)
     monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
     monkeypatch.setattr("keshro_cli.cli._collect_generic_discovery", lambda _: None)
-    monkeypatch.setattr("keshro_cli.cli._prompt_agent_display_name", lambda _agent: "Claude Code")
+    monkeypatch.setattr(
+        "keshro_cli.cli._prompt_agent_display_name", lambda _agent: "Claude Code"
+    )
 
     context_path = tmp_path / "context.txt"
     context_path.write_text("Scale the Helm chart safely.")
@@ -1268,9 +1282,7 @@ def test_prompt_for_migration_template_fields_offers_view_for_truncated_textarea
     ]
 
 
-def test_prompt_for_migration_template_fields_ctrl_c_exits_review(
-    monkeypatch, capsys
-):
+def test_prompt_for_migration_template_fields_ctrl_c_exits_review(monkeypatch, capsys):
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
     prompts = []
 
@@ -1313,7 +1325,9 @@ def test_create_interactive_migration_prompt_accepts_no_for_general_project(
     monkeypatch.setattr("keshro_cli.cli._collect_generic_discovery", lambda _: None)
     monkeypatch.setattr("keshro_cli.cli.update_auth", lambda payload: payload)
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
-    monkeypatch.setattr("keshro_cli.cli._prompt_agent_display_name", lambda _agent: "Claude Code")
+    monkeypatch.setattr(
+        "keshro_cli.cli._prompt_agent_display_name", lambda _agent: "Claude Code"
+    )
     monkeypatch.setattr(
         "keshro_cli.cli._detect_migration_intent",
         lambda _description: ("AWS Batch", "Airflow"),
@@ -1363,7 +1377,9 @@ def test_create_interactive_migration_prompt_accepts_yes_for_migration(
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
     monkeypatch.setattr("keshro_cli.cli._collect_generic_discovery", lambda _: None)
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
-    monkeypatch.setattr("keshro_cli.cli._prompt_agent_display_name", lambda _agent: "Claude Code")
+    monkeypatch.setattr(
+        "keshro_cli.cli._prompt_agent_display_name", lambda _agent: "Claude Code"
+    )
     monkeypatch.setattr(
         "keshro_cli.cli._detect_migration_intent",
         lambda _description: ("AWS Batch", "Airflow"),
@@ -1654,7 +1670,9 @@ def test_migration_create_sets_default_plan_when_linked_plan_becomes_available(
     monkeypatch.setattr(
         cli,
         "_set_default_plan_after_create",
-        lambda plan, announce=True: saved.update({"id": plan.get("id"), "title": plan.get("title")}),
+        lambda plan, announce=True: saved.update(
+            {"id": plan.get("id"), "title": plan.get("title")}
+        ),
     )
 
     cli._create_migration_from_payload(
@@ -1726,9 +1744,7 @@ def test_migration_create_does_not_retry_linked_plan_poll_on_non_404_http_error(
             attempts["count"] += 1
             request = httpx.Request("GET", f"http://localhost:8000{path}")
             response = httpx.Response(403, request=request)
-            raise httpx.HTTPStatusError(
-                "forbidden", request=request, response=response
-            )
+            raise httpx.HTTPStatusError("forbidden", request=request, response=response)
 
     monkeypatch.setattr(cli, "make_client", lambda api_url=None, token=None: _Client())
     monkeypatch.setattr(cli, "_state", cli._State(api_url="http://localhost:8000"))
