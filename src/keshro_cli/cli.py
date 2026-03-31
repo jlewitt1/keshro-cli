@@ -5672,11 +5672,11 @@ keshro login <api-token>
 ```
 The command is `keshro login`. There is no `auth` subcommand.
 
-## Create a plan
+## Create a project or migration
 ```bash
 keshro create
 ```
-Run from the project directory. Keshro scans the project, detects if it's a migration (and offers the migration pipeline with risk/cost analysis), surfaces clarifying questions back to the user, and produces a structured execution plan.
+Run from the project directory. Keshro scans the project, detects if it's a migration, surfaces follow-up questions back to the user, and creates the right project or migration with its execution context.
 
 Also accepts URLs:
 ```bash
@@ -5704,9 +5704,9 @@ EOF
 keshro create --context-file /tmp/keshro-context.txt
 ```
 
-Plan creation can take a bit — Keshro scans the repo, gathers context, and generates the plan. Do not assume it failed.
+Creation can take a bit — Keshro scans the repo, gathers context, and builds the migration or project. Do not assume it failed.
 
-If another plan is currently active, just create the new one. It becomes the active plan.
+If another execution context is currently active, just create the new one. It becomes the active one.
 
 ## Import from issue trackers
 ```bash
@@ -5759,25 +5759,29 @@ keshro explain <task-id>
 keshro rollback <task-id>
 ```
 
-## Plan context
-Keshro remembers your active plan. No need to pass `-p` every time.
-- `keshro config` — shows active plan and auth status
-- `keshro plan list` — shows all plans
+## Execution context
+Keshro remembers your active execution context. No need to pass `-p` every time.
+- `keshro config` — shows the active migration/project context and auth status
+- `keshro plan list` — shows all low-level execution contexts
 - `keshro config set --plan-id <id>` — switch active plan
 
 ## Flows
 
 **User says "plan this" or "use keshro":**
 1. Run `keshro create` (or with context/URL)
-2. Run `keshro status` — show the plan
-3. **STOP and ask the user**: "Here's the plan with N tasks. Ready to execute?"
-4. Do NOT run `keshro continue` until the user says to proceed
+2. If Keshro stops for migration confirmation or follow-up questions, surface them to the user conversationally and wait.
+3. If Keshro gave you an `--answers-file` resume path, update that file with the user's answers and rerun the exact resume command.
+4. Run `keshro status` — show the migration/project
+5. **STOP and ask the user**: "Here's the plan with N tasks. Ready to execute?"
+6. Do NOT run `keshro continue` until the user says to proceed
 
 **User says "plan and run this" or "execute this" (explicitly wants execution):**
 1. Run `keshro create`
-2. Run `keshro status`
-3. Run `keshro continue --confirm --all` — parallel agents work through all waves automatically
-4. Only intervene if a task is blocked or an error occurs
+2. If Keshro stops for migration confirmation or follow-up questions, surface them to the user conversationally and wait.
+3. If Keshro gave you an `--answers-file` resume path, update that file with the user's answers and rerun the exact resume command.
+4. Run `keshro status`
+5. Run `keshro continue --confirm --all` — parallel agents work through all waves automatically
+6. Only intervene if a task is blocked or an error occurs
 
 **User says "continue" or "keep going":**
 1. Run `keshro status` — show where things stand
@@ -5797,6 +5801,7 @@ If the user says "stop", "pause", "hold on", or "wait":
 - Run keshro commands via Bash, never as chat messages
 - Do NOT use Keshro MCP tools — always use the CLI
 - Do NOT silently accept agent-suggested clarifier answers when Keshro asks follow-up questions. Surface them to the user and let the user confirm or override them.
+- Do NOT dump giant inline `--answer ...` commands back to the user. If Keshro provides an `--answers-file` resume path, use that.
 - Never auto-execute a plan without user confirmation. Always show the plan and ask first.
 - Once the user says to execute, continue through tasks automatically — don't ask between each task
 - If the user says to stop, stop immediately after the current task
