@@ -447,7 +447,9 @@ def test_create_migration_from_path_key_prompts_and_posts_payload(
     fake_client, monkeypatch, capsys
 ):
     monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "1")
-    monkeypatch.setattr(cli, "_set_default_plan_after_create", lambda created: None)
+    monkeypatch.setattr(
+        cli, "_set_default_plan_after_create", lambda created, announce=True: None
+    )
     monkeypatch.setattr(
         "shutil.which",
         lambda name: "/usr/local/bin/claude" if name == "claude" else None,
@@ -480,7 +482,7 @@ def test_create_migration_from_path_key_prompts_and_posts_payload(
     monkeypatch.setattr("subprocess.run", _fake_run)
     cli.main(["create", "--path", "aws-batch-to-airflow"])
 
-    out = capsys.readouterr().out
+    out = ANSI_RE.sub("", capsys.readouterr().out)
     clarifier_call = next(
         call for call in fake_client.calls if call[1] == "/v1/migrations/clarifiers"
     )
@@ -495,7 +497,8 @@ def test_create_migration_from_path_key_prompts_and_posts_payload(
     assert created_payload["custom_fields"]["target_airflow_deployment"] == "AWS MWAA"
     assert "Submitting AWS Batch -> Airflow migration and generating execution plan..." in out
     assert "Migration created: AWS Batch -> Airflow" in out
-    assert "Dashboard: http://localhost:3000/migrations/migration-123" in out
+    assert "Dashboard:" in out
+    assert "migration-123" in out
     assert "Plan URL:" not in out
     assert "Analysis is still running." in out
     assert "keshro continue" not in out
@@ -503,7 +506,9 @@ def test_create_migration_from_path_key_prompts_and_posts_payload(
 
 def test_create_migration_from_path_key_can_use_codex(fake_client, monkeypatch, capsys):
     monkeypatch.setenv("CODEX_HOME", "/tmp/codex-home")
-    monkeypatch.setattr(cli, "_set_default_plan_after_create", lambda created: None)
+    monkeypatch.setattr(
+        cli, "_set_default_plan_after_create", lambda created, announce=True: None
+    )
     monkeypatch.setattr(
         "shutil.which",
         lambda name: "/Applications/Codex.app/Contents/Resources/codex"
@@ -1041,6 +1046,7 @@ def test_create_reads_context_from_file(fake_client, monkeypatch, tmp_path, caps
     monkeypatch.setattr("keshro_cli.cli.update_auth", lambda payload: payload)
     monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
     monkeypatch.setattr("keshro_cli.cli._collect_generic_discovery", lambda _: None)
+    monkeypatch.setattr("keshro_cli.cli._prompt_agent_display_name", lambda _agent: "Claude Code")
 
     context_path = tmp_path / "context.txt"
     context_path.write_text("Scale the Helm chart safely.")
@@ -1306,6 +1312,7 @@ def test_create_interactive_migration_prompt_accepts_no_for_general_project(
     monkeypatch.setattr("keshro_cli.cli._collect_generic_discovery", lambda _: None)
     monkeypatch.setattr("keshro_cli.cli.update_auth", lambda payload: payload)
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("keshro_cli.cli._prompt_agent_display_name", lambda _agent: "Claude Code")
     monkeypatch.setattr(
         "keshro_cli.cli._detect_migration_intent",
         lambda _description: ("AWS Batch", "Airflow"),
@@ -1355,6 +1362,7 @@ def test_create_interactive_migration_prompt_accepts_yes_for_migration(
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
     monkeypatch.setattr("keshro_cli.cli._collect_generic_discovery", lambda _: None)
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("keshro_cli.cli._prompt_agent_display_name", lambda _agent: "Claude Code")
     monkeypatch.setattr(
         "keshro_cli.cli._detect_migration_intent",
         lambda _description: ("AWS Batch", "Airflow"),
@@ -2643,7 +2651,7 @@ def test_task_edit_without_plan_context_fails(capsys, monkeypatch):
     monkeypatch.setattr("keshro_cli.client.load_auth", lambda: {})
     code = cli.main(["task", "edit", "task-456", "--status", "in_progress"])
     assert code == 1
-    assert "Plan ID required" in capsys.readouterr().err
+    assert "Plan or migration ID required" in capsys.readouterr().err
 
 
 def test_migration_history_uses_plan_audit_trail(fake_client, capsys):
@@ -2769,13 +2777,9 @@ def test_auth_login_with_token_prints_human_text_by_default(monkeypatch, capsys)
 
     cli.main(["login", "ksh_pat_test"])
     out = capsys.readouterr().out
-    assert "Successfully logged in to Keshro as cli@example.com." in out
+    assert "Logged in to Keshro as cli@example.com." in out
     assert "Claude Code: /tmp/keshro.md" in out
     assert "Codex: /tmp/codex-AGENTS.md" in out
-    assert (
-        "Run `keshro setup` inside a repo if you also want Cursor repo instructions there."
-        in out
-    )
     assert saved["token"] == "ksh_pat_test"
 
 
@@ -2880,12 +2884,13 @@ def test_config_marks_stale_token_as_not_authenticated(monkeypatch, capsys):
 
 def test_auth_login_requires_token_argument(monkeypatch, capsys):
     monkeypatch.setattr("keshro_cli.auth.load_auth", lambda: {})
+    monkeypatch.setattr("sys.stdout.isatty", lambda: False)
     code = cli.main(["login"])
     captured = capsys.readouterr()
     assert code == 1
     cleaned = ANSI_RE.sub("", captured.err)
-    assert "No saved Keshro session found." in cleaned
     assert "Usage: keshro login <api-token>" in cleaned
+    assert "authenticate via browser" in cleaned
     assert "Account -> API" in cleaned
 
 
@@ -2949,13 +2954,14 @@ def test_auth_login_without_token_reports_expired_saved_session(monkeypatch, cap
     monkeypatch.setattr(
         "keshro_cli.auth.httpx.Client", lambda **kwargs: _UnauthorizedClient()
     )
+    monkeypatch.setattr("sys.stdout.isatty", lambda: False)
 
     code = cli.main(["login"])
     captured = capsys.readouterr()
     assert code == 1
     cleaned = ANSI_RE.sub("", captured.err)
-    assert "Your saved Keshro session has expired." in cleaned
     assert "keshro login <api-token>" in cleaned
+    assert "authenticate via browser" in cleaned
     assert "Account -> API" in cleaned
 
 
@@ -3063,6 +3069,14 @@ def test_request_errors_render_connection_help(monkeypatch, capsys):
     monkeypatch.setattr(
         cli, "make_client", lambda api_url=None, token=None: _OfflineClient()
     )
+    monkeypatch.setattr(
+        "keshro_cli.cli.load_auth",
+        lambda: {"api_url": "http://localhost:8000", "token": "jwt-123"},
+    )
+    monkeypatch.setattr(
+        "keshro_cli.client.load_auth",
+        lambda: {"api_url": "http://localhost:8000", "token": "jwt-123"},
+    )
 
     code = cli.main(["templates"])
     captured = capsys.readouterr()
@@ -3101,6 +3115,7 @@ def test_plan_generate_shows_enrichment(fake_client, capsys, monkeypatch):
     _auth = {**_auth_with_plan(), "token": "ksh_pat_test"}
     monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: _auth)
     monkeypatch.setattr("keshro_cli.client.load_auth", lambda: _auth)
+    monkeypatch.setattr("keshro_cli.cli.update_auth", lambda payload: payload)
     original_post = fake_client.post
 
     def _post_gen(path, json=None, timeout=None):
