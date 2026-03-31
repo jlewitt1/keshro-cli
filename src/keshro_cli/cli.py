@@ -2547,8 +2547,29 @@ async def _merge_codex_worktree_changes(
         )
         _stdout, stderr = await proc.communicate(patch_bytes)
         if proc.returncode != 0:
+            reset_proc = await asyncio.create_subprocess_exec(
+                "git",
+                "reset",
+                "--hard",
+                "HEAD",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=repo_dir,
+            )
+            _reset_stdout, reset_stderr = await reset_proc.communicate()
+            reset_error = (
+                (reset_stderr or b"").decode(errors="replace").strip()
+                if reset_proc.returncode != 0
+                else ""
+            )
+            apply_error = (
+                (stderr or b"").decode(errors="replace").strip()
+                or "failed to apply Codex worktree patch"
+            )
+            if reset_error:
+                raise RuntimeError(f"{apply_error} (cleanup failed: {reset_error})")
             raise RuntimeError(
-                (stderr or b"").decode(errors="replace").strip() or "failed to apply Codex worktree patch"
+                apply_error
             )
 
 
@@ -2682,6 +2703,20 @@ async def _launch_single_agent(
         except Exception as exc:
             if codex_worktree_path:
                 await _cleanup_worktree(work_dir, codex_worktree_path)
+            if codex_worktree_branch:
+                try:
+                    branch_proc = await asyncio.create_subprocess_exec(
+                        "git",
+                        "branch",
+                        "-D",
+                        codex_worktree_branch,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        cwd=work_dir,
+                    )
+                    await branch_proc.communicate()
+                except Exception:
+                    pass
             if collab_active:
                 try:
                     session_end(collab_session_id)
