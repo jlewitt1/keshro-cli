@@ -5125,7 +5125,7 @@ The command is `keshro login`. There is no `auth` subcommand.
 ```bash
 keshro create
 ```
-Run from the project directory. Keshro scans the project, generates clarifying questions (which you answer automatically), and produces a structured execution plan.
+Run from the project directory. Keshro scans the project, detects if it's a migration (and offers the migration pipeline with risk/cost analysis), generates clarifying questions (which you answer automatically), and produces a structured execution plan.
 
 Also accepts URLs:
 ```bash
@@ -5161,13 +5161,17 @@ keshro plan import jira --project <project-key>
 
 ## Execute
 ```bash
-keshro continue
+keshro continue              # runs next wave of tasks in parallel (default)
+keshro continue --all        # auto-continue through all remaining waves
+keshro continue --no-parallel # single-task mode (one at a time)
+keshro continue -m <migration-id>  # continue a specific migration's plan
 ```
-Prints the next task with full context. Follow the instructions, then mark done.
+By default, `keshro continue` launches parallel agents in isolated git worktrees — one per ready task. Use `--all` to keep going through waves automatically.
 
 ## Status
 ```bash
 keshro status
+keshro status --tui          # live-updating terminal dashboard
 ```
 
 ## During task execution
@@ -5218,20 +5222,12 @@ Keshro remembers your active plan. No need to pass `-p` every time.
 **User says "plan and run this" or "execute this" (explicitly wants execution):**
 1. Run `keshro create`
 2. Run `keshro status`
-3. Run `keshro continue --confirm` — start first task
-4. Execute the task, writing notes along the way
-5. Run `keshro task done <task-id>` when complete
-6. Run `keshro status` — show progress
-7. Run `keshro continue` for the next task
-8. Repeat steps 4-7 until all tasks are done or blocked
-
-When the user explicitly asks to run the plan, you should continue through all tasks automatically — completing one, then pulling the next — without stopping to ask permission between each task. Only stop if a task is blocked or an error occurs.
+3. Run `keshro continue --confirm --all` — parallel agents work through all waves automatically
+4. Only intervene if a task is blocked or an error occurs
 
 **User says "continue" or "keep going":**
 1. Run `keshro status` — show where things stand
-2. Run `keshro continue`
-3. After completing the task, run `keshro continue` again for the next one
-4. Keep going through tasks until done or blocked
+2. Run `keshro continue --all` — auto-continue through remaining waves
 
 **User says "status" or "what's happening":**
 1. Run `keshro status`
