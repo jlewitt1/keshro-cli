@@ -1370,6 +1370,53 @@ def test_continue_allows_codex_for_parallel_mode(fake_client, monkeypatch, capsy
     assert "Using Codex" in out
 
 
+def test_continue_uses_parallel_mode_inside_coding_agent_by_default(
+    fake_client, monkeypatch
+):
+    monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: True)
+    monkeypatch.setattr("keshro_cli.cli._stdout_is_tty", lambda: False)
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+
+    parallel_called = {}
+
+    monkeypatch.setattr(
+        "keshro_cli.cli.asyncio.run",
+        lambda coro: (parallel_called.update({"yes": True}), coro.close())[1],
+    )
+
+    exit_code = cli.main(["continue"])
+
+    assert exit_code == 0
+    assert parallel_called.get("yes")
+
+
+def test_continue_no_parallel_stays_single_task_inside_coding_agent(
+    fake_client, monkeypatch
+):
+    monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: True)
+    monkeypatch.setattr("keshro_cli.cli._stdout_is_tty", lambda: False)
+
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "keshro_cli.cli._continue_with_claude",
+        lambda resolved_plan_id, **kwargs: captured.update(
+            {"plan_id": resolved_plan_id, **kwargs}
+        ),
+    )
+
+    exit_code = cli.main(["continue", "--no-parallel"])
+
+    assert exit_code == 0
+    assert captured["plan_id"] == "plan-123"
+    assert captured["parallel"] is False
+
+
 def test_wrap_prompt_agent_error_suggests_switching_agents(monkeypatch):
     monkeypatch.setattr(
         "shutil.which",
@@ -1714,6 +1761,54 @@ def test_prompt_for_migration_template_fields_ctrl_c_exits_review(monkeypatch, c
     }
 
 
+def test_prompt_for_clarifying_questions_keeps_or_overrides_suggestions(monkeypatch):
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    responses = iter(["", "custom answer"])
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(responses))
+
+    questions = [
+        {
+            "id": "hosting_environment",
+            "question": "Where will the new workload run?",
+            "answers": [
+                {"answer_title": "MWAA", "value": "mwaa", "recommended": True},
+                {"answer_title": "Self-hosted", "value": "self_hosted"},
+            ],
+        },
+        {
+            "id": "rollback_plan",
+            "question": "How will rollback work?",
+        },
+    ]
+
+    result = cli._prompt_for_clarifying_questions(
+        questions,
+        {"hosting_environment": "mwaa", "rollback_plan": "disable new scheduler"},
+    )
+
+    assert result == {
+        "hosting_environment": "mwaa",
+        "rollback_plan": "custom answer",
+    }
+
+
+def test_review_agent_suggested_answers_noninteractive_does_not_auto_apply(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr("sys.stdout.isatty", lambda: False)
+
+    result = cli._review_agent_suggested_answers(
+        [{"id": "hosting_environment", "question": "Where will it run?"}],
+        {"hosting_environment": "mwaa"},
+        heading="Clarifying questions",
+        non_interactive_notice="Need user review before applying suggested answers.",
+    )
+
+    assert result == {}
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+    assert "Need user review before applying suggested answers." in out
+
+
 def test_create_interactive_migration_prompt_accepts_no_for_general_project(
     fake_client, monkeypatch, capsys
 ):
@@ -1812,6 +1907,66 @@ def test_create_interactive_migration_prompt_accepts_yes_for_migration(
     assert code == 0
     assert captured["path"] == "aws-batch-to-airflow"
     assert captured["context"] == "plan the migration"
+
+
+def test_create_inside_coding_agent_reviews_suggested_answers_before_generation(
+    fake_client, monkeypatch
+):
+    monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
+    monkeypatch.setattr("keshro_cli.cli._collect_generic_discovery", lambda _: None)
+    monkeypatch.setattr("keshro_cli.cli.update_auth", lambda payload: payload)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr(
+        "keshro_cli.cli._prompt_agent_display_name", lambda _agent: "Claude Code"
+    )
+    monkeypatch.setattr(
+        "keshro_cli.cli._answer_questions_via_agent",
+        lambda *args, **kwargs: {"hosting_environment": "mwaa"},
+    )
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "")
+
+    captured: dict[str, object] = {}
+    original_post = fake_client.post
+
+    def _post(path, json=None, timeout=None):
+        if path == "/v1/plans/describe/preview":
+            return _FakeResponse(
+                {
+                    "questions": [
+                        {
+                            "id": "hosting_environment",
+                            "question": "Where will the new workflow run?",
+                            "answers": [
+                                {
+                                    "answer_title": "MWAA",
+                                    "value": "mwaa",
+                                    "recommended": True,
+                                }
+                            ],
+                        }
+                    ],
+                    "enrichment_context": "",
+                }
+            )
+        if path == "/v1/plans/generate":
+            captured["description"] = json["description"]
+            return _FakeResponse(
+                {
+                    "id": "plan-general-1",
+                    "title": "General project plan",
+                    "status": "draft",
+                    "plan_steps": [],
+                }
+            )
+        return original_post(path, json=json, timeout=timeout)
+
+    fake_client.post = _post
+
+    code = cli.main(["create", "--context", "refactor auth"])
+
+    assert code == 0
+    assert "A: mwaa" in str(captured["description"])
 
 
 def test_create_as_migration_uses_explicit_source_and_target(
