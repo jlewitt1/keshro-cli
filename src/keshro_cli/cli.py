@@ -1678,6 +1678,12 @@ def _collect_clarifier_answers_from_claude(
     return answers
 
 
+def _print_agent_collection_warning(message: str) -> None:
+    if _state.json:
+        return
+    print(f"{YELLOW}{message}{RESET}")
+
+
 def _prompt_for_migration_template_fields(
     template: dict, answers: dict[str, str]
 ) -> dict[str, str]:
@@ -4684,13 +4690,19 @@ def _create_migration(
                         f"{CYAN}Asking AI agent to suggest answers for {len(questions)} clarifying questions...{RESET}"
                     )
                 if missing_ids:
-                    suggested_answers = _answer_questions_via_agent(
-                        questions,
-                        description,
-                        discovered_context,
-                        resolved_work_dir,
-                        agent=agent,
-                    )
+                    try:
+                        suggested_answers = _answer_questions_via_agent(
+                            questions,
+                            description,
+                            discovered_context,
+                            resolved_work_dir,
+                            agent=agent,
+                        )
+                    except SystemExit as exc:
+                        suggested_answers = {}
+                        _print_agent_collection_warning(
+                            f"Skipping suggested clarifier answers: {exc}"
+                        )
                 if missing_ids:
                     suggested_for_missing = {
                         key: value
@@ -4959,9 +4971,17 @@ def _create_migration_inner(
             f"Analyzing {scan_target} and generating {source} -> {target} "
             "migration inputs and follow-up questions..."
         ):
-            discovered_answer = _collect_discovery_answer_from_claude(
-                template, work_dir=resolved_work_dir, agent=agent
-            )
+            try:
+                discovered_answer = _collect_discovery_answer_from_claude(
+                    template, work_dir=resolved_work_dir, agent=agent
+                )
+            except SystemExit as exc:
+                if not _inside_coding_agent():
+                    raise
+                discovered_answer = ""
+                _print_agent_collection_warning(
+                    f"Skipping automatic migration discovery: {exc}"
+                )
 
         extracted = _extract_discovery_answers(template, discovered_answer)
         # Don't overwrite manually provided -f values with empty extracted values
@@ -5044,13 +5064,19 @@ def _create_migration_inner(
                         with _Spinner(
                             "Collecting suggested follow-up answers (this can take a bit)..."
                         ):
-                            suggested_answers = _collect_clarifier_answers_from_claude(
-                                template,
-                                payload,
-                                clarifier_questions,
-                                work_dir=resolved_work_dir,
-                                agent=agent,
-                            )
+                            try:
+                                suggested_answers = _collect_clarifier_answers_from_claude(
+                                    template,
+                                    payload,
+                                    clarifier_questions,
+                                    work_dir=resolved_work_dir,
+                                    agent=agent,
+                                )
+                            except SystemExit as exc:
+                                suggested_answers = {}
+                                _print_agent_collection_warning(
+                                    f"Skipping suggested clarifier answers: {exc}"
+                                )
                     if not provided_clarifier_answers:
                         rerun_command = (
                             f"keshro create --path {shlex.quote(path)}"

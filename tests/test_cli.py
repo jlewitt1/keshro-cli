@@ -1014,6 +1014,7 @@ def test_create_migration_from_path_key_applies_shared_clarifiers(
 
 def test_create_migration_from_path_key_requires_claude_code(fake_client, monkeypatch):
     monkeypatch.delenv("CLAUDE_CODE_ENTRYPOINT", raising=False)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
     monkeypatch.setattr("shutil.which", lambda name: None)
     exit_code = cli.main(["create", "--path", "aws-batch-to-airflow"])
     assert exit_code == 1
