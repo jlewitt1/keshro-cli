@@ -427,6 +427,18 @@ def _execution_context_arg(plan: dict | None = None, plan_id: str | None = None)
     return _clean(plan_id) or _clean((plan or {}).get("id")) or ""
 
 
+def _execution_dashboard_url(plan: dict | None = None, plan_id: str | None = None) -> str:
+    migration_id = _clean((plan or {}).get("migration_id"))
+    if migration_id:
+        return f"{_current_app_url()}/migrations/{migration_id}"
+    resolved_plan_id = _clean(plan_id) or _clean((plan or {}).get("id"))
+    return f"{_current_app_url()}/plans/{resolved_plan_id}" if resolved_plan_id else ""
+
+
+def _execution_context_label(plan: dict | None = None) -> str:
+    return "migration" if _clean((plan or {}).get("migration_id")) else "project"
+
+
 def _set_default_plan_after_create(plan: dict, *, announce: bool = True) -> None:
     if _state.json:
         return
@@ -440,7 +452,7 @@ def _set_default_plan_after_create(plan: dict, *, announce: bool = True) -> None
     update_auth({"default_plan_id": plan_id, "default_plan_title": plan_title})
     _link_current_repo_to_plan(plan_id, plan_title=plan_title)
     if announce:
-        print(f"Saved default plan: {plan_title}")
+        print(f"Saved default execution context: {plan_title}")
 
 
 def _resolve_plan_context(plan_id: str | None) -> tuple[str | None, str | None]:
@@ -1053,12 +1065,53 @@ def _parse_field_assignments(values: list[str] | None) -> dict[str, str]:
     return parsed
 
 
-def _format_answer_assignments(answers: dict[str, str]) -> str:
-    parts: list[str] = []
-    for key, value in answers.items():
-        escaped = value.replace('"', '\\"')
-        parts.append(f'--answer {key}="{escaped}"')
-    return " ".join(parts)
+def _load_answer_file(path: str | None) -> dict[str, str]:
+    raw_path = _clean(path)
+    if not raw_path:
+        return {}
+    try:
+        payload = json.loads(Path(raw_path).read_text())
+    except OSError as exc:
+        raise SystemExit(f"Could not read --answers-file {raw_path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise SystemExit(
+            f"Invalid JSON in --answers-file {raw_path}: {exc}"
+        ) from exc
+    if isinstance(payload, dict) and isinstance(payload.get("answers"), dict):
+        source = payload["answers"]
+    elif isinstance(payload, dict):
+        source = payload
+    else:
+        raise SystemExit(
+            f"Invalid --answers-file {raw_path}: expected a JSON object of question_id -> answer."
+        )
+    parsed: dict[str, str] = {}
+    for key, value in source.items():
+        question_id = _clean(str(key))
+        answer_value = _clean(str(value))
+        if question_id and answer_value:
+            parsed[question_id] = answer_value
+    return parsed
+
+
+def _write_agent_answers_file(
+    *,
+    heading: str,
+    questions: list[dict],
+    suggested_answers: dict[str, str],
+) -> str:
+    import tempfile
+
+    payload = {
+        "heading": heading,
+        "answers": suggested_answers,
+        "questions": questions,
+    }
+    fd, path = tempfile.mkstemp(prefix="keshro-answers-", suffix=".json")
+    with os.fdopen(fd, "w") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+    return path
 
 
 def _missing_question_ids(questions: list[dict], answers: dict[str, str]) -> list[str]:
@@ -1077,6 +1130,12 @@ def _exit_for_agent_clarifier_feedback(
     suggested_answers: dict[str, str],
     rerun_command: str,
 ) -> None:
+    answers_file = _write_agent_answers_file(
+        heading=heading,
+        questions=questions,
+        suggested_answers=suggested_answers,
+    )
+    rerun_command = f"{rerun_command} --answers-file {shlex.quote(answers_file)}"
     if _state.json:
         print_output(
             {
@@ -1084,6 +1143,7 @@ def _exit_for_agent_clarifier_feedback(
                 "heading": heading,
                 "questions": questions,
                 "suggested_answers": suggested_answers,
+                "answers_file": answers_file,
                 "rerun_command": rerun_command,
             },
             True,
@@ -1091,7 +1151,7 @@ def _exit_for_agent_clarifier_feedback(
         raise typer.Exit(0)
     print(f"\n{YELLOW}{heading}{RESET}")
     print(
-        f"{DIM}Ask the user these follow-up questions conversationally, then rerun the command with --answer question_id=value.{RESET}"
+        f"{DIM}Ask the user these follow-up questions conversationally, update the generated answers file, then rerun the command.{RESET}"
     )
     for index, question in enumerate(questions, 1):
         question_id = _clean(question.get("id")) or f"q{index}"
@@ -1115,7 +1175,8 @@ def _exit_for_agent_clarifier_feedback(
                 print(f"     {DIM}{option_index}. {title}{rec}{marker}{RESET}")
         elif suggested:
             print(f"     {DIM}Suggested answer: {suggested}{RESET}")
-    print(f"\n{DIM}Then rerun:{RESET}")
+    print(f"\n{DIM}Answers file:{RESET} {CYAN}{answers_file}{RESET}")
+    print(f"{DIM}Then rerun:{RESET}")
     print(f"  {CYAN}{rerun_command}{RESET}")
     raise typer.Exit(0)
 
@@ -4258,6 +4319,13 @@ def _create_migration(
             help="Set a clarifier answer as question_id=value. Repeat for multiple answers.",
         ),
     ] = None,
+    answers_file: Annotated[
+        Optional[str],
+        typer.Option(
+            "--answers-file",
+            help="JSON file containing clarifier answers keyed by question_id.",
+        ),
+    ] = None,
     context: Annotated[
         Optional[str], typer.Option("--context", "-c", help="Additional context.")
     ] = None,
@@ -4381,6 +4449,7 @@ def _create_migration(
 
     try:
         provided_clarifier_answers = _parse_field_assignments(answer)
+        provided_clarifier_answers.update(_load_answer_file(answers_file))
         context_entered_interactively = False
         if path:
             if not _state.json:
@@ -4631,15 +4700,10 @@ def _create_migration(
                     rerun_command = f"keshro create --context {shlex.quote(context or description)}"
                     if agent != "auto":
                         rerun_command += f" --agent {shlex.quote(agent)}"
-                    answer_flags = _format_answer_assignments(
-                        {**answered, **suggested_for_missing}
-                    )
-                    if answer_flags:
-                        rerun_command += f" {answer_flags}"
                     _exit_for_agent_clarifier_feedback(
                         heading="Keshro needs user answers before it can generate this plan.",
                         questions=questions,
-                        suggested_answers={**answered, **suggested_answers},
+                        suggested_answers={**answered, **suggested_for_missing},
                         rerun_command=rerun_command,
                     )
                 if not _state.json:
@@ -4994,9 +5058,6 @@ def _create_migration_inner(
                         ).rstrip()
                         if agent != "auto":
                             rerun_command += f" --agent {shlex.quote(agent)}"
-                        answer_flags = _format_answer_assignments(suggested_answers)
-                        if answer_flags:
-                            rerun_command += f" {answer_flags}"
                         _exit_for_agent_clarifier_feedback(
                             heading="Keshro needs user answers before it can create this migration.",
                             questions=clarifier_questions,
@@ -5217,9 +5278,9 @@ def _config_show():
             )
         else:
             repo_plan_url = f"{app_url}/plans/{repo_plan_id}" if repo_plan_id else ""
-            print(f"{DIM}Current repo plan:{RESET} {YELLOW}{repo_plan}{RESET}")
+            print(f"{DIM}Current repo project:{RESET} {YELLOW}{repo_plan}{RESET}")
             if repo_plan_url:
-                print(f"{DIM}Plan URL:{RESET} {CYAN}{repo_plan_url}{RESET}")
+                print(f"{DIM}Project URL:{RESET} {CYAN}{repo_plan_url}{RESET}")
     if default_plan and plan_id != repo_plan_id:
         app_url = _app_url_from_api_url(payload["api_url"])
         default_migration_id = payload.get("default_context_migration_id") or ""
@@ -5230,9 +5291,9 @@ def _config_show():
             )
         else:
             plan_url = f"{app_url}/plans/{plan_id}" if plan_id else ""
-            print(f"{DIM}Default plan:{RESET} {YELLOW}{default_plan}{RESET}")
+            print(f"{DIM}Default project:{RESET} {YELLOW}{default_plan}{RESET}")
             if plan_url:
-                print(f"{DIM}Plan URL:{RESET} {CYAN}{plan_url}{RESET}")
+                print(f"{DIM}Project URL:{RESET} {CYAN}{plan_url}{RESET}")
     if user.get("email"):
         print(f"{DIM}User:{RESET} {CYAN}{user['email']}{RESET}")
     if user.get("name"):
@@ -5338,11 +5399,11 @@ def _config_set(
         print(f"Saved default agent: {auth.get('default_agent') or 'auto'}")
     plan_label = auth.get("default_plan_title") or auth.get("default_plan_id")
     if plan_label:
-        print(f"Saved default plan: {plan_label}")
+        print(f"Saved default execution context: {plan_label}")
         if linked_repo:
-            print("Linked the current repo to this plan in Keshro.")
+            print("Linked the current repo to this execution context in Keshro.")
     elif clear_plan:
-        print("Cleared default plan context.")
+        print("Cleared default execution context.")
 
 
 # ---------------------------------------------------------------------------
@@ -6058,8 +6119,8 @@ def _print_plan_status(plan: dict) -> None:
     if plan.get("enrichment_sources") or _plan_analysis(plan):
         plan_id = _clean(plan.get("id"))
         if plan_id:
-            app_url = _current_app_url()
-            print(f"  {DIM}Review in UI: {app_url}/plans/{plan_id}{RESET}")
+            dashboard_url = _execution_dashboard_url(plan, plan_id)
+            print(f"  {DIM}Review in UI: {dashboard_url}{RESET}")
         print()
 
     # Status symbols
@@ -7929,7 +7990,7 @@ def _plan_generate(
 
     _set_default_plan_after_create(plan)
 
-    print(f"\n{GREEN}Plan created: {plan.get('title', 'Untitled')}{RESET}")
+    print(f"\n{GREEN}Project created: {plan.get('title', 'Untitled')}{RESET}")
     print(f"  ID: {plan_id}")
     print(f"  Tasks: {len(steps)}")
     print(f"  Status: {plan.get('status', 'draft')}")
@@ -7937,28 +7998,27 @@ def _plan_generate(
     _print_plan_enrichment(plan)
     _print_plan_analysis(plan)
     if plan.get("enrichment_sources") or _plan_analysis(plan):
-        app_url = _current_app_url()
-        print(f"  Review in UI: {app_url}/plans/{plan_id}")
+        print(f"  Review in UI: {_execution_dashboard_url(plan, plan_id)}")
 
     if steps:
         print(f"\n{CYAN}Tasks:{RESET}")
-        for step in steps:
-            dep_info = ""
-            if step.get("depends_on"):
-                dep_info = f" {DIM}(depends on: {', '.join(step['depends_on'])}){RESET}"
-            risk = step.get("risk_level") or ""
-            risk_badge = ""
-            if risk == "high":
-                risk_badge = f" {RED}[high risk]{RESET}"
-            elif risk == "medium":
-                risk_badge = f" {YELLOW}[medium]{RESET}"
-            print(
-                f"  {step.get('order', 0):2d}. {step.get('title', 'Untitled')}{risk_badge}{dep_info}"
-            )
+    for step in steps:
+        dep_info = ""
+        if step.get("depends_on"):
+            dep_info = f" {DIM}(depends on: {', '.join(step['depends_on'])}){RESET}"
+        risk = step.get("risk_level") or ""
+        risk_badge = ""
+        if risk == "high":
+            risk_badge = f" {RED}[high risk]{RESET}"
+        elif risk == "medium":
+            risk_badge = f" {YELLOW}[medium]{RESET}"
+        print(
+            f"  {step.get('order', 0):2d}. {step.get('title', 'Untitled')}{risk_badge}{dep_info}"
+        )
 
     if not confirm and plan.get("status") == "draft":
         print(
-            f"\n{DIM}Plan is in draft. Run 'keshro continue -p {plan_id} --confirm' to start execution.{RESET}"
+            f"\n{DIM}Execution context is in draft. Run 'keshro continue -p {plan_id} --confirm' to start execution.{RESET}"
         )
 
     if _state.json:

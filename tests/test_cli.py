@@ -1606,6 +1606,7 @@ def test_prompt_for_migration_template_fields_hides_duplicate_suggested_value_fo
     monkeypatch, capsys
 ):
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
     monkeypatch.setattr("builtins.input", lambda _prompt="": "")
 
     template = {
@@ -1639,6 +1640,7 @@ def test_prompt_for_migration_template_fields_uses_replacement_label_for_preview
     monkeypatch, capsys
 ):
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
     prompts = []
 
     def _fake_input(prompt=""):
@@ -1677,6 +1679,7 @@ def test_prompt_for_migration_template_fields_offers_view_for_truncated_textarea
     monkeypatch, capsys
 ):
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
     prompts = []
     answers = iter(["v", ""])
 
@@ -1721,6 +1724,7 @@ def test_prompt_for_migration_template_fields_offers_view_for_truncated_textarea
 
 def test_prompt_for_migration_template_fields_ctrl_c_exits_review(monkeypatch, capsys):
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
     prompts = []
 
     def _fake_input(prompt=""):
@@ -1757,6 +1761,7 @@ def test_prompt_for_migration_template_fields_ctrl_c_exits_review(monkeypatch, c
 
 def test_prompt_for_clarifying_questions_keeps_or_overrides_suggestions(monkeypatch):
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
     responses = iter(["", "custom answer"])
     monkeypatch.setattr("builtins.input", lambda _prompt="": next(responses))
 
@@ -1810,6 +1815,7 @@ def test_create_interactive_migration_prompt_accepts_no_for_general_project(
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
     monkeypatch.setattr("keshro_cli.cli._collect_generic_discovery", lambda _: None)
     monkeypatch.setattr("keshro_cli.cli.update_auth", lambda payload: payload)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
     monkeypatch.setattr(
         "keshro_cli.cli._prompt_agent_display_name", lambda _agent: "Claude Code"
@@ -1862,6 +1868,7 @@ def test_create_interactive_migration_prompt_accepts_yes_for_migration(
 ):
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
     monkeypatch.setattr("keshro_cli.cli._collect_generic_discovery", lambda _: None)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
     monkeypatch.setattr(
         "keshro_cli.cli._prompt_agent_display_name", lambda _agent: "Claude Code"
@@ -2018,7 +2025,7 @@ def test_create_inside_coding_agent_stops_before_generation_when_answers_missing
     assert code == 0
     out = ANSI_RE.sub("", capsys.readouterr().out)
     assert "Keshro needs user answers before it can generate this plan." in out
-    assert '--answer hosting_environment="mwaa"' in out
+    assert "--answers-file" in out
 
 
 def test_create_inside_coding_agent_stops_for_clarifiers_until_user_answers(
@@ -2070,7 +2077,7 @@ def test_create_inside_coding_agent_stops_for_clarifiers_until_user_answers(
     assert code == 0
     out = ANSI_RE.sub("", capsys.readouterr().out)
     assert "Keshro needs user answers before it can generate this plan." in out
-    assert '--answer hosting_environment="mwaa"' in out
+    assert "--answers-file" in out
 
 
 def test_create_inside_coding_agent_accepts_answer_flags_on_rerun(
@@ -2115,13 +2122,16 @@ def test_create_inside_coding_agent_accepts_answer_flags_on_rerun(
 
     fake_client.post = _post
 
+    answers_path = Path("/tmp/keshro-test-answers.json")
+    answers_path.write_text(json.dumps({"answers": {"hosting_environment": "mwaa"}}))
+
     code = cli.main(
         [
             "create",
             "--context",
             "refactor auth",
-            "--answer",
-            "hosting_environment=mwaa",
+            "--answers-file",
+            str(answers_path),
         ]
     )
 
@@ -2256,7 +2266,7 @@ def test_plan_create_saves_default_plan_automatically(fake_client, monkeypatch, 
         ]
     )
     out = capsys.readouterr().out
-    assert "Saved default plan:" in out
+    assert "Saved default execution context:" in out
     assert saved["default_plan_id"]
     assert saved["default_plan_title"]
 
@@ -2812,8 +2822,8 @@ def test_config_set_can_save_default_plan(fake_client, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert code == 0
     assert "Saved default context: personal" in out
-    assert "Saved default plan: AWS Batch to Airflow pilot" in out
-    assert "Linked the current repo to this plan in Keshro." in out
+    assert "Saved default execution context: AWS Batch to Airflow pilot" in out
+    assert "Linked the current repo to this execution context in Keshro." in out
 
 
 def test_require_plan_context_can_resolve_repo_link(monkeypatch):
