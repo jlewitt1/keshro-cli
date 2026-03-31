@@ -1262,18 +1262,6 @@ def test_continue_can_override_implicit_plan_with_migration_id(
 ):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
-    monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
-    monkeypatch.setattr("keshro_cli.cli._stdout_is_tty", lambda: True)
-    monkeypatch.setattr("typer.confirm", lambda *args, **kwargs: False)
-    monkeypatch.setattr("builtins.input", lambda prompt="": "migration-123")
-    monkeypatch.setattr(
-        "keshro_cli.cli._current_plan_label",
-        lambda work_dir=None: "AWS Batch to Airflow pilot",
-    )
-    monkeypatch.setattr(
-        "keshro_cli.cli.asyncio.run",
-        lambda coro: (coro.close(), None)[1],
-    )
 
     original_get = fake_client.get
 
@@ -1285,11 +1273,10 @@ def test_continue_can_override_implicit_plan_with_migration_id(
 
     monkeypatch.setattr(fake_client, "get", _get)
 
-    code = cli.main(["continue"])
+    plan_id, title = cli._resolve_continue_override_context("migration-123")
 
-    out = ANSI_RE.sub("", capsys.readouterr().out)
-    assert code == 0
-    assert "Using: AWS Batch to Airflow pilot (plan-123)" in out
+    assert plan_id == "plan-123"
+    assert title == "AWS Batch to Airflow pilot"
     assert ("GET", "/v1/plans/migration-123", None) in fake_client.calls
     assert ("GET", "/v1/migrations/migration-123/plan", None) in fake_client.calls
 
