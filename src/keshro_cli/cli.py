@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -2587,6 +2588,7 @@ async def _launch_single_agent(
     api_client: httpx.AsyncClient,
     session_id: str = "",
     agent: str = "auto",
+    visible: bool = False,
 ) -> AgentResult:
     task_id = _clean(task.get("id")) or "unknown"
     task_title = _clean(task.get("title")) or "Untitled"
@@ -2612,10 +2614,11 @@ async def _launch_single_agent(
             # Fallback to plain status update if agent endpoint fails
             await _mark_task_status_async(api_client, plan_id, task_id, "in_progress")
 
-        # Register with Collaborator if available
+        # Register with Collaborator/Conductor if available
         collab_session_id = f"keshro-{task_id}"
+        launched_in_terminal = False
         try:
-            from .collaborator import is_available, notify, session_end, session_start
+            from .collaborator import is_available, launch_terminal, notify, session_end, session_start
 
             collab_active = is_available()
             if collab_active:
@@ -2686,58 +2689,113 @@ async def _launch_single_agent(
                 )
 
         start = time.monotonic()
-        try:
-            exec_dir = codex_worktree_path if agent_name == "codex" else work_dir
-            command = _build_agent_exec_command(
-                agent_name,
-                agent_bin,
-                prompt,
-                task_title=task_title,
-                work_dir=exec_dir,
-                worktree_name=worktree_name,
-            )
-            proc = await asyncio.create_subprocess_exec(
-                *command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=exec_dir,
-            )
-            stdout_bytes, stderr_bytes = await proc.communicate()
-            exit_code = proc.returncode or 0
-        except Exception as exc:
-            if codex_worktree_path:
-                await _cleanup_worktree(work_dir, codex_worktree_path)
-            if codex_worktree_branch:
+        exec_dir = codex_worktree_path if agent_name == "codex" else work_dir
+        command = _build_agent_exec_command(
+            agent_name,
+            agent_bin,
+            prompt,
+            task_title=task_title,
+            work_dir=exec_dir,
+            worktree_name=worktree_name,
+        )
+
+        if collab_active and visible:
+            tile_title = f"keshro: {task_title[:40]}"
+            try:
+                from .collaborator import launch_terminal
+
+                tile_id = launch_terminal(
+                    command=shlex.join(command),
+                    cwd=exec_dir,
+                    title=tile_title,
+                    session_id=collab_session_id,
+                )
+                launched_in_terminal = tile_id is not None
+            except Exception:
+                launched_in_terminal = False
+
+        if launched_in_terminal:
+            # Agent is running in a visible Conductor terminal tile.
+            # Poll the Keshro API for task completion instead of reading stdout.
+            exit_code = 0
+            stdout_text = ""
+            stderr_text = ""
+            poll_interval = 5
+            while True:
+                await asyncio.sleep(poll_interval)
                 try:
-                    branch_proc = await asyncio.create_subprocess_exec(
-                        "git",
-                        "branch",
-                        "-D",
-                        codex_worktree_branch,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                        cwd=work_dir,
-                    )
-                    await branch_proc.communicate()
+                    resp = await api_client.get(f"/v1/plans/{plan_id}")
+                    if resp.status_code == 200:
+                        plan_data = resp.json()
+                        tasks_list = (
+                            plan_data.get("plan_steps")
+                            or plan_data.get("tasks")
+                            or plan_data.get("plan", {}).get("tasks")
+                            or []
+                        )
+                        for t in tasks_list:
+                            if t.get("id") == task_id:
+                                status = t.get("status", "")
+                                if status in ("completed", "done"):
+                                    break
+                                elif status == "blocked":
+                                    exit_code = 1
+                                    stderr_text = t.get("blocked_reason", "Agent blocked")
+                                    break
+                        else:
+                            poll_interval = min(poll_interval + 2, 15)
+                            continue
+                        break
                 except Exception:
                     pass
-            if collab_active:
-                try:
-                    session_end(collab_session_id)
-                except Exception:
-                    pass
-            return AgentResult(
-                task_id=task_id,
-                task_title=task_title,
-                exit_code=1,
-                stdout="",
-                stderr=str(exc),
-                duration_seconds=time.monotonic() - start,
-            )
+                poll_interval = min(poll_interval + 2, 15)
+
+        else:
+            # Standard subprocess mode — pipe stdout for agent output parsing
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=exec_dir,
+                )
+                stdout_bytes, stderr_bytes = await proc.communicate()
+                exit_code = proc.returncode or 0
+            except Exception as exc:
+                if codex_worktree_path:
+                    await _cleanup_worktree(work_dir, codex_worktree_path)
+                if codex_worktree_branch:
+                    try:
+                        branch_proc = await asyncio.create_subprocess_exec(
+                            "git",
+                            "branch",
+                            "-D",
+                            codex_worktree_branch,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                            cwd=work_dir,
+                        )
+                        await branch_proc.communicate()
+                    except Exception:
+                        pass
+                if collab_active:
+                    try:
+                        session_end(collab_session_id)
+                    except Exception:
+                        pass
+                return AgentResult(
+                    task_id=task_id,
+                    task_title=task_title,
+                    exit_code=1,
+                    stdout="",
+                    stderr=str(exc),
+                    duration_seconds=time.monotonic() - start,
+                )
+
+            stdout_text = (stdout_bytes or b"").decode(errors="replace").strip()
+            stderr_text = (stderr_bytes or b"").decode(errors="replace").strip()
 
         duration = time.monotonic() - start
-        stdout_text = (stdout_bytes or b"").decode(errors="replace").strip()
-        stderr_text = (stderr_bytes or b"").decode(errors="replace").strip()
 
         # Parse cost and token data from agent's JSON output (Claude only)
         cost_usd = 0.0
@@ -2876,6 +2934,7 @@ async def _run_parallel(
     run_all: bool,
     dry_run: bool,
     agent: str = "auto",
+    visible: bool = False,
 ) -> None:
     import uuid as _uuid
 
@@ -3019,6 +3078,7 @@ async def _run_parallel(
                     api_client,
                     session_id=session_id,
                     agent=agent,
+                    visible=visible,
                 )
                 for task in actionable
             ]
@@ -5064,6 +5124,13 @@ def _continue_command(
             help="Coding agent to use for prompt-based resume flows: auto, claude, or codex.",
         ),
     ] = "auto",
+    visible: Annotated[
+        bool,
+        typer.Option(
+            "--visible",
+            help="Open agent sessions in visible Conductor terminal tiles.",
+        ),
+    ] = False,
 ):
     """Resume execution of a plan. In the shell this is coordinator mode; in an agent it resumes one task."""
 
@@ -5108,6 +5175,7 @@ def _continue_command(
                 run_all=auto_continue,
                 dry_run=dry_run,
                 agent=resolved_agent,
+                visible=visible,
             )
         )
 
