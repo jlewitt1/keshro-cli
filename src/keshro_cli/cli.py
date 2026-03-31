@@ -2626,21 +2626,37 @@ async def _launch_single_agent(
                 wt_stdout, wt_stderr = await wt_proc.communicate()
                 if wt_proc.returncode != 0:
                     err_msg = (wt_stderr or b"").decode(errors="replace").strip()
+                    blocked_reason = f"Failed to create worktree for Codex: {err_msg}"
+                    await _mark_task_status_async(
+                        api_client,
+                        plan_id,
+                        task_id,
+                        "blocked",
+                        blocked_reason=blocked_reason,
+                    )
                     return AgentResult(
                         task_id=task_id,
                         task_title=task_title,
                         exit_code=1,
                         stdout="",
-                        stderr=f"Failed to create worktree for Codex: {err_msg}",
+                        stderr=blocked_reason,
                         duration_seconds=0,
                     )
             except Exception as exc:
+                blocked_reason = f"Failed to create worktree for Codex: {exc}"
+                await _mark_task_status_async(
+                    api_client,
+                    plan_id,
+                    task_id,
+                    "blocked",
+                    blocked_reason=blocked_reason,
+                )
                 return AgentResult(
                     task_id=task_id,
                     task_title=task_title,
                     exit_code=1,
                     stdout="",
-                    stderr=f"Failed to create worktree for Codex: {exc}",
+                    stderr=blocked_reason,
                     duration_seconds=0,
                 )
 

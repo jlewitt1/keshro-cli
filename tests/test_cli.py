@@ -181,6 +181,80 @@ def test_launch_single_agent_marks_task_blocked_when_codex_merge_fails(monkeypat
     assert not any(update["status"] == "completed" for update in task_updates)
 
 
+def test_launch_single_agent_marks_task_blocked_when_codex_worktree_create_fails(
+    monkeypatch,
+):
+    import asyncio
+
+    class _FakeProc:
+        def __init__(self, returncode=0, stdout=b"", stderr=b""):
+            self.returncode = returncode
+            self._stdout = stdout
+            self._stderr = stderr
+
+        async def communicate(self, _input=None):
+            return self._stdout, self._stderr
+
+    class _FakeAsyncClient:
+        def __init__(self):
+            self.posts = []
+
+        async def post(self, path, json=None):
+            self.posts.append((path, json))
+            return None
+
+    task_updates = []
+
+    async def _fake_mark_task_status_async(
+        client, plan_id, task_id, status, notes=None, blocked_reason=None
+    ):
+        task_updates.append(
+            {
+                "plan_id": plan_id,
+                "task_id": task_id,
+                "status": status,
+                "notes": notes,
+                "blocked_reason": blocked_reason,
+            }
+        )
+
+    async def _fake_git_stdout(*args, cwd):
+        if args[:3] == ("git", "rev-parse", "HEAD"):
+            return "base-rev"
+        return ""
+
+    async def _fake_create_subprocess_exec(*args, **kwargs):
+        if args[:3] == ("git", "worktree", "add"):
+            return _FakeProc(returncode=1, stderr=b"fatal: worktree add failed")
+        raise AssertionError(f"Unexpected subprocess args: {args}")
+
+    monkeypatch.setattr(cli, "_resolve_prompt_agent", lambda agent: ("codex", "codex"))
+    monkeypatch.setattr(
+        cli, "_build_parallel_prompt", lambda plan, task, total_agents, work_dir=None: "prompt"
+    )
+    monkeypatch.setattr(cli, "_mark_task_status_async", _fake_mark_task_status_async)
+    monkeypatch.setattr(cli, "_git_stdout", _fake_git_stdout)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+
+    result = asyncio.run(
+        cli._launch_single_agent(
+            {"id": "task-1", "title": "Test task"},
+            {"id": "plan-1"},
+            "plan-1",
+            "/tmp/project",
+            1,
+            asyncio.Semaphore(1),
+            _FakeAsyncClient(),
+            session_id="session-1",
+            agent="codex",
+        )
+    )
+
+    assert result.exit_code == 1
+    assert any(update["status"] == "blocked" for update in task_updates)
+    assert "worktree add failed" in (task_updates[-1]["blocked_reason"] or "")
+
+
 class _FakeResponse:
     def __init__(self, payload, status_code=200):
         self._payload = payload
