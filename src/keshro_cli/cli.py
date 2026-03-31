@@ -3112,10 +3112,16 @@ def _confirm_implicit_continue_plan(
     if _state.json or not sys.stdout.isatty():
         return resolved_plan_id
     plan_label = _current_plan_label(work_dir=work_dir) or resolved_plan_id
-    confirmed = typer.confirm(
-        f"Continue with plan '{plan_label}' ({resolved_plan_id})?",
-        default=True,
-    )
+    plan_url = f"{_current_app_url()}/plans/{resolved_plan_id}"
+    try:
+        confirmed = typer.confirm(
+            f"Continue with plan '{plan_label}' ({resolved_plan_id})?\n"
+            f"{DIM}Dashboard:{RESET} {CYAN}{plan_url}{RESET}",
+            default=True,
+        )
+    except click.Abort:
+        print()
+        raise SystemExit(0)
     if confirmed:
         return resolved_plan_id
     print(
@@ -7663,6 +7669,9 @@ def main(argv: list[str] | None = None):
     except click.exceptions.UsageError as exc:
         print(f"{RED}Error: {exc.format_message()}{RESET}", file=sys.stderr)
         return 2
+    except (click.Abort, KeyboardInterrupt):
+        print(file=sys.stderr)
+        return 130
     except httpx.HTTPStatusError as exc:
         _print_http_error(exc)
         return 1

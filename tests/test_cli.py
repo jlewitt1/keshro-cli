@@ -4,6 +4,7 @@ import re
 import subprocess
 from pathlib import Path
 
+import click
 import httpx
 import pytest
 
@@ -1527,6 +1528,53 @@ def test_migration_view_shows_detail(fake_client, capsys, monkeypatch):
     assert "Links" in out
     assert "Dashboard:" in out
     assert "Plan dashboard:" not in out
+
+
+def test_confirm_implicit_continue_plan_shows_dashboard_link(monkeypatch):
+    monkeypatch.setattr(cli._state, "json", False)
+    monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr(cli, "_current_plan_label", lambda work_dir=None: "Plan A")
+    monkeypatch.setattr(cli, "_current_app_url", lambda: "http://localhost:3000")
+    captured = {}
+
+    def _confirm(message, default=True):
+        captured["message"] = message
+        return True
+
+    monkeypatch.setattr(cli.typer, "confirm", _confirm)
+
+    assert cli._confirm_implicit_continue_plan("plan-123") == "plan-123"
+    assert "Dashboard:" in captured["message"]
+    assert "http://localhost:3000/plans/plan-123" in captured["message"]
+
+
+def test_confirm_implicit_continue_plan_ctrl_c_exits_cleanly(monkeypatch, capsys):
+    monkeypatch.setattr(cli._state, "json", False)
+    monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr(cli, "_current_plan_label", lambda work_dir=None: "Plan A")
+    monkeypatch.setattr(cli, "_current_app_url", lambda: "http://localhost:3000")
+
+    def _confirm(message, default=True):
+        raise click.Abort()
+
+    monkeypatch.setattr(cli.typer, "confirm", _confirm)
+
+    with pytest.raises(SystemExit) as exc:
+        cli._confirm_implicit_continue_plan("plan-123")
+
+    assert exc.value.code == 0
+    assert capsys.readouterr().out.endswith("\n")
+
+
+def test_main_handles_abort_without_traceback(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli,
+        "app",
+        lambda argv, standalone_mode=False: (_ for _ in ()).throw(click.Abort()),
+    )
+
+    assert cli.main(["continue"]) == 130
+    assert capsys.readouterr().err.endswith("\n")
 
 
 def test_migration_delete_hits_endpoint(fake_client, capsys):
