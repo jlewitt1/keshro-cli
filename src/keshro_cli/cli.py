@@ -166,6 +166,10 @@ def _inside_coding_agent() -> bool:
     return _coding_agent_name() is not None
 
 
+def _interactive_cli_prompts_allowed() -> bool:
+    return not _state.json and sys.stdout.isatty() and not _inside_coding_agent()
+
+
 def _default_agent_preference() -> str:
     value = _clean(load_auth().get("default_agent")).lower()
     return value if value in {"auto", "claude", "codex"} else "auto"
@@ -1049,6 +1053,118 @@ def _parse_field_assignments(values: list[str] | None) -> dict[str, str]:
     return parsed
 
 
+def _format_answer_assignments(answers: dict[str, str]) -> str:
+    parts: list[str] = []
+    for key, value in answers.items():
+        escaped = value.replace('"', '\\"')
+        parts.append(f'--answer {key}="{escaped}"')
+    return " ".join(parts)
+
+
+def _missing_question_ids(questions: list[dict], answers: dict[str, str]) -> list[str]:
+    missing: list[str] = []
+    for index, question in enumerate(questions, 1):
+        question_id = _clean(question.get("id")) or f"q{index}"
+        if not _clean(answers.get(question_id)):
+            missing.append(question_id)
+    return missing
+
+
+def _exit_for_agent_clarifier_feedback(
+    *,
+    heading: str,
+    questions: list[dict],
+    suggested_answers: dict[str, str],
+    rerun_command: str,
+) -> None:
+    if _state.json:
+        print_output(
+            {
+                "status": "needs_input",
+                "heading": heading,
+                "questions": questions,
+                "suggested_answers": suggested_answers,
+                "rerun_command": rerun_command,
+            },
+            True,
+        )
+        raise typer.Exit(0)
+    print(f"\n{YELLOW}{heading}{RESET}")
+    print(
+        f"{DIM}Ask the user these follow-up questions conversationally, then rerun the command with --answer question_id=value.{RESET}"
+    )
+    for index, question in enumerate(questions, 1):
+        question_id = _clean(question.get("id")) or f"q{index}"
+        prompt_text = _clean(question.get("question")) or question_id
+        why = _clean(question.get("why_this_matters"))
+        print(f"\n  {CYAN}{index}.{RESET} {prompt_text}")
+        print(f"     {DIM}id: {question_id}{RESET}")
+        if why:
+            print(f"     {DIM}{why}{RESET}")
+        suggested = _clean(suggested_answers.get(question_id))
+        options = list(question.get("answers") or [])
+        if options:
+            for option_index, option in enumerate(options, 1):
+                title = _clean(option.get("answer_title")) or _clean(
+                    option.get("value")
+                )
+                rec = _format_recommended_suffix(title, bool(option.get("recommended")))
+                marker = " (suggested)" if suggested and suggested == _clean(
+                    option.get("value")
+                ) else ""
+                print(f"     {DIM}{option_index}. {title}{rec}{marker}{RESET}")
+        elif suggested:
+            print(f"     {DIM}Suggested answer: {suggested}{RESET}")
+    print(f"\n{DIM}Then rerun:{RESET}")
+    print(f"  {CYAN}{rerun_command}{RESET}")
+    raise typer.Exit(0)
+
+
+def _exit_for_agent_migration_confirmation(
+    *,
+    source_tech: str,
+    target_tech: str,
+    template_key: str | None,
+    context: str,
+    agent: str,
+) -> None:
+    migration_command = (
+        f"keshro create --path {shlex.quote(template_key)} --context {shlex.quote(context)}"
+        if template_key
+        else f"keshro create --as-migration --context {shlex.quote(context)}"
+    )
+    general_command = f"keshro create --context {shlex.quote(context)}"
+    if agent != "auto":
+        migration_command += f" --agent {shlex.quote(agent)}"
+        general_command += f" --agent {shlex.quote(agent)}"
+    if _state.json:
+        print_output(
+            {
+                "status": "needs_input",
+                "kind": "migration_confirmation",
+                "question": f"This looks like a migration ({source_tech} -> {target_tech}). Should Keshro treat it as a migration or a general project?",
+                "recommended": "migration",
+                "options": [
+                    {"id": "migration", "label": "Treat as migration", "rerun_command": migration_command},
+                    {"id": "general", "label": "Treat as a general project", "rerun_command": general_command},
+                ],
+            },
+            True,
+        )
+        raise typer.Exit(0)
+    print(
+        f"\n{YELLOW}This looks like a migration ({source_tech} -> {target_tech}). Keshro needs user confirmation before continuing.{RESET}"
+    )
+    print(
+        f"{DIM}Ask the user whether to treat it as a migration or a general project, then rerun one of these commands.{RESET}"
+    )
+    print(f"\n  1. {CYAN}Treat as migration{RESET} {GREEN}(recommended){RESET}")
+    print(f"     {DIM}{migration_command}{RESET}")
+    print(f"\n  2. {CYAN}Treat as a general project{RESET}")
+    print(f"     {DIM}{general_command}{RESET}")
+    raise typer.Exit(0)
+
+
 def _normalize_prompt_key(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", _clean(value).lower()).strip()
 
@@ -1504,7 +1620,7 @@ def _collect_clarifier_answers_from_claude(
 def _prompt_for_migration_template_fields(
     template: dict, answers: dict[str, str]
 ) -> dict[str, str]:
-    if _state.json or not sys.stdout.isatty():
+    if not _interactive_cli_prompts_allowed():
         return answers
     prompted = dict(answers)
     fields = list(template.get("fields") or [])
@@ -1663,7 +1779,7 @@ def _prompt_for_clarifying_questions(
     heading: str = "Clarifying questions",
     intro: str = "press Enter to keep the suggested answer",
 ) -> dict[str, str]:
-    if _state.json or not sys.stdout.isatty() or not questions:
+    if not _interactive_cli_prompts_allowed() or not questions:
         return suggested_answers
     answers = dict(suggested_answers)
     print(f"\n{CYAN}{heading}{RESET} {DIM}({intro}){RESET}")
@@ -1723,6 +1839,12 @@ def _review_agent_suggested_answers(
         return {}
     if _state.json:
         return suggested_answers
+    if _inside_coding_agent():
+        if not _state.json:
+            print(
+                f"{DIM}Using agent-suggested answers for this agent-driven flow. Review and adjust in the dashboard if needed.{RESET}"
+            )
+        return suggested_answers
     if sys.stdout.isatty():
         return _prompt_for_clarifying_questions(
             questions,
@@ -1734,7 +1856,7 @@ def _review_agent_suggested_answers(
 
 
 def _prompt_for_optional_cli_context(subject: str, context: str | None) -> str | None:
-    if _state.json or not sys.stdout.isatty():
+    if not _interactive_cli_prompts_allowed():
         return context
     existing = _clean(context)
     print(
@@ -3953,10 +4075,30 @@ def _find_migration_template(source: str, target: str) -> str | None:
                     break
             cleaned = cleaned.replace("&", " and ")
             cleaned = re.sub(r"[^a-z0-9]+", " ", cleaned).strip()
-            synonyms = {
-                "mwaa": "airflow",
-            }
-            return synonyms.get(cleaned, cleaned)
+            return " ".join(token for token in cleaned.split() if token)
+
+        def _name_variants(value: str) -> list[str]:
+            raw = _clean(value)
+            if not raw:
+                return []
+            variants: list[str] = []
+
+            def _add_variant(candidate: str) -> None:
+                normalized = _normalize_name(candidate)
+                if normalized and normalized not in variants:
+                    variants.append(normalized)
+
+            _add_variant(raw)
+            without_parens = _re.sub(r"\([^)]*\)", " ", raw)
+            _add_variant(without_parens)
+            before_dash = _re.split(r"\s[-:/]\s", raw, maxsplit=1)[0]
+            _add_variant(before_dash)
+            return variants
+
+        def _matches_name(left: str, right: str) -> bool:
+            left_variants = _name_variants(left)
+            right_variants = _name_variants(right)
+            return any(lv == rv for lv in left_variants for rv in right_variants)
 
         def _slug(v: str) -> str:
             return _re.sub(r"[^a-z0-9]+", "-", v.strip().lower()).strip("-")
@@ -3969,15 +4111,10 @@ def _find_migration_template(source: str, target: str) -> str | None:
             if res.status_code == 200:
                 templates = res.json() or []
                 for template in templates:
-                    template_source = _normalize_name(
-                        str(template.get("source_type") or "")
-                    )
-                    template_target = _normalize_name(
-                        str(template.get("target_type") or "")
-                    )
-                    if (
-                        template_source == desired_source
-                        and template_target == desired_target
+                    template_source = str(template.get("source_type") or "")
+                    template_target = str(template.get("target_type") or "")
+                    if _matches_name(template_source, source) and _matches_name(
+                        template_target, target
                     ):
                         key = _clean(template.get("key"))
                         if key:
@@ -4113,6 +4250,14 @@ def _create_migration(
             help="Set a template field as field_id=value. Repeat for multiple fields.",
         ),
     ] = None,
+    answer: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            "--answer",
+            "-a",
+            help="Set a clarifier answer as question_id=value. Repeat for multiple answers.",
+        ),
+    ] = None,
     context: Annotated[
         Optional[str], typer.Option("--context", "-c", help="Additional context.")
     ] = None,
@@ -4235,6 +4380,7 @@ def _create_migration(
         work_dir = clone_dir
 
     try:
+        provided_clarifier_answers = _parse_field_assignments(answer)
         context_entered_interactively = False
         if path:
             if not _state.json:
@@ -4249,6 +4395,7 @@ def _create_migration(
                 resource_url,
                 org_id,
                 work_dir,
+                clarifier_answers=provided_clarifier_answers,
                 skip_questions=skip_questions,
                 prompt_for_context=not bool(context and context.strip()),
                 agent=agent,
@@ -4347,6 +4494,7 @@ def _create_migration(
                     resource_url,
                     org_id,
                     work_dir,
+                    clarifier_answers=provided_clarifier_answers,
                     skip_questions=skip_questions,
                     prompt_for_context=not context_entered_interactively,
                     agent=agent,
@@ -4360,6 +4508,15 @@ def _create_migration(
                     detected_driver = None
                 else:
                     source_tech, target_tech, detected_driver = migration_match
+                if _inside_coding_agent():
+                    template_key = _find_migration_template(source_tech, target_tech)
+                    _exit_for_agent_migration_confirmation(
+                        source_tech=source_tech,
+                        target_tech=target_tech,
+                        template_key=template_key,
+                        context=context or description,
+                        agent=agent,
+                    )
                 if not _state.json:
                     print(
                         f"\n{CYAN}This looks like a migration ({source_tech} → {target_tech}).{RESET}"
@@ -4404,6 +4561,7 @@ def _create_migration(
                                 resource_url,
                                 org_id,
                                 work_dir,
+                                clarifier_answers=provided_clarifier_answers,
                                 skip_questions=skip_questions,
                                 prompt_for_context=not context_entered_interactively,
                                 agent=agent,
@@ -4448,28 +4606,42 @@ def _create_migration(
                         print(f"{YELLOW}Could not generate questions: {exc}{RESET}")
 
             # Step 3: Have the coding agent suggest answers, then review them with the user
-            answered: dict[str, str] = {}
+            answered: dict[str, str] = dict(provided_clarifier_answers)
             if questions and _inside_coding_agent():
-                if not _state.json:
+                missing_ids = _missing_question_ids(questions, answered)
+                suggested_answers: dict[str, str] = {}
+                if missing_ids and not _state.json:
                     print(
                         f"{CYAN}Asking AI agent to suggest answers for {len(questions)} clarifying questions...{RESET}"
                     )
-                suggested_answers = _answer_questions_via_agent(
-                    questions,
-                    description,
-                    discovered_context,
-                    resolved_work_dir,
-                    agent=agent,
-                )
-                answered = _review_agent_suggested_answers(
-                    questions,
-                    suggested_answers,
-                    heading="Clarifying questions",
-                    non_interactive_notice=(
-                        "Non-interactive agent session detected; suggested clarifier answers were not auto-applied. "
-                        "Re-run interactively or use the direct CLI if you want to review them before plan generation."
-                    ),
-                )
+                if missing_ids:
+                    suggested_answers = _answer_questions_via_agent(
+                        questions,
+                        description,
+                        discovered_context,
+                        resolved_work_dir,
+                        agent=agent,
+                    )
+                if missing_ids:
+                    suggested_for_missing = {
+                        key: value
+                        for key, value in suggested_answers.items()
+                        if key in missing_ids
+                    }
+                    rerun_command = f"keshro create --context {shlex.quote(context or description)}"
+                    if agent != "auto":
+                        rerun_command += f" --agent {shlex.quote(agent)}"
+                    answer_flags = _format_answer_assignments(
+                        {**answered, **suggested_for_missing}
+                    )
+                    if answer_flags:
+                        rerun_command += f" {answer_flags}"
+                    _exit_for_agent_clarifier_feedback(
+                        heading="Keshro needs user answers before it can generate this plan.",
+                        questions=questions,
+                        suggested_answers={**answered, **suggested_answers},
+                        rerun_command=rerun_command,
+                    )
                 if not _state.json:
                     suggested_count = sum(
                         1
@@ -4695,6 +4867,7 @@ def _create_migration_inner(
     resource_url: str | None,
     org_id: str | None,
     work_dir: str | None,
+    clarifier_answers: dict[str, str] | None = None,
     skip_questions: bool = False,
     prompt_for_context: bool = True,
     agent: str = "auto",
@@ -4793,32 +4966,50 @@ def _create_migration_inner(
                 clarifier_questions = _get_migration_clarifiers(client, payload)
             if clarifier_questions:
                 suggested_answers: dict[str, str] = {}
-                if _inside_coding_agent():
-                    with _Spinner(
-                        "Collecting suggested follow-up answers (this can take a bit)..."
-                    ):
-                        suggested_answers = _collect_clarifier_answers_from_claude(
-                            template,
-                            payload,
-                            clarifier_questions,
-                            work_dir=resolved_work_dir,
-                            agent=agent,
-                        )
-                    clarifier_answers = _review_agent_suggested_answers(
-                        clarifier_questions,
-                        suggested_answers,
-                        heading="Follow-up questions",
-                        non_interactive_notice=(
-                            "Non-interactive agent session detected; suggested follow-up answers were not auto-applied. "
-                            "Re-run interactively or use the direct CLI if you want to review them before the migration is created."
-                        ),
+                provided_clarifier_answers = dict(clarifier_answers or {})
+                if provided_clarifier_answers:
+                    missing_ids = _missing_question_ids(
+                        clarifier_questions, provided_clarifier_answers
                     )
+                    if missing_ids:
+                        raise SystemExit(
+                            "Missing --answer values for: " + ", ".join(missing_ids)
+                        )
+                if _inside_coding_agent():
+                    if not provided_clarifier_answers:
+                        with _Spinner(
+                            "Collecting suggested follow-up answers (this can take a bit)..."
+                        ):
+                            suggested_answers = _collect_clarifier_answers_from_claude(
+                                template,
+                                payload,
+                                clarifier_questions,
+                                work_dir=resolved_work_dir,
+                                agent=agent,
+                            )
+                    if not provided_clarifier_answers:
+                        rerun_command = (
+                            f"keshro create --path {shlex.quote(path)}"
+                            f" --context {shlex.quote(context or '')}"
+                        ).rstrip()
+                        if agent != "auto":
+                            rerun_command += f" --agent {shlex.quote(agent)}"
+                        answer_flags = _format_answer_assignments(suggested_answers)
+                        if answer_flags:
+                            rerun_command += f" {answer_flags}"
+                        _exit_for_agent_clarifier_feedback(
+                            heading="Keshro needs user answers before it can create this migration.",
+                            questions=clarifier_questions,
+                            suggested_answers=suggested_answers,
+                            rerun_command=rerun_command,
+                        )
+                    resolved_clarifier_answers = provided_clarifier_answers
                 else:
-                    clarifier_answers = _prompt_for_migration_clarifiers(
+                    resolved_clarifier_answers = _prompt_for_migration_clarifiers(
                         clarifier_questions, suggested_answers
                     )
                 payload = _merge_clarifier_answers(
-                    payload, clarifier_questions, clarifier_answers
+                    payload, clarifier_questions, resolved_clarifier_answers
                 )
             elif not _state.json:
                 print("No additional follow-up questions needed.")
