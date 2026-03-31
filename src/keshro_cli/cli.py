@@ -31,6 +31,8 @@ GREEN = "\033[32m"
 YELLOW = "\033[33m"
 RED = "\033[31m"
 
+_codex_merge_lock = asyncio.Lock()
+
 
 # ---------------------------------------------------------------------------
 # Global state – populated by the app callback before any subcommand runs
@@ -2532,21 +2534,22 @@ async def _merge_codex_worktree_changes(
         )
     if not patch_bytes:
         return
-    proc = await asyncio.create_subprocess_exec(
-        "git",
-        "apply",
-        "--3way",
-        "-",
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=repo_dir,
-    )
-    _stdout, stderr = await proc.communicate(patch_bytes)
-    if proc.returncode != 0:
-        raise RuntimeError(
-            (stderr or b"").decode(errors="replace").strip() or "failed to apply Codex worktree patch"
+    async with _codex_merge_lock:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "apply",
+            "--3way",
+            "-",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=repo_dir,
         )
+        _stdout, stderr = await proc.communicate(patch_bytes)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                (stderr or b"").decode(errors="replace").strip() or "failed to apply Codex worktree patch"
+            )
 
 
 async def _launch_single_agent(
@@ -2725,18 +2728,19 @@ async def _launch_single_agent(
             except Exception:
                 pass
 
+        if exit_code == 0 and codex_worktree_path and codex_worktree_base_rev:
+            try:
+                await _merge_codex_worktree_changes(
+                    work_dir,
+                    codex_worktree_path,
+                    codex_worktree_base_rev,
+                    task_id,
+                )
+            except Exception as exc:
+                exit_code = 1
+                stderr_text = str(exc)
+
         if exit_code == 0:
-            if codex_worktree_path and codex_worktree_base_rev:
-                try:
-                    await _merge_codex_worktree_changes(
-                        work_dir,
-                        codex_worktree_path,
-                        codex_worktree_base_rev,
-                        task_id,
-                    )
-                except Exception as exc:
-                    exit_code = 1
-                    stderr_text = str(exc)
             # Build a detailed completion note
             cost_parts = [f"{duration:.0f}s"]
             if tokens_used > 0:
