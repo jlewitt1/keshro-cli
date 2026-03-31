@@ -3850,7 +3850,11 @@ def _create_migration(
             # Detect migration intent and offer the migration pipeline
             migration_match = _detect_migration_intent(description)
             if migration_match and not path:
-                source_tech, target_tech, detected_driver = migration_match
+                if len(migration_match) == 2:
+                    source_tech, target_tech = migration_match
+                    detected_driver = None
+                else:
+                    source_tech, target_tech, detected_driver = migration_match
                 if sys.stdout.isatty() and not _state.json:
                     print(
                         f"\n{CYAN}This looks like a migration ({source_tech} → {target_tech}).{RESET}"
