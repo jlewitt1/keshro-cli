@@ -3377,13 +3377,34 @@ def _confirm_implicit_continue_plan(
         raise SystemExit(0)
     if not override:
         raise SystemExit(0)
-    override_plan_id, override_title = _resolve_plan_or_migration_context(override)
+    override_plan_id, override_title = _resolve_continue_override_context(override)
     if not override_plan_id:
         raise SystemExit(0)
     if not _state.json:
         label = override_title or override_plan_id
         print(f"{DIM}Using:{RESET} {label} ({override_plan_id})")
     return override_plan_id
+
+
+def _resolve_continue_override_context(value: str | None) -> tuple[str | None, str | None]:
+    explicit_id = _clean(value)
+    if not explicit_id:
+        return None, None
+    with make_client(_state.api_url, _state.token) as client:
+        plan_res = client.get(f"/v1/plans/{explicit_id}")
+        if plan_res.status_code < 400:
+            plan = plan_res.json()
+            return explicit_id, _clean(plan.get("title")) or explicit_id
+
+        migration_plan_res = client.get(f"/v1/migrations/{explicit_id}/plan")
+        if migration_plan_res.status_code < 400:
+            plan = migration_plan_res.json()
+            plan_id = _clean(plan.get("id")) or explicit_id
+            return plan_id, _clean(plan.get("title")) or plan_id
+
+    raise SystemExit(
+        f"Could not resolve '{explicit_id}' to a plan or migration-linked plan."
+    )
 
 
 def _view_task(plan_id: str | None, task_id: str) -> None:
