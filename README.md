@@ -8,11 +8,11 @@ pip install keshro
 
 ```bash
 keshro login              # opens browser to authenticate
-keshro create             # scan project, generate plan
+keshro create             # scan project, create the right migration/project
 keshro continue           # agents execute in parallel if possible
 ```
 
-Keshro is built for migrations first. It scans the repo, asks the follow-up questions that actually matter for the migration, generates a migration-aware execution plan, then coordinates agents to execute it safely.
+Keshro is built for migrations first. It scans the repo, asks the follow-up questions that actually matter for the migration, creates the right migration or project, then coordinates agents to execute it safely.
 
 Works with your existing coding agent. Use Claude Code or Codex for planning, migration intake, and parallel execution.
 
@@ -24,18 +24,20 @@ Examples:
 - Apache Iceberg -> ClickHouse
 
 What Keshro does:
-1. Builds a migration-aware plan with risks, open questions, task ordering, and acceptance criteria
+1. Builds a migration-aware execution context with risks, open questions, task ordering, and acceptance criteria
 2. Runs agents in parallel in isolated git worktrees
 3. Carries learnings from one task into related future tasks
 4. Tracks progress, decisions, and rollback points through execution
 
-## Create a migration
+## Create a migration or project
 
 ```bash
 keshro create
 ```
 
-Keshro scans the project, asks follow-up questions, and creates a migration with analysis, risks, open questions, and a linked execution plan.
+Keshro scans the project, detects whether this is a migration, asks the follow-up questions that matter, and creates the right migration or project with a linked execution context.
+
+If Keshro stops to ask follow-up questions in `/keshro` or another agent session, surface those questions back to the user and resume with the generated `--answers-file` command instead of building a giant shell command by hand.
 
 ## Execute
 
@@ -44,6 +46,8 @@ Keshro drives the full execution loop — picks up the next task, gives the agen
 ```bash
 keshro continue
 ```
+
+By default, `keshro continue` runs the next ready wave in parallel when the environment supports it. Use `--no-parallel` only when you explicitly want one task at a time.
 
 ## Monitor
 
@@ -57,7 +61,7 @@ Planning, execution, and parallel mode work with [Claude Code](https://claude.ai
 
 Cursor is supported for in-editor context via `.cursorrules` (`keshro setup-cursor`), but does not have a headless CLI, so it cannot be used as an execution agent.
 
-Keshro can also create general execution plans from repos, issues, and freeform descriptions, but the primary workflow is migrations.
+Keshro can also create general projects from repos, issues, and freeform descriptions, but the primary workflow is migrations.
 
 ## License
 

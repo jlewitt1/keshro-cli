@@ -56,13 +56,13 @@ _state = _State()
 
 app = typer.Typer(add_completion=False, no_args_is_help=False)
 auth_app = typer.Typer(help="Authentication")
-plan_app = typer.Typer(help="Plan management")
+plan_app = typer.Typer(help="Advanced plan internals")
 task_app = typer.Typer(help="Task management")
 migration_app = typer.Typer(help="Migration project management")
 config_app = typer.Typer(help="Configuration", invoke_without_command=True)
 plan_task_app = typer.Typer(help="Plan task management")
 
-app.add_typer(plan_app, name="plan")
+app.add_typer(plan_app, name="plan", hidden=True)
 app.add_typer(task_app, name="task")
 app.add_typer(migration_app, name="migration")
 app.add_typer(config_app, name="config")
@@ -164,6 +164,10 @@ def _coding_agent_name() -> str | None:
 
 def _inside_coding_agent() -> bool:
     return _coding_agent_name() is not None
+
+
+def _interactive_cli_prompts_allowed() -> bool:
+    return not _state.json and sys.stdout.isatty() and not _inside_coding_agent()
 
 
 def _default_agent_preference() -> str:
@@ -423,6 +427,18 @@ def _execution_context_arg(plan: dict | None = None, plan_id: str | None = None)
     return _clean(plan_id) or _clean((plan or {}).get("id")) or ""
 
 
+def _execution_dashboard_url(plan: dict | None = None, plan_id: str | None = None) -> str:
+    migration_id = _clean((plan or {}).get("migration_id"))
+    if migration_id:
+        return f"{_current_app_url()}/migrations/{migration_id}"
+    resolved_plan_id = _clean(plan_id) or _clean((plan or {}).get("id"))
+    return f"{_current_app_url()}/plans/{resolved_plan_id}" if resolved_plan_id else ""
+
+
+def _execution_context_label(plan: dict | None = None) -> str:
+    return "migration" if _clean((plan or {}).get("migration_id")) else "project"
+
+
 def _set_default_plan_after_create(plan: dict, *, announce: bool = True) -> None:
     if _state.json:
         return
@@ -436,7 +452,7 @@ def _set_default_plan_after_create(plan: dict, *, announce: bool = True) -> None
     update_auth({"default_plan_id": plan_id, "default_plan_title": plan_title})
     _link_current_repo_to_plan(plan_id, plan_title=plan_title)
     if announce:
-        print(f"Saved default plan: {plan_title}")
+        print(f"Saved default execution context: {plan_title}")
 
 
 def _resolve_plan_context(plan_id: str | None) -> tuple[str | None, str | None]:
@@ -1049,6 +1065,167 @@ def _parse_field_assignments(values: list[str] | None) -> dict[str, str]:
     return parsed
 
 
+def _load_answer_file(path: str | None) -> dict[str, str]:
+    raw_path = _clean(path)
+    if not raw_path:
+        return {}
+    try:
+        payload = json.loads(Path(raw_path).read_text())
+    except OSError as exc:
+        raise SystemExit(f"Could not read --answers-file {raw_path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise SystemExit(
+            f"Invalid JSON in --answers-file {raw_path}: {exc}"
+        ) from exc
+    if isinstance(payload, dict) and isinstance(payload.get("answers"), dict):
+        source = payload["answers"]
+    elif isinstance(payload, dict):
+        source = payload
+    else:
+        raise SystemExit(
+            f"Invalid --answers-file {raw_path}: expected a JSON object of question_id -> answer."
+        )
+    parsed: dict[str, str] = {}
+    for key, value in source.items():
+        question_id = _clean(str(key))
+        answer_value = _clean(str(value))
+        if question_id and answer_value:
+            parsed[question_id] = answer_value
+    return parsed
+
+
+def _write_agent_answers_file(
+    *,
+    heading: str,
+    questions: list[dict],
+    suggested_answers: dict[str, str],
+) -> str:
+    import tempfile
+
+    payload = {
+        "heading": heading,
+        "answers": suggested_answers,
+        "questions": questions,
+    }
+    fd, path = tempfile.mkstemp(prefix="keshro-answers-", suffix=".json")
+    with os.fdopen(fd, "w") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+    return path
+
+
+def _missing_question_ids(questions: list[dict], answers: dict[str, str]) -> list[str]:
+    missing: list[str] = []
+    for index, question in enumerate(questions, 1):
+        question_id = _clean(question.get("id")) or f"q{index}"
+        if not _clean(answers.get(question_id)):
+            missing.append(question_id)
+    return missing
+
+
+def _exit_for_agent_clarifier_feedback(
+    *,
+    heading: str,
+    questions: list[dict],
+    suggested_answers: dict[str, str],
+    rerun_command: str,
+) -> None:
+    answers_file = _write_agent_answers_file(
+        heading=heading,
+        questions=questions,
+        suggested_answers=suggested_answers,
+    )
+    rerun_command = f"{rerun_command} --answers-file {shlex.quote(answers_file)}"
+    if _state.json:
+        print_output(
+            {
+                "status": "needs_input",
+                "heading": heading,
+                "questions": questions,
+                "suggested_answers": suggested_answers,
+                "answers_file": answers_file,
+                "rerun_command": rerun_command,
+            },
+            True,
+        )
+        raise typer.Exit(0)
+    print(f"\n{YELLOW}{heading}{RESET}")
+    print(
+        f"{DIM}Ask the user these follow-up questions conversationally, update the generated answers file, then rerun the command.{RESET}"
+    )
+    for index, question in enumerate(questions, 1):
+        question_id = _clean(question.get("id")) or f"q{index}"
+        prompt_text = _clean(question.get("question")) or question_id
+        why = _clean(question.get("why_this_matters"))
+        print(f"\n  {CYAN}{index}.{RESET} {prompt_text}")
+        print(f"     {DIM}id: {question_id}{RESET}")
+        if why:
+            print(f"     {DIM}{why}{RESET}")
+        suggested = _clean(suggested_answers.get(question_id))
+        options = list(question.get("answers") or [])
+        if options:
+            for option_index, option in enumerate(options, 1):
+                title = _clean(option.get("answer_title")) or _clean(
+                    option.get("value")
+                )
+                rec = _format_recommended_suffix(title, bool(option.get("recommended")))
+                marker = " (suggested)" if suggested and suggested == _clean(
+                    option.get("value")
+                ) else ""
+                print(f"     {DIM}{option_index}. {title}{rec}{marker}{RESET}")
+        elif suggested:
+            print(f"     {DIM}Suggested answer: {suggested}{RESET}")
+    print(f"\n{DIM}Answers file:{RESET} {CYAN}{answers_file}{RESET}")
+    print(f"{DIM}Then rerun:{RESET}")
+    print(f"  {CYAN}{rerun_command}{RESET}")
+    raise typer.Exit(0)
+
+
+def _exit_for_agent_migration_confirmation(
+    *,
+    source_tech: str,
+    target_tech: str,
+    template_key: str | None,
+    context: str,
+    agent: str,
+) -> None:
+    migration_command = (
+        f"keshro create --path {shlex.quote(template_key)} --context {shlex.quote(context)}"
+        if template_key
+        else f"keshro create --as-migration --context {shlex.quote(context)}"
+    )
+    general_command = f"keshro create --context {shlex.quote(context)}"
+    if agent != "auto":
+        migration_command += f" --agent {shlex.quote(agent)}"
+        general_command += f" --agent {shlex.quote(agent)}"
+    if _state.json:
+        print_output(
+            {
+                "status": "needs_input",
+                "kind": "migration_confirmation",
+                "question": f"This looks like a migration ({source_tech} -> {target_tech}). Should Keshro treat it as a migration or a general project?",
+                "recommended": "migration",
+                "options": [
+                    {"id": "migration", "label": "Treat as migration", "rerun_command": migration_command},
+                    {"id": "general", "label": "Treat as a general project", "rerun_command": general_command},
+                ],
+            },
+            True,
+        )
+        raise typer.Exit(0)
+    print(
+        f"\n{YELLOW}This looks like a migration ({source_tech} -> {target_tech}). Keshro needs user confirmation before continuing.{RESET}"
+    )
+    print(
+        f"{DIM}Ask the user whether to treat it as a migration or a general project, then rerun one of these commands.{RESET}"
+    )
+    print(f"\n  1. {CYAN}Treat as migration{RESET} {GREEN}(recommended){RESET}")
+    print(f"     {DIM}{migration_command}{RESET}")
+    print(f"\n  2. {CYAN}Treat as a general project{RESET}")
+    print(f"     {DIM}{general_command}{RESET}")
+    raise typer.Exit(0)
+
+
 def _normalize_prompt_key(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", _clean(value).lower()).strip()
 
@@ -1501,10 +1678,16 @@ def _collect_clarifier_answers_from_claude(
     return answers
 
 
+def _print_agent_collection_warning(message: str) -> None:
+    if _state.json:
+        return
+    print(f"{YELLOW}{message}{RESET}")
+
+
 def _prompt_for_migration_template_fields(
     template: dict, answers: dict[str, str]
 ) -> dict[str, str]:
-    if _state.json or not sys.stdout.isatty():
+    if not _interactive_cli_prompts_allowed():
         return answers
     prompted = dict(answers)
     fields = list(template.get("fields") or [])
@@ -1649,17 +1832,30 @@ def _current_app_url() -> str:
 def _prompt_for_migration_clarifiers(
     questions: list[dict], suggested_answers: dict[str, str]
 ) -> dict[str, str]:
-    if _state.json or not sys.stdout.isatty() or not questions:
+    return _prompt_for_clarifying_questions(
+        questions,
+        suggested_answers,
+        heading="Follow-up questions",
+    )
+
+
+def _prompt_for_clarifying_questions(
+    questions: list[dict],
+    suggested_answers: dict[str, str],
+    *,
+    heading: str = "Clarifying questions",
+    intro: str = "press Enter to keep the suggested answer",
+) -> dict[str, str]:
+    if not _interactive_cli_prompts_allowed() or not questions:
         return suggested_answers
     answers = dict(suggested_answers)
-    print(
-        f"\n{CYAN}Follow-up questions{RESET} {DIM}(press Enter to keep the suggested answer){RESET}"
-    )
+    print(f"\n{CYAN}{heading}{RESET} {DIM}({intro}){RESET}")
     for index, question in enumerate(questions, 1):
         question_id = _clean(question.get("id")) or f"q{index}"
         prompt_text = _clean(question.get("question")) or question_id
         why = _clean(question.get("why_this_matters"))
         options = list(question.get("answers") or [])
+        placeholder = _clean(question.get("placeholder"))
         current_value = _clean(answers.get(question_id))
         print(f"\n  {CYAN}{index}.{RESET} {prompt_text}")
         if why:
@@ -1673,6 +1869,8 @@ def _prompt_for_migration_clarifiers(
                 marker = " (suggested)" if value and value == current_value else ""
                 rec = _format_recommended_suffix(title, bool(option.get("recommended")))
                 print(f"     {DIM}{option_index}. {title}{rec}{marker}{RESET}")
+        elif placeholder:
+            print(f"     {DIM}Hint: {placeholder}{RESET}")
         prompt_label = "  keep or enter answer"
         if current_value:
             prompt_label += f" [{current_value}]"
@@ -1697,8 +1895,35 @@ def _prompt_for_migration_clarifiers(
     return answers
 
 
+def _review_agent_suggested_answers(
+    questions: list[dict],
+    suggested_answers: dict[str, str],
+    *,
+    heading: str,
+    non_interactive_notice: str,
+) -> dict[str, str]:
+    if not questions:
+        return {}
+    if _state.json:
+        return suggested_answers
+    if _inside_coding_agent():
+        if not _state.json:
+            print(
+                f"{DIM}Using agent-suggested answers for this agent-driven flow. Review and adjust in the dashboard if needed.{RESET}"
+            )
+        return suggested_answers
+    if sys.stdout.isatty():
+        return _prompt_for_clarifying_questions(
+            questions,
+            suggested_answers,
+            heading=heading,
+        )
+    print(f"{YELLOW}{non_interactive_notice}{RESET}")
+    return {}
+
+
 def _prompt_for_optional_cli_context(subject: str, context: str | None) -> str | None:
-    if _state.json or not sys.stdout.isatty():
+    if not _interactive_cli_prompts_allowed():
         return context
     existing = _clean(context)
     print(
@@ -1820,7 +2045,7 @@ def _build_cli_agent_skill_text(
 
 IMPORTANT: Use `keshro` CLI commands to interact with Keshro. Do NOT use Keshro MCP tools — always use the CLI in your terminal instead.
 
-The current task and plan context are provided below. Do not re-fetch them with `keshro plan view` or `keshro task next` — start working directly.
+The current task and execution context are provided below. Do not re-fetch them before you start working — start directly from the task details provided here.
 
 Style:
 - Be concise. Do not narrate your thought process — just do the work and report what you did.
@@ -1836,7 +2061,6 @@ During execution:
 - use `keshro task block <task-id> -p {resolved_plan_id} -r "..."` the moment a real blocker appears that prevents further progress on the task
 - if an external system is unavailable but you can still continue from local code, checked-in config, or documented context, record that in a note instead of blocking the task
 - use `keshro task unblock <task-id> -p {resolved_plan_id}` when that blocker is cleared
-- use `keshro plan replan-notes {resolved_plan_id} "..."` only when the plan itself changed materially
 
 When a task is done:
 - record a concise completion note. It must include `Acceptance criteria met:` and `Verification:`. Add `Next task should know:` only when it helps the next task.
@@ -1857,7 +2081,6 @@ Rules:
 - Do not silently work around blockers or plan drift.
 - Do not assume Keshro is current unless you updated it.
 - If asked how to monitor progress, point to `keshro status -p {resolved_plan_id} --watch` or `keshro status -p {resolved_plan_id} --tui`.
-- If you need the full plan for context, use `keshro plan view {resolved_plan_id}`.
 - If you need more detail on any task, use `keshro task view <task-id> -p {resolved_plan_id}`."""
 
 
@@ -1961,7 +2184,7 @@ def _build_continue_brief(
             "Execution reminders:",
             f'- Start work with: `keshro task start {task_id} -p {resolved_plan_id} --reason "session:{session_id}"`',
             f'- Record concise progress notes with: `keshro task note {task_id} -p {resolved_plan_id} -n "..."`',
-            "- The current task and plan context are already included below. Do not re-fetch them with `keshro plan view` or `keshro task next` before you start working.",
+            "- The current task and execution context are already included below. Do not re-fetch them before you start working.",
             "- Only mark the task blocked if work cannot continue. If local sources let you proceed, note the limitation instead.",
             "- If a keshro command fails with a connection error, retry once after 5 seconds. For any other error, say what happened and keep working unless the failure blocks the task.",
             "- Before `keshro task done`, include `Acceptance criteria met:` and `Verification:` in the completion note.",
@@ -3919,10 +4142,30 @@ def _find_migration_template(source: str, target: str) -> str | None:
                     break
             cleaned = cleaned.replace("&", " and ")
             cleaned = re.sub(r"[^a-z0-9]+", " ", cleaned).strip()
-            synonyms = {
-                "mwaa": "airflow",
-            }
-            return synonyms.get(cleaned, cleaned)
+            return " ".join(token for token in cleaned.split() if token)
+
+        def _name_variants(value: str) -> list[str]:
+            raw = _clean(value)
+            if not raw:
+                return []
+            variants: list[str] = []
+
+            def _add_variant(candidate: str) -> None:
+                normalized = _normalize_name(candidate)
+                if normalized and normalized not in variants:
+                    variants.append(normalized)
+
+            _add_variant(raw)
+            without_parens = _re.sub(r"\([^)]*\)", " ", raw)
+            _add_variant(without_parens)
+            before_dash = _re.split(r"\s[-:/]\s", raw, maxsplit=1)[0]
+            _add_variant(before_dash)
+            return variants
+
+        def _matches_name(left: str, right: str) -> bool:
+            left_variants = _name_variants(left)
+            right_variants = _name_variants(right)
+            return any(lv == rv for lv in left_variants for rv in right_variants)
 
         def _slug(v: str) -> str:
             return _re.sub(r"[^a-z0-9]+", "-", v.strip().lower()).strip("-")
@@ -3935,15 +4178,10 @@ def _find_migration_template(source: str, target: str) -> str | None:
             if res.status_code == 200:
                 templates = res.json() or []
                 for template in templates:
-                    template_source = _normalize_name(
-                        str(template.get("source_type") or "")
-                    )
-                    template_target = _normalize_name(
-                        str(template.get("target_type") or "")
-                    )
-                    if (
-                        template_source == desired_source
-                        and template_target == desired_target
+                    template_source = str(template.get("source_type") or "")
+                    template_target = str(template.get("target_type") or "")
+                    if _matches_name(template_source, source) and _matches_name(
+                        template_target, target
                     ):
                         key = _clean(template.get("key"))
                         if key:
@@ -4079,6 +4317,21 @@ def _create_migration(
             help="Set a template field as field_id=value. Repeat for multiple fields.",
         ),
     ] = None,
+    answer: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            "--answer",
+            "-a",
+            help="Set a clarifier answer as question_id=value. Repeat for multiple answers.",
+        ),
+    ] = None,
+    answers_file: Annotated[
+        Optional[str],
+        typer.Option(
+            "--answers-file",
+            help="JSON file containing clarifier answers keyed by question_id.",
+        ),
+    ] = None,
     context: Annotated[
         Optional[str], typer.Option("--context", "-c", help="Additional context.")
     ] = None,
@@ -4201,6 +4454,8 @@ def _create_migration(
         work_dir = clone_dir
 
     try:
+        provided_clarifier_answers = _parse_field_assignments(answer)
+        provided_clarifier_answers.update(_load_answer_file(answers_file))
         context_entered_interactively = False
         if path:
             if not _state.json:
@@ -4215,6 +4470,7 @@ def _create_migration(
                 resource_url,
                 org_id,
                 work_dir,
+                clarifier_answers=provided_clarifier_answers,
                 skip_questions=skip_questions,
                 prompt_for_context=not bool(context and context.strip()),
                 agent=agent,
@@ -4313,6 +4569,7 @@ def _create_migration(
                     resource_url,
                     org_id,
                     work_dir,
+                    clarifier_answers=provided_clarifier_answers,
                     skip_questions=skip_questions,
                     prompt_for_context=not context_entered_interactively,
                     agent=agent,
@@ -4326,6 +4583,15 @@ def _create_migration(
                     detected_driver = None
                 else:
                     source_tech, target_tech, detected_driver = migration_match
+                if _inside_coding_agent():
+                    template_key = _find_migration_template(source_tech, target_tech)
+                    _exit_for_agent_migration_confirmation(
+                        source_tech=source_tech,
+                        target_tech=target_tech,
+                        template_key=template_key,
+                        context=context or description,
+                        agent=agent,
+                    )
                 if not _state.json:
                     print(
                         f"\n{CYAN}This looks like a migration ({source_tech} → {target_tech}).{RESET}"
@@ -4370,6 +4636,7 @@ def _create_migration(
                                 resource_url,
                                 org_id,
                                 work_dir,
+                                clarifier_answers=provided_clarifier_answers,
                                 skip_questions=skip_questions,
                                 prompt_for_context=not context_entered_interactively,
                                 agent=agent,
@@ -4413,26 +4680,55 @@ def _create_migration(
                     if not _state.json:
                         print(f"{YELLOW}Could not generate questions: {exc}{RESET}")
 
-            # Step 3: Have the coding agent answer the questions
-            answered: dict[str, str] = {}
+            # Step 3: Have the coding agent suggest answers, then review them with the user
+            answered: dict[str, str] = dict(provided_clarifier_answers)
             if questions and _inside_coding_agent():
-                if not _state.json:
+                missing_ids = _missing_question_ids(questions, answered)
+                suggested_answers: dict[str, str] = {}
+                if missing_ids and not _state.json:
                     print(
-                        f"{CYAN}Asking AI agent to answer {len(questions)} clarifying questions...{RESET}"
+                        f"{CYAN}Asking AI agent to suggest answers for {len(questions)} clarifying questions...{RESET}"
                     )
-                answered = _answer_questions_via_agent(
-                    questions,
-                    description,
-                    discovered_context,
-                    resolved_work_dir,
-                    agent=agent,
-                )
+                if missing_ids:
+                    try:
+                        suggested_answers = _answer_questions_via_agent(
+                            questions,
+                            description,
+                            discovered_context,
+                            resolved_work_dir,
+                            agent=agent,
+                        )
+                    except SystemExit as exc:
+                        suggested_answers = {}
+                        _print_agent_collection_warning(
+                            f"Skipping suggested clarifier answers: {exc}"
+                        )
+                if missing_ids:
+                    suggested_for_missing = {
+                        key: value
+                        for key, value in suggested_answers.items()
+                        if key in missing_ids
+                    }
+                    rerun_command = f"keshro create --context {shlex.quote(context or description)}"
+                    if agent != "auto":
+                        rerun_command += f" --agent {shlex.quote(agent)}"
+                    _exit_for_agent_clarifier_feedback(
+                        heading="Keshro needs user answers before it can generate this plan.",
+                        questions=questions,
+                        suggested_answers={**answered, **suggested_for_missing},
+                        rerun_command=rerun_command,
+                    )
                 if not _state.json:
-                    answered_count = sum(
+                    suggested_count = sum(
+                        1
+                        for v in suggested_answers.values()
+                        if v and v.lower() != "unknown"
+                    )
+                    accepted_count = sum(
                         1 for v in answered.values() if v and v.lower() != "unknown"
                     )
                     print(
-                        f"  Agent answered {answered_count}/{len(questions)} questions."
+                        f"  Agent suggested {suggested_count}/{len(questions)} answers; accepted {accepted_count}/{len(questions)}."
                     )
             elif questions and sys.stdout.isatty() and not _state.json:
                 # TTY mode — let the user answer interactively
@@ -4647,6 +4943,7 @@ def _create_migration_inner(
     resource_url: str | None,
     org_id: str | None,
     work_dir: str | None,
+    clarifier_answers: dict[str, str] | None = None,
     skip_questions: bool = False,
     prompt_for_context: bool = True,
     agent: str = "auto",
@@ -4674,9 +4971,17 @@ def _create_migration_inner(
             f"Analyzing {scan_target} and generating {source} -> {target} "
             "migration inputs and follow-up questions..."
         ):
-            discovered_answer = _collect_discovery_answer_from_claude(
-                template, work_dir=resolved_work_dir, agent=agent
-            )
+            try:
+                discovered_answer = _collect_discovery_answer_from_claude(
+                    template, work_dir=resolved_work_dir, agent=agent
+                )
+            except SystemExit as exc:
+                if not _inside_coding_agent():
+                    raise
+                discovered_answer = ""
+                _print_agent_collection_warning(
+                    f"Skipping automatic migration discovery: {exc}"
+                )
 
         extracted = _extract_discovery_answers(template, discovered_answer)
         # Don't overwrite manually provided -f values with empty extracted values
@@ -4745,22 +5050,53 @@ def _create_migration_inner(
                 clarifier_questions = _get_migration_clarifiers(client, payload)
             if clarifier_questions:
                 suggested_answers: dict[str, str] = {}
-                if _inside_coding_agent():
-                    with _Spinner(
-                        "Collecting follow-up answers (this can take a bit)..."
-                    ):
-                        suggested_answers = _collect_clarifier_answers_from_claude(
-                            template,
-                            payload,
-                            clarifier_questions,
-                            work_dir=resolved_work_dir,
-                            agent=agent,
+                provided_clarifier_answers = dict(clarifier_answers or {})
+                if provided_clarifier_answers:
+                    missing_ids = _missing_question_ids(
+                        clarifier_questions, provided_clarifier_answers
+                    )
+                    if missing_ids:
+                        raise SystemExit(
+                            "Missing --answer values for: " + ", ".join(missing_ids)
                         )
-                clarifier_answers = _prompt_for_migration_clarifiers(
-                    clarifier_questions, suggested_answers
-                )
+                if _inside_coding_agent():
+                    if not provided_clarifier_answers:
+                        with _Spinner(
+                            "Collecting suggested follow-up answers (this can take a bit)..."
+                        ):
+                            try:
+                                suggested_answers = _collect_clarifier_answers_from_claude(
+                                    template,
+                                    payload,
+                                    clarifier_questions,
+                                    work_dir=resolved_work_dir,
+                                    agent=agent,
+                                )
+                            except SystemExit as exc:
+                                suggested_answers = {}
+                                _print_agent_collection_warning(
+                                    f"Skipping suggested clarifier answers: {exc}"
+                                )
+                    if not provided_clarifier_answers:
+                        rerun_command = (
+                            f"keshro create --path {shlex.quote(path)}"
+                            f" --context {shlex.quote(context or '')}"
+                        ).rstrip()
+                        if agent != "auto":
+                            rerun_command += f" --agent {shlex.quote(agent)}"
+                        _exit_for_agent_clarifier_feedback(
+                            heading="Keshro needs user answers before it can create this migration.",
+                            questions=clarifier_questions,
+                            suggested_answers=suggested_answers,
+                            rerun_command=rerun_command,
+                        )
+                    resolved_clarifier_answers = provided_clarifier_answers
+                else:
+                    resolved_clarifier_answers = _prompt_for_migration_clarifiers(
+                        clarifier_questions, suggested_answers
+                    )
                 payload = _merge_clarifier_answers(
-                    payload, clarifier_questions, clarifier_answers
+                    payload, clarifier_questions, resolved_clarifier_answers
                 )
             elif not _state.json:
                 print("No additional follow-up questions needed.")
@@ -4968,9 +5304,9 @@ def _config_show():
             )
         else:
             repo_plan_url = f"{app_url}/plans/{repo_plan_id}" if repo_plan_id else ""
-            print(f"{DIM}Current repo plan:{RESET} {YELLOW}{repo_plan}{RESET}")
+            print(f"{DIM}Current repo project:{RESET} {YELLOW}{repo_plan}{RESET}")
             if repo_plan_url:
-                print(f"{DIM}Plan URL:{RESET} {CYAN}{repo_plan_url}{RESET}")
+                print(f"{DIM}Project URL:{RESET} {CYAN}{repo_plan_url}{RESET}")
     if default_plan and plan_id != repo_plan_id:
         app_url = _app_url_from_api_url(payload["api_url"])
         default_migration_id = payload.get("default_context_migration_id") or ""
@@ -4981,9 +5317,9 @@ def _config_show():
             )
         else:
             plan_url = f"{app_url}/plans/{plan_id}" if plan_id else ""
-            print(f"{DIM}Default plan:{RESET} {YELLOW}{default_plan}{RESET}")
+            print(f"{DIM}Default project:{RESET} {YELLOW}{default_plan}{RESET}")
             if plan_url:
-                print(f"{DIM}Plan URL:{RESET} {CYAN}{plan_url}{RESET}")
+                print(f"{DIM}Project URL:{RESET} {CYAN}{plan_url}{RESET}")
     if user.get("email"):
         print(f"{DIM}User:{RESET} {CYAN}{user['email']}{RESET}")
     if user.get("name"):
@@ -5089,11 +5425,11 @@ def _config_set(
         print(f"Saved default agent: {auth.get('default_agent') or 'auto'}")
     plan_label = auth.get("default_plan_title") or auth.get("default_plan_id")
     if plan_label:
-        print(f"Saved default plan: {plan_label}")
+        print(f"Saved default execution context: {plan_label}")
         if linked_repo:
-            print("Linked the current repo to this plan in Keshro.")
+            print("Linked the current repo to this execution context in Keshro.")
     elif clear_plan:
-        print("Cleared default plan context.")
+        print("Cleared default execution context.")
 
 
 # ---------------------------------------------------------------------------
@@ -5242,7 +5578,7 @@ def _continue_command(
         bool,
         typer.Option(
             "--no-parallel",
-            help="Disable parallel execution and resume a single task (used inside an agent).",
+            help="Disable parallel execution and resume a single task.",
         ),
     ] = False,
     concurrency: Annotated[
@@ -5275,7 +5611,7 @@ def _continue_command(
         ),
     ] = False,
 ):
-    """Resume execution of a plan. In the shell this is coordinator mode; in an agent it resumes one task."""
+    """Resume execution of a plan. Parallel execution is the default; use --no-parallel for one task at a time."""
 
     if _clean(plan_id) and _clean(migration_id):
         raise SystemExit("Pass either --plan-id or --migration-id, not both.")
@@ -5288,9 +5624,9 @@ def _continue_command(
                 resolved_plan_id, work_dir=work_dir
             )
 
-    # Inside a coding agent (piped stdout), always single-task mode.
-    # In user's terminal, default to parallel unless --no-parallel is passed.
-    use_parallel = not no_parallel and (_stdout_is_tty() or dry_run)
+    # Parallel is the default everywhere. Use --no-parallel only when you explicitly
+    # want a single-task prompt flow.
+    use_parallel = not no_parallel
     resolved_agent = _clean(agent).lower() or _default_agent_preference() or "auto"
     if resolved_agent not in {"auto", "claude", "codex"}:
         raise SystemExit(
@@ -5336,11 +5672,11 @@ keshro login <api-token>
 ```
 The command is `keshro login`. There is no `auth` subcommand.
 
-## Create a plan
+## Create a project or migration
 ```bash
 keshro create
 ```
-Run from the project directory. Keshro scans the project, detects if it's a migration (and offers the migration pipeline with risk/cost analysis), generates clarifying questions (which you answer automatically), and produces a structured execution plan.
+Run from the project directory. Keshro scans the project, detects if it's a migration, surfaces follow-up questions back to the user, and creates the right project or migration with its execution context.
 
 Also accepts URLs:
 ```bash
@@ -5354,6 +5690,11 @@ If the user gave a project description, pass it as context:
 keshro create --context "Refactor the auth module to support API keys"
 ```
 
+If the request is clearly a migration, prefer:
+```bash
+keshro create --as-migration --context "migrate Jenkins pipelines to GitHub Actions"
+```
+
 For longer descriptions, write to a temp file:
 ```bash
 cat > /tmp/keshro-context.txt <<'EOF'
@@ -5363,9 +5704,9 @@ EOF
 keshro create --context-file /tmp/keshro-context.txt
 ```
 
-Plan creation can take a bit — Keshro scans the repo, gathers context, and generates the plan. Do not assume it failed.
+Creation can take a bit — Keshro scans the repo, gathers context, and builds the migration or project. Do not assume it failed.
 
-If another plan is currently active, just create the new one. It becomes the active plan.
+If another execution context is currently active, just create the new one. It becomes the active one.
 
 ## Import from issue trackers
 ```bash
@@ -5381,7 +5722,7 @@ keshro continue --all        # auto-continue through all remaining waves
 keshro continue --no-parallel # single-task mode (one at a time)
 keshro continue -m <migration-id>  # continue a specific migration's plan
 ```
-By default, `keshro continue` launches parallel agents in isolated git worktrees — one per ready task. Use `--all` to keep going through waves automatically.
+By default, `keshro continue` launches parallel agents in isolated git worktrees — one per ready task — including when the user is driving Keshro from `/keshro`. Use `--all` to keep going through waves automatically. Use `--no-parallel` only when the user explicitly wants one task at a time.
 
 ## Status
 ```bash
@@ -5403,15 +5744,13 @@ keshro task decide <task-id> --context "..." --choice "..." --reasoning "..."
 keshro task delete <task-id>
 ```
 
-## Plan management
+## Advanced plan internals
+Only use these if the user explicitly asks for lower-level plan operations.
 ```bash
 keshro plan list
 keshro plan view <plan-id>
-keshro plan generate "<description>"          # generate plan from text
-keshro plan update <plan-id> --status active
-keshro plan delete <plan-id>
-keshro plan push --provider linear            # push tasks to issue tracker
-keshro plan sync-pull                         # pull status from tracker
+keshro plan push --provider linear
+keshro plan sync-pull
 ```
 
 ## Review and rollback
@@ -5420,25 +5759,29 @@ keshro explain <task-id>
 keshro rollback <task-id>
 ```
 
-## Plan context
-Keshro remembers your active plan. No need to pass `-p` every time.
-- `keshro config` — shows active plan and auth status
-- `keshro plan list` — shows all plans
+## Execution context
+Keshro remembers your active execution context. No need to pass `-p` every time.
+- `keshro config` — shows the active migration/project context and auth status
+- `keshro plan list` — shows all low-level execution contexts
 - `keshro config set --plan-id <id>` — switch active plan
 
 ## Flows
 
 **User says "plan this" or "use keshro":**
 1. Run `keshro create` (or with context/URL)
-2. Run `keshro status` — show the plan
-3. **STOP and ask the user**: "Here's the plan with N tasks. Ready to execute?"
-4. Do NOT run `keshro continue` until the user says to proceed
+2. If Keshro stops for migration confirmation or follow-up questions, surface them to the user conversationally and wait.
+3. If Keshro gave you an `--answers-file` resume path, update that file with the user's answers and rerun the exact resume command.
+4. Run `keshro status` — show the migration/project
+5. **STOP and ask the user**: "Here's the plan with N tasks. Ready to execute?"
+6. Do NOT run `keshro continue` until the user says to proceed
 
 **User says "plan and run this" or "execute this" (explicitly wants execution):**
 1. Run `keshro create`
-2. Run `keshro status`
-3. Run `keshro continue --confirm --all` — parallel agents work through all waves automatically
-4. Only intervene if a task is blocked or an error occurs
+2. If Keshro stops for migration confirmation or follow-up questions, surface them to the user conversationally and wait.
+3. If Keshro gave you an `--answers-file` resume path, update that file with the user's answers and rerun the exact resume command.
+4. Run `keshro status`
+5. Run `keshro continue --confirm --all` — parallel agents work through all waves automatically
+6. Only intervene if a task is blocked or an error occurs
 
 **User says "continue" or "keep going":**
 1. Run `keshro status` — show where things stand
@@ -5457,6 +5800,8 @@ If the user says "stop", "pause", "hold on", or "wait":
 ## Rules
 - Run keshro commands via Bash, never as chat messages
 - Do NOT use Keshro MCP tools — always use the CLI
+- Do NOT silently accept agent-suggested clarifier answers when Keshro asks follow-up questions. Surface them to the user and let the user confirm or override them.
+- Do NOT dump giant inline `--answer ...` commands back to the user. If Keshro provides an `--answers-file` resume path, use that.
 - Never auto-execute a plan without user confirmation. Always show the plan and ask first.
 - Once the user says to execute, continue through tasks automatically — don't ask between each task
 - If the user says to stop, stop immediately after the current task
@@ -5805,8 +6150,8 @@ def _print_plan_status(plan: dict) -> None:
     if plan.get("enrichment_sources") or _plan_analysis(plan):
         plan_id = _clean(plan.get("id"))
         if plan_id:
-            app_url = _current_app_url()
-            print(f"  {DIM}Review in UI: {app_url}/plans/{plan_id}{RESET}")
+            dashboard_url = _execution_dashboard_url(plan, plan_id)
+            print(f"  {DIM}Review in UI: {dashboard_url}{RESET}")
         print()
 
     # Status symbols
@@ -7676,7 +8021,7 @@ def _plan_generate(
 
     _set_default_plan_after_create(plan)
 
-    print(f"\n{GREEN}Plan created: {plan.get('title', 'Untitled')}{RESET}")
+    print(f"\n{GREEN}Project created: {plan.get('title', 'Untitled')}{RESET}")
     print(f"  ID: {plan_id}")
     print(f"  Tasks: {len(steps)}")
     print(f"  Status: {plan.get('status', 'draft')}")
@@ -7684,28 +8029,27 @@ def _plan_generate(
     _print_plan_enrichment(plan)
     _print_plan_analysis(plan)
     if plan.get("enrichment_sources") or _plan_analysis(plan):
-        app_url = _current_app_url()
-        print(f"  Review in UI: {app_url}/plans/{plan_id}")
+        print(f"  Review in UI: {_execution_dashboard_url(plan, plan_id)}")
 
     if steps:
         print(f"\n{CYAN}Tasks:{RESET}")
-        for step in steps:
-            dep_info = ""
-            if step.get("depends_on"):
-                dep_info = f" {DIM}(depends on: {', '.join(step['depends_on'])}){RESET}"
-            risk = step.get("risk_level") or ""
-            risk_badge = ""
-            if risk == "high":
-                risk_badge = f" {RED}[high risk]{RESET}"
-            elif risk == "medium":
-                risk_badge = f" {YELLOW}[medium]{RESET}"
-            print(
-                f"  {step.get('order', 0):2d}. {step.get('title', 'Untitled')}{risk_badge}{dep_info}"
-            )
+    for step in steps:
+        dep_info = ""
+        if step.get("depends_on"):
+            dep_info = f" {DIM}(depends on: {', '.join(step['depends_on'])}){RESET}"
+        risk = step.get("risk_level") or ""
+        risk_badge = ""
+        if risk == "high":
+            risk_badge = f" {RED}[high risk]{RESET}"
+        elif risk == "medium":
+            risk_badge = f" {YELLOW}[medium]{RESET}"
+        print(
+            f"  {step.get('order', 0):2d}. {step.get('title', 'Untitled')}{risk_badge}{dep_info}"
+        )
 
     if not confirm and plan.get("status") == "draft":
         print(
-            f"\n{DIM}Plan is in draft. Run 'keshro continue -p {plan_id} --confirm' to start execution.{RESET}"
+            f"\n{DIM}Execution context is in draft. Run 'keshro continue -p {plan_id} --confirm' to start execution.{RESET}"
         )
 
     if _state.json:
@@ -7775,7 +8119,7 @@ def _plan_import(
     if questions and not skip_questions:
         if _inside_coding_agent():
             print(
-                f"{CYAN}Asking AI agent to answer {len(questions)} clarifying questions...{RESET}"
+                f"{CYAN}Asking AI agent to suggest answers for {len(questions)} clarifying questions...{RESET}"
             )
             import_context = "\n\n".join(
                 part
@@ -7785,19 +8129,35 @@ def _plan_import(
                 ]
                 if _clean(part)
             )
-            answers = _answer_questions_via_agent(
+            suggested_answers = _answer_questions_via_agent(
                 questions,
                 import_context or f"Imported project from {provider}",
                 None,
                 os.getcwd(),
             )
+            answers = _review_agent_suggested_answers(
+                questions,
+                suggested_answers,
+                heading="Clarifying questions",
+                non_interactive_notice=(
+                    "Non-interactive agent session detected; suggested clarifier answers were not auto-applied. "
+                    "Re-run interactively or use the direct CLI if you want to review them before plan generation."
+                ),
+            )
             if not _state.json:
+                suggested_count = sum(
+                    1
+                    for value in suggested_answers.values()
+                    if value and value.lower() != "unknown"
+                )
                 answered_count = sum(
                     1
                     for value in answers.values()
                     if value and value.lower() != "unknown"
                 )
-                print(f"  Agent answered {answered_count}/{len(questions)} questions.")
+                print(
+                    f"  Agent suggested {suggested_count}/{len(questions)} answers; accepted {answered_count}/{len(questions)}."
+                )
         elif sys.stdout.isatty():
             print(f"\n{CYAN}Clarifying questions ({len(questions)}):{RESET}")
             print(

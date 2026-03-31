@@ -951,35 +951,22 @@ def test_create_migration_from_path_key_applies_shared_clarifiers(
     fake_client, monkeypatch, capsys
 ):
     monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "1")
-    monkeypatch.setattr(
-        "shutil.which",
-        lambda name: "/usr/local/bin/claude" if name == "claude" else None,
-    )
-
-    call_count = {"count": 0}
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
 
     def _fake_run(cmd, capture_output, text, cwd, check):
-        call_count["count"] += 1
-        if call_count["count"] == 1:
-            return subprocess.CompletedProcess(
-                cmd,
-                0,
-                stdout="\n".join(
-                    [
-                        "## Versions",
-                        "- Source version: 1.0",
-                        "- Target version: 2.9",
-                        "",
-                        "## AWS Batch to Airflow details",
-                        "- AWS Batch workloads: scheduled ETL jobs",
-                    ]
-                ),
-                stderr="",
-            )
         return subprocess.CompletedProcess(
             cmd,
             0,
-            stdout="- rollback_strategy: switch back to Batch scheduling immediately",
+            stdout="\n".join(
+                [
+                    "## Versions",
+                    "- Source version: 1.0",
+                    "- Target version: 2.9",
+                    "",
+                    "## AWS Batch to Airflow details",
+                    "- AWS Batch workloads: scheduled ETL jobs",
+                ]
+            ),
             stderr="",
         )
 
@@ -1004,7 +991,15 @@ def test_create_migration_from_path_key_applies_shared_clarifiers(
     monkeypatch.setattr("subprocess.run", _fake_run)
     monkeypatch.setattr(fake_client, "post", _post)
 
-    cli.main(["create", "--path", "aws-batch-to-airflow"])
+    cli.main(
+        [
+            "create",
+            "--path",
+            "aws-batch-to-airflow",
+            "--answer",
+            "rollback_strategy=switch back to Batch scheduling immediately",
+        ]
+    )
 
     create_call = next(
         call for call in fake_client.calls if call[1] == "/v1/migrations"
@@ -1015,11 +1010,11 @@ def test_create_migration_from_path_key_applies_shared_clarifiers(
         == "switch back to Batch scheduling immediately"
     )
     assert "Critical clarifications" in created_payload["context"]
-    assert call_count["count"] == 2
 
 
 def test_create_migration_from_path_key_requires_claude_code(fake_client, monkeypatch):
     monkeypatch.delenv("CLAUDE_CODE_ENTRYPOINT", raising=False)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
     monkeypatch.setattr("shutil.which", lambda name: None)
     exit_code = cli.main(["create", "--path", "aws-batch-to-airflow"])
     assert exit_code == 1
@@ -1035,7 +1030,7 @@ def test_continue_prints_prompt_with_task_context(fake_client, monkeypatch, caps
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     _bypass_auth(monkeypatch)
 
-    cli.main(["continue"])
+    cli.main(["continue", "--no-parallel"])
 
     out = capsys.readouterr().out
     assert "Task: Review EventBridge schedules" in out
@@ -1051,7 +1046,7 @@ def test_continue_prompt_omits_full_skill_boilerplate_in_non_tty_mode(
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     _bypass_auth(monkeypatch)
 
-    cli.main(["continue"])
+    cli.main(["continue", "--no-parallel"])
 
     out = capsys.readouterr().out
     assert "Do NOT use Keshro MCP tools" not in out
@@ -1082,7 +1077,7 @@ def test_continue_prompt_mentions_status_tracking_and_blocking_rule(
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     _bypass_auth(monkeypatch)
 
-    cli.main(["continue"])
+    cli.main(["continue", "--no-parallel"])
 
     out = capsys.readouterr().out
     assert "keshro status -p plan-123 --watch" in out
@@ -1131,7 +1126,7 @@ def test_continue_prompt_surfaces_plan_risks_unknowns_and_ui_link(
         return _FakeResponse(plan)
 
     fake_client.get = _get
-    cli.main(["continue"])
+    cli.main(["continue", "--no-parallel"])
     out = ANSI_RE.sub("", capsys.readouterr().out)
     assert "Top plan risks:" in out
     assert "Open questions:" in out
@@ -1182,7 +1177,7 @@ def test_continue_in_agent_mode_resumes_in_progress_task_before_next_todo(
 
     monkeypatch.setattr(fake_client, "get", _get)
 
-    cli.main(["continue"])
+    cli.main(["continue", "--no-parallel"])
 
     out = capsys.readouterr().out
     assert "Task: Set up MWAA environment with Terraform" in out
@@ -1194,7 +1189,7 @@ def test_continue_prompt_includes_error_guidance(fake_client, monkeypatch, capsy
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     _bypass_auth(monkeypatch)
 
-    cli.main(["continue"])
+    cli.main(["continue", "--no-parallel"])
 
     out = capsys.readouterr().out
     assert "If a keshro command fails" in out
@@ -1226,7 +1221,7 @@ def test_continue_confirms_when_using_implicit_plan_context(
         lambda coro: (coro.close(), None)[1],
     )
 
-    cli.main(["continue"])
+    cli.main(["continue", "--no-parallel"])
 
     assert "AWS Batch to Airflow pilot" in prompted["message"]
     assert "plan-123" in prompted["message"]
@@ -1328,7 +1323,7 @@ def test_continue_prompt_does_not_tell_claude_to_refetch(
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     _bypass_auth(monkeypatch)
 
-    cli.main(["continue"])
+    cli.main(["continue", "--no-parallel"])
 
     out = capsys.readouterr().out
     assert "Do not re-fetch them" in out
@@ -1368,6 +1363,53 @@ def test_continue_allows_codex_for_parallel_mode(fake_client, monkeypatch, capsy
     assert exit_code == 0
     assert parallel_called.get("yes")
     assert "Using Codex" in out
+
+
+def test_continue_uses_parallel_mode_inside_coding_agent_by_default(
+    fake_client, monkeypatch
+):
+    monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: True)
+    monkeypatch.setattr("keshro_cli.cli._stdout_is_tty", lambda: False)
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+
+    parallel_called = {}
+
+    monkeypatch.setattr(
+        "keshro_cli.cli.asyncio.run",
+        lambda coro: (parallel_called.update({"yes": True}), coro.close())[1],
+    )
+
+    exit_code = cli.main(["continue"])
+
+    assert exit_code == 0
+    assert parallel_called.get("yes")
+
+
+def test_continue_no_parallel_stays_single_task_inside_coding_agent(
+    fake_client, monkeypatch
+):
+    monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: True)
+    monkeypatch.setattr("keshro_cli.cli._stdout_is_tty", lambda: False)
+
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "keshro_cli.cli._continue_with_claude",
+        lambda resolved_plan_id, **kwargs: captured.update(
+            {"plan_id": resolved_plan_id, **kwargs}
+        ),
+    )
+
+    exit_code = cli.main(["continue", "--no-parallel"])
+
+    assert exit_code == 0
+    assert captured["plan_id"] == "plan-123"
+    assert captured["parallel"] is False
 
 
 def test_wrap_prompt_agent_error_suggests_switching_agents(monkeypatch):
@@ -1565,6 +1607,7 @@ def test_prompt_for_migration_template_fields_hides_duplicate_suggested_value_fo
     monkeypatch, capsys
 ):
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
     monkeypatch.setattr("builtins.input", lambda _prompt="": "")
 
     template = {
@@ -1598,6 +1641,7 @@ def test_prompt_for_migration_template_fields_uses_replacement_label_for_preview
     monkeypatch, capsys
 ):
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
     prompts = []
 
     def _fake_input(prompt=""):
@@ -1636,6 +1680,7 @@ def test_prompt_for_migration_template_fields_offers_view_for_truncated_textarea
     monkeypatch, capsys
 ):
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
     prompts = []
     answers = iter(["v", ""])
 
@@ -1680,6 +1725,7 @@ def test_prompt_for_migration_template_fields_offers_view_for_truncated_textarea
 
 def test_prompt_for_migration_template_fields_ctrl_c_exits_review(monkeypatch, capsys):
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
     prompts = []
 
     def _fake_input(prompt=""):
@@ -1714,12 +1760,63 @@ def test_prompt_for_migration_template_fields_ctrl_c_exits_review(monkeypatch, c
     }
 
 
+def test_prompt_for_clarifying_questions_keeps_or_overrides_suggestions(monkeypatch):
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
+    responses = iter(["", "custom answer"])
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(responses))
+
+    questions = [
+        {
+            "id": "hosting_environment",
+            "question": "Where will the new workload run?",
+            "answers": [
+                {"answer_title": "MWAA", "value": "mwaa", "recommended": True},
+                {"answer_title": "Self-hosted", "value": "self_hosted"},
+            ],
+        },
+        {
+            "id": "rollback_plan",
+            "question": "How will rollback work?",
+        },
+    ]
+
+    result = cli._prompt_for_clarifying_questions(
+        questions,
+        {"hosting_environment": "mwaa", "rollback_plan": "disable new scheduler"},
+    )
+
+    assert result == {
+        "hosting_environment": "mwaa",
+        "rollback_plan": "custom answer",
+    }
+
+
+def test_review_agent_suggested_answers_noninteractive_does_not_auto_apply(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr("sys.stdout.isatty", lambda: False)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
+
+    result = cli._review_agent_suggested_answers(
+        [{"id": "hosting_environment", "question": "Where will it run?"}],
+        {"hosting_environment": "mwaa"},
+        heading="Clarifying questions",
+        non_interactive_notice="Need user review before applying suggested answers.",
+    )
+
+    assert result == {}
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+    assert "Need user review before applying suggested answers." in out
+
+
 def test_create_interactive_migration_prompt_accepts_no_for_general_project(
     fake_client, monkeypatch, capsys
 ):
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
     monkeypatch.setattr("keshro_cli.cli._collect_generic_discovery", lambda _: None)
     monkeypatch.setattr("keshro_cli.cli.update_auth", lambda payload: payload)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
     monkeypatch.setattr(
         "keshro_cli.cli._prompt_agent_display_name", lambda _agent: "Claude Code"
@@ -1772,6 +1869,7 @@ def test_create_interactive_migration_prompt_accepts_yes_for_migration(
 ):
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
     monkeypatch.setattr("keshro_cli.cli._collect_generic_discovery", lambda _: None)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
     monkeypatch.setattr(
         "keshro_cli.cli._prompt_agent_display_name", lambda _agent: "Claude Code"
@@ -1812,6 +1910,252 @@ def test_create_interactive_migration_prompt_accepts_yes_for_migration(
     assert code == 0
     assert captured["path"] == "aws-batch-to-airflow"
     assert captured["context"] == "plan the migration"
+
+
+def test_create_inside_coding_agent_explicit_migration_still_routes(monkeypatch):
+    monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
+    monkeypatch.setattr("keshro_cli.cli._collect_generic_discovery", lambda _: None)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: True)
+    monkeypatch.setattr(
+        "keshro_cli.cli._prompt_agent_display_name", lambda _agent: "Claude Code"
+    )
+    monkeypatch.setattr(
+        "keshro_cli.cli._find_migration_template",
+        lambda _source, _target: "aws-batch-to-airflow",
+    )
+
+    captured: dict[str, object] = {}
+
+    def _fake_create_migration_inner(
+        path,
+        provided_answers,
+        context,
+        github_url,
+        resource_url,
+        org_id,
+        work_dir,
+        **kwargs,
+    ):
+        captured["path"] = path
+        captured["context"] = context
+
+    monkeypatch.setattr(
+        "keshro_cli.cli._create_migration_inner", _fake_create_migration_inner
+    )
+
+    code = cli.main(["create", "--path", "aws-batch-to-airflow", "--context", "migrate from aws batch to airflow"])
+
+    assert code == 0
+    assert captured["path"] == "aws-batch-to-airflow"
+    assert captured["context"] == "migrate from aws batch to airflow"
+
+
+def test_create_inside_coding_agent_stops_for_detected_migration_confirmation(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
+    monkeypatch.setattr("keshro_cli.cli._collect_generic_discovery", lambda _: None)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: True)
+    monkeypatch.setattr(
+        "keshro_cli.cli._prompt_agent_display_name", lambda _agent: "Claude Code"
+    )
+    monkeypatch.setattr(
+        "keshro_cli.cli._detect_migration_intent",
+        lambda _description: ("AWS Batch", "Airflow"),
+    )
+    monkeypatch.setattr(
+        "keshro_cli.cli._find_migration_template",
+        lambda _source, _target: "aws-batch-to-airflow",
+    )
+
+    code = cli.main(["create", "--context", "migrate from aws batch to airflow"])
+
+    assert code == 0
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+    assert "This looks like a migration (AWS Batch -> Airflow)." in out
+    assert "keshro create --path aws-batch-to-airflow --context 'migrate from aws batch to airflow'" in out
+
+
+def test_create_inside_coding_agent_stops_before_generation_when_answers_missing(
+    fake_client, monkeypatch, capsys
+):
+    monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
+    monkeypatch.setattr("keshro_cli.cli._collect_generic_discovery", lambda _: None)
+    monkeypatch.setattr("keshro_cli.cli.update_auth", lambda payload: payload)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr(
+        "keshro_cli.cli._prompt_agent_display_name", lambda _agent: "Claude Code"
+    )
+    monkeypatch.setattr(
+        "keshro_cli.cli._answer_questions_via_agent",
+        lambda *args, **kwargs: {"hosting_environment": "mwaa"},
+    )
+    original_post = fake_client.post
+
+    def _post(path, json=None, timeout=None):
+        if path == "/v1/plans/describe/preview":
+            return _FakeResponse(
+                {
+                    "questions": [
+                        {
+                            "id": "hosting_environment",
+                            "question": "Where will the new workflow run?",
+                            "answers": [
+                                {
+                                    "answer_title": "MWAA",
+                                    "value": "mwaa",
+                                    "recommended": True,
+                                }
+                            ],
+                        }
+                    ],
+                    "enrichment_context": "",
+                }
+            )
+        if path == "/v1/plans/generate":
+            raise AssertionError("plan generation should not happen before user feedback")
+        return original_post(path, json=json, timeout=timeout)
+
+    fake_client.post = _post
+
+    code = cli.main(["create", "--context", "refactor auth"])
+
+    assert code == 0
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+    assert "Keshro needs user answers before it can generate this plan." in out
+    assert "--answers-file" in out
+
+
+def test_create_inside_coding_agent_stops_for_clarifiers_until_user_answers(
+    fake_client, monkeypatch, capsys
+):
+    monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
+    monkeypatch.setattr("keshro_cli.cli._collect_generic_discovery", lambda _: None)
+    monkeypatch.setattr("keshro_cli.cli.update_auth", lambda payload: payload)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr(
+        "keshro_cli.cli._prompt_agent_display_name", lambda _agent: "Claude Code"
+    )
+    monkeypatch.setattr(
+        "keshro_cli.cli._answer_questions_via_agent",
+        lambda *args, **kwargs: {"hosting_environment": "mwaa"},
+    )
+
+    original_post = fake_client.post
+
+    def _post(path, json=None, timeout=None):
+        if path == "/v1/plans/describe/preview":
+            return _FakeResponse(
+                {
+                    "questions": [
+                        {
+                            "id": "hosting_environment",
+                            "question": "Where will the new workflow run?",
+                            "answers": [
+                                {
+                                    "answer_title": "MWAA",
+                                    "value": "mwaa",
+                                    "recommended": True,
+                                }
+                            ],
+                        }
+                    ],
+                    "enrichment_context": "",
+                }
+            )
+        if path == "/v1/plans/generate":
+            raise AssertionError("plan generation should not happen before user feedback")
+        return original_post(path, json=json, timeout=timeout)
+
+    fake_client.post = _post
+
+    code = cli.main(["create", "--context", "refactor auth"])
+
+    assert code == 0
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+    assert "Keshro needs user answers before it can generate this plan." in out
+    assert "--answers-file" in out
+
+
+def test_create_inside_coding_agent_accepts_answer_flags_on_rerun(
+    fake_client, monkeypatch
+):
+    monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
+    monkeypatch.setattr("keshro_cli.cli._collect_generic_discovery", lambda _: None)
+    monkeypatch.setattr("keshro_cli.cli.update_auth", lambda payload: payload)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr(
+        "keshro_cli.cli._prompt_agent_display_name", lambda _agent: "Claude Code"
+    )
+
+    captured: dict[str, object] = {}
+    original_post = fake_client.post
+
+    def _post(path, json=None, timeout=None):
+        if path == "/v1/plans/describe/preview":
+            return _FakeResponse(
+                {
+                    "questions": [
+                        {
+                            "id": "hosting_environment",
+                            "question": "Where will the new workflow run?",
+                        }
+                    ],
+                    "enrichment_context": "",
+                }
+            )
+        if path == "/v1/plans/generate":
+            captured["description"] = json["description"]
+            return _FakeResponse(
+                {
+                    "id": "plan-general-1",
+                    "title": "General project plan",
+                    "status": "draft",
+                    "plan_steps": [],
+                }
+            )
+        return original_post(path, json=json, timeout=timeout)
+
+    fake_client.post = _post
+
+    answers_path = Path("/tmp/keshro-test-answers.json")
+    answers_path.write_text(json.dumps({"answers": {"hosting_environment": "mwaa"}}))
+
+    code = cli.main(
+        [
+            "create",
+            "--context",
+            "refactor auth",
+            "--answers-file",
+            str(answers_path),
+        ]
+    )
+
+    assert code == 0
+    assert "A: mwaa" in str(captured["description"])
+
+
+def test_review_agent_suggested_answers_accepts_suggestions_inside_agent(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+
+    result = cli._review_agent_suggested_answers(
+        [{"id": "hosting_environment", "question": "Where will it run?"}],
+        {"hosting_environment": "mwaa"},
+        heading="Clarifying questions",
+        non_interactive_notice="should not be used",
+    )
+
+    assert result == {"hosting_environment": "mwaa"}
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+    assert "Using agent-suggested answers" in out
 
 
 def test_create_as_migration_uses_explicit_source_and_target(
@@ -1897,6 +2241,14 @@ def test_find_migration_template_normalizes_apache_airflow(fake_client):
     assert template_key == "aws-batch-to-airflow"
 
 
+def test_find_migration_template_normalizes_airflow_mwaa_variant(fake_client):
+    template_key = cli._find_migration_template(
+        "AWS Batch", "Apache Airflow (MWAA)"
+    )
+
+    assert template_key == "aws-batch-to-airflow"
+
+
 def test_plan_create_saves_default_plan_automatically(fake_client, monkeypatch, capsys):
     saved = {}
     monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: {})
@@ -1915,7 +2267,7 @@ def test_plan_create_saves_default_plan_automatically(fake_client, monkeypatch, 
         ]
     )
     out = capsys.readouterr().out
-    assert "Saved default plan:" in out
+    assert "Saved default execution context:" in out
     assert saved["default_plan_id"]
     assert saved["default_plan_title"]
 
@@ -2471,8 +2823,8 @@ def test_config_set_can_save_default_plan(fake_client, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert code == 0
     assert "Saved default context: personal" in out
-    assert "Saved default plan: AWS Batch to Airflow pilot" in out
-    assert "Linked the current repo to this plan in Keshro." in out
+    assert "Saved default execution context: AWS Batch to Airflow pilot" in out
+    assert "Linked the current repo to this execution context in Keshro." in out
 
 
 def test_require_plan_context_can_resolve_repo_link(monkeypatch):
