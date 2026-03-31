@@ -3594,7 +3594,7 @@ def test_task_edit_without_plan_context_fails(capsys, monkeypatch):
     monkeypatch.setattr("keshro_cli.client.load_auth", lambda: {})
     code = cli.main(["task", "edit", "task-456", "--status", "in_progress"])
     assert code == 1
-    assert "Plan or migration ID required" in capsys.readouterr().err
+    assert "Execution context or migration ID required" in capsys.readouterr().err
 
 
 def test_migration_history_uses_plan_audit_trail(fake_client, capsys):

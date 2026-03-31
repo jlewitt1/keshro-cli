@@ -416,7 +416,7 @@ def _require_plan_context(
     if resolved:
         return resolved
     raise SystemExit(
-        "Plan or migration ID required. Pass -p <plan-id-or-migration-id> or run `keshro config set --plan-id <plan-id-or-migration-id>` from the repo you want to link."
+        "Execution context or migration ID required. Pass -p <id> or run `keshro config set --plan-id <id>` from the repo you want to link."
     )
 
 
@@ -519,7 +519,7 @@ def _resolve_plan_or_migration_context(
         except Exception:
             pass
     raise SystemExit(
-        f"Could not resolve '{explicit_id}' to a plan or migration-linked plan."
+        f"Could not resolve '{explicit_id}' to an execution context or migration-linked context."
     )
 
 
@@ -3582,7 +3582,7 @@ def _continue_with_claude(
     resolved_plan_id = _current_plan_id(plan_id)
     if not resolved_plan_id:
         raise SystemExit(
-            "Plan or migration context required. Pass --plan-id <plan-id-or-migration-id> or save one with `keshro config set --plan-id <plan-id-or-migration-id>`."
+            "Execution context or migration ID required. Pass --plan-id <id> or save one with `keshro config set --plan-id <id>`."
         )
     plan = _get_plan_or_exit(resolved_plan_id)
 
@@ -3739,7 +3739,7 @@ def _resolve_continue_override_context(
             return plan_id, _clean(plan.get("title")) or plan_id
 
     raise SystemExit(
-        f"Could not resolve '{explicit_id}' to a plan or migration-linked plan."
+        f"Could not resolve '{explicit_id}' to an execution context or migration-linked context."
     )
 
 
@@ -5363,7 +5363,7 @@ def _config_set(
         Optional[str], typer.Option("--dir", "-d", help="Default project directory.")
     ] = None,
     clear_plan: Annotated[
-        bool, typer.Option("--clear-plan", help="Clear saved plan context.")
+        bool, typer.Option("--clear-plan", help="Clear saved execution context.")
     ] = False,
 ):
     """Set default workspace context."""
@@ -6357,7 +6357,7 @@ def _run_status(plan_id: str | None, watch: bool = False, tui: bool = False) -> 
     resolved_plan_id = _current_plan_id(plan_id)
     if not resolved_plan_id:
         raise SystemExit(
-            "Plan context required. Pass --plan-id <plan-id> or save one with `keshro config set --plan-id <plan-id>`."
+            "Execution context required. Pass --plan-id <id> or save one with `keshro config set --plan-id <id>`."
         )
 
     if tui:
@@ -6400,12 +6400,12 @@ def _run_status(plan_id: str | None, watch: bool = False, tui: bool = False) -> 
 def _plan_status(
     plan_id_arg: Annotated[
         Optional[str],
-        typer.Argument(help="Plan ID. Uses saved plan context if omitted."),
+        typer.Argument(help="Execution context ID. Uses saved context if omitted."),
     ] = None,
     plan_id: Annotated[
         Optional[str],
         typer.Option(
-            "--plan-id", "-p", help="Plan ID. Uses saved plan context if omitted."
+            "--plan-id", "-p", help="Execution context ID. Uses saved context if omitted."
         ),
     ] = None,
     watch: Annotated[
@@ -6417,7 +6417,7 @@ def _plan_status(
         typer.Option("--tui", help="Launch interactive Textual TUI dashboard."),
     ] = False,
 ):
-    """Live status dashboard for a plan. Shows all tasks, active agents, and blockers."""
+    """Live status dashboard for the current execution context."""
     _run_status(plan_id_arg or plan_id, watch=watch, tui=tui)
 
 
@@ -6425,12 +6425,12 @@ def _plan_status(
 def _status_alias(
     plan_id_arg: Annotated[
         Optional[str],
-        typer.Argument(help="Plan ID. Uses saved plan context if omitted."),
+        typer.Argument(help="Execution context ID. Uses saved context if omitted."),
     ] = None,
     plan_id: Annotated[
         Optional[str],
         typer.Option(
-            "--plan-id", "-p", help="Plan ID. Uses saved plan context if omitted."
+            "--plan-id", "-p", help="Execution context ID. Uses saved context if omitted."
         ),
     ] = None,
     watch: Annotated[
@@ -6442,7 +6442,7 @@ def _status_alias(
         typer.Option("--tui", help="Launch interactive Textual TUI dashboard."),
     ] = False,
 ):
-    """Live status dashboard for the current plan."""
+    """Live status dashboard for the current execution context."""
     _run_status(plan_id_arg or plan_id, watch=watch, tui=tui)
 
 
@@ -6450,10 +6450,10 @@ def _status_alias(
 def _plan_next(
     plan_id: Annotated[
         Optional[str],
-        typer.Argument(help="Plan ID. Uses saved plan context if omitted."),
+        typer.Argument(help="Execution context ID. Uses saved context if omitted."),
     ] = None,
 ):
-    """Show the next actionable task in a plan."""
+    """Show the next actionable task in the current execution context."""
     resolved_plan_id = _require_plan_context(plan_id)
     plan = _get_plan_or_exit(resolved_plan_id)
     task = _next_actionable_task(plan)
