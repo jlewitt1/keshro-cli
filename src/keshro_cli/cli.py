@@ -2432,7 +2432,11 @@ async def _cleanup_worktree(repo_dir: str, worktree_path: str) -> None:
     """Remove a manually-created git worktree."""
     try:
         proc = await asyncio.create_subprocess_exec(
-            "git", "worktree", "remove", "--force", worktree_path,
+            "git",
+            "worktree",
+            "remove",
+            "--force",
+            worktree_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=repo_dir,
@@ -2451,7 +2455,9 @@ async def _git_stdout(*args: str, cwd: str) -> str:
     )
     stdout, stderr = await proc.communicate()
     if proc.returncode != 0:
-        raise RuntimeError((stderr or b"").decode(errors="replace").strip() or "git command failed")
+        raise RuntimeError(
+            (stderr or b"").decode(errors="replace").strip() or "git command failed"
+        )
     return (stdout or b"").decode(errors="replace").strip()
 
 
@@ -2517,7 +2523,8 @@ async def _merge_codex_worktree_changes(
         _stdout, stderr = await proc.communicate()
         if proc.returncode != 0:
             raise RuntimeError(
-                (stderr or b"").decode(errors="replace").strip() or "failed to commit Codex worktree changes"
+                (stderr or b"").decode(errors="replace").strip()
+                or "failed to commit Codex worktree changes"
             )
 
     head_rev = await _git_stdout("git", "rev-parse", "HEAD", cwd=worktree_path)
@@ -2535,7 +2542,8 @@ async def _merge_codex_worktree_changes(
     patch_bytes, stderr = await diff_proc.communicate()
     if diff_proc.returncode != 0:
         raise RuntimeError(
-            (stderr or b"").decode(errors="replace").strip() or "failed to build Codex worktree patch"
+            (stderr or b"").decode(errors="replace").strip()
+            or "failed to build Codex worktree patch"
         )
     if not patch_bytes:
         return
@@ -2567,15 +2575,12 @@ async def _merge_codex_worktree_changes(
                 if reset_proc.returncode != 0
                 else ""
             )
-            apply_error = (
-                (stderr or b"").decode(errors="replace").strip()
-                or "failed to apply Codex worktree patch"
-            )
+            apply_error = (stderr or b"").decode(
+                errors="replace"
+            ).strip() or "failed to apply Codex worktree patch"
             if reset_error:
                 raise RuntimeError(f"{apply_error} (cleanup failed: {reset_error})")
-            raise RuntimeError(
-                apply_error
-            )
+            raise RuntimeError(apply_error)
 
 
 async def _launch_single_agent(
@@ -2657,7 +2662,10 @@ async def _launch_single_agent(
                     "git", "rev-parse", "HEAD", cwd=work_dir
                 )
                 wt_proc = await asyncio.create_subprocess_exec(
-                    "git", "worktree", "add", "-b",
+                    "git",
+                    "worktree",
+                    "add",
+                    "-b",
                     codex_worktree_branch,
                     codex_worktree_path,
                     codex_worktree_base_rev,
@@ -2732,9 +2740,7 @@ async def _launch_single_agent(
                     session_start(collab_session_id, work_dir)
             except Exception:
                 launched_in_terminal = False
-                visible_fallback_reason = (
-                    "Collaborator/Conductor integration failed; falling back to headless execution"
-                )
+                visible_fallback_reason = "Collaborator/Conductor integration failed; falling back to headless execution"
                 session_start(collab_session_id, work_dir)
 
         if launched_in_terminal:
@@ -3444,11 +3450,18 @@ def _confirm_implicit_continue_plan(
     if _state.json or not _stdout_is_tty():
         return resolved_plan_id
     plan_label = _current_plan_label(work_dir=work_dir) or resolved_plan_id
-    plan_url = f"{_current_app_url()}/plans/{resolved_plan_id}"
+    context_details = _load_plan_context_details(resolved_plan_id)
+    is_migration = context_details.get("kind") == "migration"
+    context_label = "migration" if is_migration else "plan"
+    dashboard_url = (
+        f"{_current_app_url()}/migrations/{context_details.get('migration_id')}"
+        if is_migration and _clean(context_details.get("migration_id"))
+        else f"{_current_app_url()}/plans/{resolved_plan_id}"
+    )
     try:
         confirmed = typer.confirm(
-            f"Continue with plan '{plan_label}' ({resolved_plan_id})?\n"
-            f"{DIM}Dashboard:{RESET} {CYAN}{plan_url}{RESET}",
+            f"Continue with {context_label} '{plan_label}' ({resolved_plan_id})?\n"
+            f"{DIM}Dashboard:{RESET} {CYAN}{dashboard_url}{RESET}",
             default=True,
         )
     except click.Abort:
@@ -3475,7 +3488,9 @@ def _confirm_implicit_continue_plan(
     return override_plan_id
 
 
-def _resolve_continue_override_context(value: str | None) -> tuple[str | None, str | None]:
+def _resolve_continue_override_context(
+    value: str | None,
+) -> tuple[str | None, str | None]:
     explicit_id = _clean(value)
     if not explicit_id:
         return None, None
@@ -4208,7 +4223,7 @@ def _create_migration(
                     detected_driver = None
                 else:
                     source_tech, target_tech, detected_driver = migration_match
-                if sys.stdout.isatty() and not _state.json:
+                if not _state.json:
                     print(
                         f"\n{CYAN}This looks like a migration ({source_tech} → {target_tech}).{RESET}"
                     )
