@@ -84,7 +84,6 @@ def session_end(session_id: str) -> bool:
     return result is not None
 
 
-
 def launch_terminal(
     command: str,
     cwd: str,
