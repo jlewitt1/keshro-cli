@@ -1019,7 +1019,7 @@ def test_continue_prompt_omits_full_skill_boilerplate_in_non_tty_mode(
 
 
 def test_spinner_truncates_long_messages_but_keeps_animation(monkeypatch, capsys):
-    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("keshro_cli.cli._stdout_is_tty", lambda: True)
     monkeypatch.setattr(
         "keshro_cli.cli.shutil.get_terminal_size",
         lambda fallback=(80, 24): os.terminal_size((40, 24)),
@@ -1170,7 +1170,7 @@ def test_continue_confirms_when_using_implicit_plan_context(
         "keshro_cli.cli._current_plan_label",
         lambda work_dir=None: "AWS Batch to Airflow pilot",
     )
-    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("keshro_cli.cli._stdout_is_tty", lambda: True)
 
     prompted = {}
 
@@ -1200,7 +1200,7 @@ def test_continue_skips_confirmation_when_plan_id_is_explicit(
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
-    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("keshro_cli.cli._stdout_is_tty", lambda: True)
 
     def _fail_confirm(*args, **kwargs):
         raise AssertionError("should not prompt when plan id is explicit")
@@ -1220,7 +1220,7 @@ def test_continue_skips_confirmation_when_migration_id_is_explicit(
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
-    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("keshro_cli.cli._stdout_is_tty", lambda: True)
 
     def _fail_confirm(*args, **kwargs):
         raise AssertionError("should not prompt when migration id is explicit")
@@ -1248,7 +1248,7 @@ def test_continue_exits_cleanly_when_implicit_plan_confirmation_is_declined(
 ):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
-    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("keshro_cli.cli._stdout_is_tty", lambda: True)
     monkeypatch.setattr("typer.confirm", lambda *args, **kwargs: False)
     monkeypatch.setattr("builtins.input", lambda prompt="": "")
 
@@ -1263,7 +1263,7 @@ def test_continue_can_override_implicit_plan_with_migration_id(
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
-    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("keshro_cli.cli._stdout_is_tty", lambda: True)
     monkeypatch.setattr("typer.confirm", lambda *args, **kwargs: False)
     monkeypatch.setattr("builtins.input", lambda prompt="": "migration-123")
     monkeypatch.setattr(
@@ -1323,7 +1323,7 @@ def test_continue_allows_codex_for_parallel_mode(fake_client, monkeypatch, capsy
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
     monkeypatch.setattr("keshro_cli.cli._current_plan_label", lambda work_dir=None: "Test plan")
     monkeypatch.setattr("typer.confirm", lambda *a, **kw: True)
-    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("keshro_cli.cli._stdout_is_tty", lambda: True)
     monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
 
     parallel_called = {}

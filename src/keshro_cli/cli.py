@@ -77,6 +77,10 @@ def _clean(value: str | None) -> str:
     return (value or "").strip()
 
 
+def _stdout_is_tty() -> bool:
+    return sys.stdout.isatty()
+
+
 def _sanitize_json_payload(value):
     if isinstance(value, str):
         return value.encode("utf-8", "replace").decode("utf-8").strip()
@@ -101,7 +105,7 @@ class _Spinner:
         self._thread: threading.Thread | None = None
 
     def __enter__(self):
-        if _state.json or not sys.stdout.isatty():
+        if _state.json or not _stdout_is_tty():
             print(self._message)
             return self
         self._thread = threading.Thread(target=self._spin, daemon=True)
@@ -3327,7 +3331,7 @@ def _continue_with_claude(
         return
     task_title = _clean(task.get("title")) or "next task"
     is_parallel_task = task.get("parallelizable", False)
-    if sys.stdout.isatty():
+    if _stdout_is_tty():
         progress = f"[{done_count}/{total_count}]"
         parallel_note = (
             f" {GREEN}(parallelizable — will split into sub-tasks){RESET}"
@@ -3352,7 +3356,7 @@ def _continue_with_claude(
 def _confirm_implicit_continue_plan(
     resolved_plan_id: str, work_dir: str | None = None
 ) -> str:
-    if _state.json or not sys.stdout.isatty():
+    if _state.json or not _stdout_is_tty():
         return resolved_plan_id
     plan_label = _current_plan_label(work_dir=work_dir) or resolved_plan_id
     plan_url = f"{_current_app_url()}/plans/{resolved_plan_id}"
@@ -5076,7 +5080,7 @@ def _continue_command(
 
     # Inside a coding agent (piped stdout), always single-task mode.
     # In user's terminal, default to parallel unless --no-parallel is passed.
-    use_parallel = not no_parallel and (sys.stdout.isatty() or dry_run)
+    use_parallel = not no_parallel and (_stdout_is_tty() or dry_run)
     resolved_agent = _clean(agent).lower() or _default_agent_preference() or "auto"
     if resolved_agent not in {"auto", "claude", "codex"}:
         raise SystemExit(
