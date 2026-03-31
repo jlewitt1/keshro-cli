@@ -1,3 +1,5 @@
+from importlib.metadata import version as _pkg_version
+
 __all__ = ["__version__"]
 
-__version__ = "0.1.2"
+__version__ = _pkg_version("keshro")
