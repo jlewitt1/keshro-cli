@@ -2617,14 +2617,28 @@ async def _launch_single_agent(
         # Register with Collaborator/Conductor if available
         collab_session_id = f"keshro-{task_id}"
         launched_in_terminal = False
+        visible_fallback_reason = ""
         try:
-            from .collaborator import is_available, launch_terminal, notify, session_end, session_start
+            from .collaborator import (
+                is_available,
+                launch_terminal,
+                notify,
+                session_end,
+                session_start,
+            )
 
             collab_active = is_available()
-            if collab_active:
+            if collab_active and not visible:
                 session_start(collab_session_id, work_dir)
+            elif visible:
+                visible_fallback_reason = "Collaborator/Conductor is not running; falling back to headless execution"
         except Exception:
             collab_active = False
+            if visible:
+                visible_fallback_reason = "Collaborator/Conductor integration failed; falling back to headless execution"
+
+        if visible and not launched_in_terminal and visible_fallback_reason:
+            print(f"    {YELLOW}!{RESET} {visible_fallback_reason}")
 
         # For Codex, create a manual git worktree for isolation and merge the
         # resulting changes back into the main repo after the run succeeds.
@@ -2711,8 +2725,17 @@ async def _launch_single_agent(
                     session_id=collab_session_id,
                 )
                 launched_in_terminal = tile_id is not None
+                if launched_in_terminal:
+                    print(f"    {DIM}Visible tile launched in Conductor.{RESET}")
+                else:
+                    visible_fallback_reason = "visible terminal launch RPC unavailable"
+                    session_start(collab_session_id, work_dir)
             except Exception:
                 launched_in_terminal = False
+                visible_fallback_reason = (
+                    "Collaborator/Conductor integration failed; falling back to headless execution"
+                )
+                session_start(collab_session_id, work_dir)
 
         if launched_in_terminal:
             # Agent is running in a visible Conductor terminal tile.
@@ -2740,7 +2763,9 @@ async def _launch_single_agent(
                                     break
                                 elif status == "blocked":
                                     exit_code = 1
-                                    stderr_text = t.get("blocked_reason", "Agent blocked")
+                                    stderr_text = t.get(
+                                        "blocked_reason", "Agent blocked"
+                                    )
                                     break
                         else:
                             poll_interval = min(poll_interval + 2, 15)
