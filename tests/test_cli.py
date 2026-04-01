@@ -1525,7 +1525,7 @@ def test_setup_claude_creates_slash_command(monkeypatch, tmp_path, capsys):
     content = target.read_text()
     assert "keshro continue" in content
     assert "Do NOT use Keshro MCP tools" in content
-    assert "keshro create -f /tmp/keshro-context.txt" in content
+    assert "keshro create --context-file /tmp/keshro-context.txt" in content
     assert "Do not inspect the codebase first to decide whether Keshro is relevant." in content
     assert "the first pass may take a bit before follow-up questions appear" in content
     assert "immediately surface the dashboard URL to the user" in content
@@ -1568,6 +1568,43 @@ def test_setup_claude_overwrites_existing(monkeypatch, tmp_path, capsys):
     content = (commands_dir / "keshro.md").read_text()
     assert "old content" not in content
     assert "keshro continue" in content
+
+
+def test_setup_claude_creates_symlink(monkeypatch, tmp_path, capsys):
+    """setup-claude should create a symlink to the package's skill file,
+    not a copy. This ensures editable installs auto-update."""
+    commands_dir = tmp_path / "commands"
+    monkeypatch.setattr("keshro_cli.cli.CLAUDE_COMMANDS_DIR", commands_dir)
+
+    cli.main(["setup-claude"])
+
+    target = commands_dir / "keshro.md"
+    assert target.is_symlink(), "keshro.md should be a symlink, not a regular file"
+    assert target.resolve() == cli._SKILL_FILE.resolve()
+    # Content should be readable through the symlink
+    assert "TRIGGER when:" in target.read_text()
+
+
+def test_setup_claude_replaces_regular_file_with_symlink(monkeypatch, tmp_path, capsys):
+    """If an old regular file exists (pre-symlink installs), replace it."""
+    commands_dir = tmp_path / "commands"
+    commands_dir.mkdir(parents=True)
+    (commands_dir / "keshro.md").write_text("old copied content")
+    monkeypatch.setattr("keshro_cli.cli.CLAUDE_COMMANDS_DIR", commands_dir)
+
+    cli.main(["setup-claude"])
+
+    target = commands_dir / "keshro.md"
+    assert target.is_symlink()
+    assert "old copied content" not in target.read_text()
+    assert "TRIGGER when:" in target.read_text()
+
+
+def test_skill_file_lives_in_package():
+    """The skill file must exist in the package data directory."""
+    assert cli._SKILL_FILE.exists(), f"Skill file missing at {cli._SKILL_FILE}"
+    content = cli._SKILL_FILE.read_text()
+    assert content == cli.KESHRO_SLASH_COMMAND
 
 
 def test_create_reads_context_from_file(fake_client, monkeypatch, tmp_path, capsys):
@@ -3274,8 +3311,11 @@ def test_get_plan_or_exit_clears_stale_cached_default_on_404(monkeypatch):
 def test_install_codex_integration_replaces_existing_managed_block(
     monkeypatch, tmp_path
 ):
+    """Codex integration should replace old (un-versioned or stale-versioned)
+    keshro blocks with the current versioned block."""
     monkeypatch.setattr("keshro_cli.cli.CODEX_HOME_DIR", tmp_path)
     target = tmp_path / "AGENTS.md"
+    # Simulate an old un-versioned marker from a previous install
     old_block = (
         "<!-- keshro-agent-instructions -->\n"
         "# Keshro Integration\n\n"
@@ -3287,10 +3327,84 @@ def test_install_codex_integration_replaces_existing_managed_block(
     cli._install_codex_integration()
 
     content = target.read_text()
+    from keshro_cli import __version__
+
     assert "OLD CONTENT" not in content
     assert "Existing intro" in content
     assert "Existing footer" in content
-    assert content.count("<!-- keshro-agent-instructions -->") == 2
+    assert f"v{__version__}" in content
+    assert "TRIGGER when:" in content
+
+
+def test_install_codex_integration_replaces_old_versioned_block(
+    monkeypatch, tmp_path
+):
+    """Codex integration should replace a block from an older CLI version."""
+    monkeypatch.setattr("keshro_cli.cli.CODEX_HOME_DIR", tmp_path)
+    target = tmp_path / "AGENTS.md"
+    old_block = (
+        "<!-- keshro-agent-instructions v0.0.1 -->\n"
+        "# Keshro Integration\n\n"
+        "OLD VERSION CONTENT\n"
+        "<!-- keshro-agent-instructions v0.0.1 -->\n"
+    )
+    target.write_text("Intro\n\n" + old_block + "\nFooter\n")
+
+    cli._install_codex_integration()
+
+    content = target.read_text()
+    from keshro_cli import __version__
+
+    assert "OLD VERSION CONTENT" not in content
+    assert "v0.0.1" not in content
+    assert f"v{__version__}" in content
+    assert "Intro" in content
+    assert "Footer" in content
+
+
+def test_maybe_refresh_codex_updates_stale_version(monkeypatch, tmp_path):
+    """Auto-refresh should rewrite Codex AGENTS.md when version is stale."""
+    monkeypatch.setattr("keshro_cli.cli.CODEX_HOME_DIR", tmp_path)
+    target = tmp_path / "AGENTS.md"
+    old_block = (
+        "<!-- keshro-agent-instructions v0.0.1 -->\n"
+        "# Keshro Integration\n\n"
+        "STALE CONTENT\n"
+        "<!-- keshro-agent-instructions v0.0.1 -->\n"
+    )
+    target.write_text(old_block)
+
+    cli._maybe_refresh_codex()
+
+    content = target.read_text()
+    from keshro_cli import __version__
+
+    assert "STALE CONTENT" not in content
+    assert f"v{__version__}" in content
+    assert "TRIGGER when:" in content
+
+
+def test_maybe_refresh_codex_skips_when_current(monkeypatch, tmp_path):
+    """Auto-refresh should not touch AGENTS.md if version already matches."""
+    monkeypatch.setattr("keshro_cli.cli.CODEX_HOME_DIR", tmp_path)
+    target = tmp_path / "AGENTS.md"
+    # Install current version first
+    cli._install_codex_integration()
+    mtime_before = target.stat().st_mtime
+
+    cli._maybe_refresh_codex()
+
+    assert target.stat().st_mtime == mtime_before
+
+
+def test_maybe_refresh_codex_skips_when_no_file(monkeypatch, tmp_path):
+    """Auto-refresh should not create AGENTS.md if it doesn't exist."""
+    monkeypatch.setattr("keshro_cli.cli.CODEX_HOME_DIR", tmp_path)
+    tmp_path.mkdir(exist_ok=True)
+
+    cli._maybe_refresh_codex()
+
+    assert not (tmp_path / "AGENTS.md").exists()
 
 
 def test_setup_all_reports_already_present_integrations(monkeypatch, capsys):
