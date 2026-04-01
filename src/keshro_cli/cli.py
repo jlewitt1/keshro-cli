@@ -4321,15 +4321,16 @@ def _create_migration(
         Optional[list[str]],
         typer.Option(
             "--answer",
-            "-a",
-            help="Set a clarifier answer as question_id=value. Repeat for multiple answers.",
+            help="Internal agent resume option for clarifier answers.",
+            hidden=True,
         ),
     ] = None,
     answers_file: Annotated[
         Optional[str],
         typer.Option(
             "--answers-file",
-            help="JSON file containing clarifier answers keyed by question_id.",
+            help="Internal agent resume option for clarifier answers.",
+            hidden=True,
         ),
     ] = None,
     context: Annotated[
@@ -4403,7 +4404,7 @@ def _create_migration(
         ),
     ] = "auto",
 ):
-    """Create a project. Pass a directory, GitHub URL, Linear URL, or any URL — Keshro figures out the rest."""
+    """Create a migration or project from a repo, issue, URL, or freeform request."""
     if path and (
         as_migration
         or _clean(source_type_override)
