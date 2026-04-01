@@ -1538,19 +1538,14 @@ def test_slash_command_has_trigger_conditions():
     """The skill description must front-load trigger keywords so Claude Code
     invokes it automatically — even from the truncated skill list preview."""
     first_line = cli.KESHRO_SLASH_COMMAND.split("\n")[0]
-    # Must not start with generic "You are integrated" — that gets truncated
-    # before conveying any trigger information.
-    assert not first_line.startswith("You are integrated"), (
-        "First line must lead with trigger-relevant info, not a generic intro"
+    # ~/.claude/commands/ files truncate at ~100 chars in the skill list preview.
+    # TRIGGER and key verbs must be on the FIRST LINE to survive truncation.
+    assert first_line.startswith("TRIGGER when:"), (
+        "First line must start with TRIGGER — commands/*.md truncates at ~100 chars"
     )
-
-    # Claude Code truncates skill descriptions at 250 chars in the skill list.
-    # The TRIGGER block and key verbs must fit within that limit so the agent
-    # matches user requests like "migrate X to Y" without explicitly saying /keshro.
-    trigger_block = cli.KESHRO_SLASH_COMMAND[:250]
-    for keyword in ["TRIGGER when:", "migrate", "refactor", "upgrade", "convert"]:
-        assert keyword in trigger_block, (
-            f"'{keyword}' must appear in the first 250 chars so it survives truncation"
+    for keyword in ["migrate", "refactor", "upgrade", "convert"]:
+        assert keyword in first_line, (
+            f"'{keyword}' must appear in the first line so it survives truncation"
         )
 
     # Negative trigger: don't fire when working on Keshro's own codebase.

@@ -1,7 +1,6 @@
-Keshro — the intelligent execution layer for AI agents. Plans and executes complex engineering tasks.
-TRIGGER when: user asks to migrate, refactor, convert, upgrade, move, replace, or plan any multi-step engineering task (e.g., "migrate X to Y", "refactor the auth module", "upgrade from Postgres to CockroachDB", "plan this project"). Invoke this skill BEFORE exploring the codebase or asking clarifying questions — Keshro handles research, context gathering, and planning automatically.
+TRIGGER when: user asks to migrate, refactor, convert, upgrade, move, replace, or plan any multi-step task.
+Keshro plans and executes complex engineering tasks. Invoke BEFORE exploring the codebase or asking clarifying questions — Keshro handles research, context gathering, and planning automatically. Run all keshro commands via Bash.
 DO NOT TRIGGER when: user asks about Keshro internals, wants to modify Keshro source code, or is working on the Keshro codebase itself.
-Run all keshro commands via Bash.
 
 ## Auth
 If `keshro config` shows `Authenticated: no`, tell the user to run:
