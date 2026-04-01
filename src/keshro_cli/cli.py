@@ -1065,10 +1065,10 @@ def _parse_field_assignments(values: list[str] | None) -> dict[str, str]:
     return parsed
 
 
-def _load_answer_file(path: str | None) -> dict[str, str]:
+def _load_answer_file_bundle(path: str | None) -> tuple[dict[str, str], list[dict]]:
     raw_path = _clean(path)
     if not raw_path:
-        return {}
+        return ({}, [])
     try:
         payload = json.loads(Path(raw_path).read_text())
     except OSError as exc:
@@ -1077,6 +1077,9 @@ def _load_answer_file(path: str | None) -> dict[str, str]:
         raise SystemExit(
             f"Invalid JSON in --answers-file {raw_path}: {exc}"
         ) from exc
+    questions = []
+    if isinstance(payload, dict) and isinstance(payload.get("questions"), list):
+        questions = [q for q in payload.get("questions") or [] if isinstance(q, dict)]
     if isinstance(payload, dict) and isinstance(payload.get("answers"), dict):
         source = payload["answers"]
     elif isinstance(payload, dict):
@@ -1091,7 +1094,12 @@ def _load_answer_file(path: str | None) -> dict[str, str]:
         answer_value = _clean(str(value))
         if question_id and answer_value:
             parsed[question_id] = answer_value
-    return parsed
+    return parsed, questions
+
+
+def _load_answer_file(path: str | None) -> dict[str, str]:
+    answers, _questions = _load_answer_file_bundle(path)
+    return answers
 
 
 def _write_agent_answers_file(
@@ -4314,7 +4322,8 @@ def _create_migration(
         typer.Option(
             "--field",
             "-f",
-            help="Set a template field as field_id=value. Repeat for multiple fields.",
+            help="Advanced template field override.",
+            hidden=True,
         ),
     ] = None,
     answer: Annotated[
@@ -4372,7 +4381,8 @@ def _create_migration(
         bool,
         typer.Option(
             "--skip-questions",
-            help="Skip clarifying questions and generate the plan immediately.",
+            help="Advanced option to skip clarifying questions.",
+            hidden=True,
         ),
     ] = False,
     as_migration: Annotated[
@@ -4386,14 +4396,16 @@ def _create_migration(
         Optional[str],
         typer.Option(
             "--source-type",
-            help="Explicit source technology when forcing migration mode.",
+            help="Advanced migration source override.",
+            hidden=True,
         ),
     ] = None,
     target_type_override: Annotated[
         Optional[str],
         typer.Option(
             "--target-type",
-            help="Explicit target technology when forcing migration mode.",
+            help="Advanced migration target override.",
+            hidden=True,
         ),
     ] = None,
     agent: Annotated[
@@ -4422,7 +4434,11 @@ def _create_migration(
 
     # Classify the positional source argument and set defaults
     source_type, source_value = _classify_source(source)
+    explicit_work_dir = False
+    if work_dir is not None:
+        explicit_work_dir = True
     if source_type == "directory" and work_dir is None:
+        explicit_work_dir = bool(source_value)
         work_dir = source_value or "."
     elif source_type == "github_repo" and repo_url is None:
         repo_url = source_value
@@ -4456,7 +4472,8 @@ def _create_migration(
 
     try:
         provided_clarifier_answers = _parse_field_assignments(answer)
-        provided_clarifier_answers.update(_load_answer_file(answers_file))
+        file_answers, resume_questions = _load_answer_file_bundle(answers_file)
+        provided_clarifier_answers.update(file_answers)
         context_entered_interactively = False
         if path:
             if not _state.json:
@@ -4529,10 +4546,18 @@ def _create_migration(
 
             # Step 1: Collect codebase context if we have a directory
             discovered_context = None
-            if os.path.isdir(resolved_work_dir):
+            explicit_scan_target = explicit_work_dir or bool(repo_url)
+            if os.path.isdir(resolved_work_dir) and _should_scan_default_work_dir(
+                resolved_work_dir, explicit_target=explicit_scan_target
+            ):
                 if not _state.json:
                     print(f"{CYAN}Using project: {resolved_work_dir}{RESET}")
                 discovered_context = _collect_generic_discovery(resolved_work_dir)
+            elif os.path.isdir(resolved_work_dir):
+                if not _state.json:
+                    print(
+                        f"{YELLOW}Skipping repo scan for {resolved_work_dir} because it does not look like the relevant project root.{RESET}"
+                    )
             elif not _state.json:
                 source_label = source_value or resolved_work_dir
                 print(f"{CYAN}Creating project from: {source_label}{RESET}")
@@ -4657,9 +4682,9 @@ def _create_migration(
             client = make_client()
 
             # Step 2: Get clarifying questions from the preview endpoint
-            questions: list[dict] = []
+            questions: list[dict] = list(resume_questions)
             enrichment_context = ""
-            if not skip_questions:
+            if not skip_questions and not questions:
                 if not _state.json:
                     print(f"{CYAN}Generating clarifying questions...{RESET}")
 
@@ -4863,6 +4888,48 @@ def _collect_generic_discovery(work_dir: str) -> str | None:
         pass
 
     return "\n\n".join(facts) if facts else None
+
+
+def _should_scan_default_work_dir(work_dir: str, *, explicit_target: bool = False) -> bool:
+    if explicit_target:
+        return True
+    root = Path(work_dir)
+    if not root.is_dir():
+        return False
+    try:
+        visible_entries = [entry for entry in root.iterdir() if not entry.name.startswith(".")]
+    except OSError:
+        return False
+    repo_like_children = 0
+    for entry in visible_entries[:30]:
+        if not entry.is_dir():
+            continue
+        if (entry / ".git").exists():
+            repo_like_children += 1
+            continue
+        if any((entry / marker).exists() for marker in ("package.json", "pyproject.toml", "go.mod", "Cargo.toml")):
+            repo_like_children += 1
+    if repo_like_children >= 2:
+        return False
+    strong_markers = {
+        ".git",
+        "package.json",
+        "requirements.txt",
+        "pyproject.toml",
+        "go.mod",
+        "Cargo.toml",
+        "pom.xml",
+        "build.gradle",
+        "Gemfile",
+        "Makefile",
+        "Dockerfile",
+        ".github",
+        "src",
+        "app",
+    }
+    if any((root / marker).exists() for marker in strong_markers):
+        return True
+    return repo_like_children == 0
 
 
 def _answer_questions_via_agent(

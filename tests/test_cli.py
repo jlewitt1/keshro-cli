@@ -1530,6 +1530,79 @@ def test_create_reads_context_from_file(fake_client, monkeypatch, tmp_path, caps
     assert "Scalability plan" in out
 
 
+def test_should_scan_default_work_dir_accepts_repo_like_root(tmp_path):
+    (tmp_path / ".git").mkdir()
+    assert cli._should_scan_default_work_dir(str(tmp_path)) is True
+
+
+def test_should_scan_default_work_dir_skips_parent_directory_with_multiple_repos(tmp_path):
+    repo_one = tmp_path / "repo-one"
+    repo_two = tmp_path / "repo-two"
+    repo_one.mkdir()
+    repo_two.mkdir()
+    (repo_one / ".git").mkdir()
+    (repo_two / "pyproject.toml").write_text("[project]\nname='demo'\n")
+    assert cli._should_scan_default_work_dir(str(tmp_path)) is False
+
+
+def test_should_scan_default_work_dir_honors_explicit_target(tmp_path):
+    repo_one = tmp_path / "repo-one"
+    repo_two = tmp_path / "repo-two"
+    repo_one.mkdir()
+    repo_two.mkdir()
+    (repo_one / ".git").mkdir()
+    (repo_two / "package.json").write_text("{}\n")
+    assert cli._should_scan_default_work_dir(str(tmp_path), explicit_target=True) is True
+
+
+def test_create_skips_default_directory_scan_when_cwd_looks_unrelated(
+    fake_client, monkeypatch, tmp_path, capsys
+):
+    unrelated_root = tmp_path / "workspace"
+    unrelated_root.mkdir()
+    (unrelated_root / "repo-one").mkdir()
+    (unrelated_root / "repo-two").mkdir()
+    (unrelated_root / "repo-one" / ".git").mkdir(parents=True)
+    (unrelated_root / "repo-two" / "pyproject.toml").write_text("[project]\nname='demo'\n")
+
+    monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
+    monkeypatch.setattr("keshro_cli.cli.update_auth", lambda payload: payload)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
+    monkeypatch.setattr("keshro_cli.cli._prompt_agent_display_name", lambda _agent: "Claude Code")
+    collect_calls: list[str] = []
+    monkeypatch.setattr(
+        "keshro_cli.cli._collect_generic_discovery",
+        lambda work_dir: collect_calls.append(work_dir) or None,
+    )
+    monkeypatch.chdir(unrelated_root)
+
+    original_post = fake_client.post
+
+    def _post(path, json=None, timeout=None):
+        if path == "/v1/plans/describe/preview":
+            assert json["discovered_context"] is None
+            return _FakeResponse({"questions": [], "enrichment_context": ""})
+        if path == "/v1/plans/generate":
+            return _FakeResponse(
+                {
+                    "id": "plan-general-1",
+                    "title": "General project plan",
+                    "status": "draft",
+                    "plan_steps": [],
+                }
+            )
+        return original_post(path, json=json, timeout=timeout)
+
+    fake_client.post = _post
+
+    code = cli.main(["create", "--context", "refactor auth"])
+
+    assert code == 0
+    assert collect_calls == []
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+    assert "Skipping repo scan" in out
+
+
 def test_resolve_menu_choice_supports_numbers_text_and_aliases():
     assert cli._resolve_menu_choice("2", ["Migration", "General"]) == "General"
     assert cli._resolve_menu_choice("general", ["Migration", "General"]) == "General"
@@ -2137,6 +2210,73 @@ def test_create_inside_coding_agent_accepts_answer_flags_on_rerun(
     )
 
     assert code == 0
+    assert "A: mwaa" in str(captured["description"])
+
+
+def test_create_inside_coding_agent_rerun_with_answers_file_skips_new_preview(
+    fake_client, monkeypatch, tmp_path
+):
+    monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
+    monkeypatch.setattr("keshro_cli.cli._collect_generic_discovery", lambda _: None)
+    monkeypatch.setattr("keshro_cli.cli.update_auth", lambda payload: payload)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr(
+        "keshro_cli.cli._prompt_agent_display_name", lambda _agent: "Claude Code"
+    )
+
+    captured: dict[str, object] = {}
+    original_post = fake_client.post
+    preview_calls = 0
+
+    def _post(path, json=None, timeout=None):
+        nonlocal preview_calls
+        if path == "/v1/plans/describe/preview":
+            preview_calls += 1
+            raise AssertionError("preview should not run on answers-file resume")
+        if path == "/v1/plans/generate":
+            captured["description"] = json["description"]
+            return _FakeResponse(
+                {
+                    "id": "plan-general-2",
+                    "title": "General project plan",
+                    "status": "draft",
+                    "plan_steps": [],
+                }
+            )
+        return original_post(path, json=json, timeout=timeout)
+
+    fake_client.post = _post
+
+    answers_path = tmp_path / "answers.json"
+    answers_path.write_text(
+        json.dumps(
+            {
+                "heading": "Keshro needs user answers before it can generate this plan.",
+                "answers": {"hosting_environment": "mwaa"},
+                "questions": [
+                    {
+                        "id": "hosting_environment",
+                        "question": "Where will the new workflow run?",
+                    }
+                ],
+            }
+        )
+    )
+
+    code = cli.main(
+        [
+            "create",
+            "--context",
+            "refactor auth",
+            "--answers-file",
+            str(answers_path),
+        ]
+    )
+
+    assert code == 0
+    assert preview_calls == 0
+    assert "Where will the new workflow run?" in str(captured["description"])
     assert "A: mwaa" in str(captured["description"])
 
 
