@@ -1607,6 +1607,61 @@ def test_skill_file_lives_in_package():
     assert content == cli.KESHRO_SLASH_COMMAND
 
 
+def test_maybe_refresh_claude_upgrades_regular_file(monkeypatch, tmp_path):
+    """Auto-refresh should replace a stale regular file with a symlink."""
+    commands_dir = tmp_path / "commands"
+    commands_dir.mkdir(parents=True)
+    target = commands_dir / "keshro.md"
+    target.write_text("old regular file content")
+    monkeypatch.setattr("keshro_cli.cli.CLAUDE_COMMANDS_DIR", commands_dir)
+
+    cli._maybe_refresh_claude()
+
+    assert target.is_symlink()
+    assert "TRIGGER when:" in target.read_text()
+
+
+def test_maybe_refresh_claude_upgrades_stale_symlink(monkeypatch, tmp_path):
+    """Auto-refresh should replace a symlink pointing to old install path."""
+    commands_dir = tmp_path / "commands"
+    commands_dir.mkdir(parents=True)
+    target = commands_dir / "keshro.md"
+    old_file = tmp_path / "old_keshro.md"
+    old_file.write_text("stale symlink target")
+    target.symlink_to(old_file)
+    monkeypatch.setattr("keshro_cli.cli.CLAUDE_COMMANDS_DIR", commands_dir)
+
+    cli._maybe_refresh_claude()
+
+    assert target.is_symlink()
+    assert target.resolve() == cli._SKILL_FILE.resolve()
+
+
+def test_maybe_refresh_claude_skips_when_current(monkeypatch, tmp_path):
+    """Auto-refresh should not touch a correct symlink."""
+    commands_dir = tmp_path / "commands"
+    commands_dir.mkdir(parents=True)
+    target = commands_dir / "keshro.md"
+    target.symlink_to(cli._SKILL_FILE)
+    mtime_before = target.lstat().st_mtime
+    monkeypatch.setattr("keshro_cli.cli.CLAUDE_COMMANDS_DIR", commands_dir)
+
+    cli._maybe_refresh_claude()
+
+    assert target.lstat().st_mtime == mtime_before
+
+
+def test_maybe_refresh_claude_skips_when_no_file(monkeypatch, tmp_path):
+    """Auto-refresh should not create keshro.md if not installed."""
+    commands_dir = tmp_path / "commands"
+    commands_dir.mkdir(parents=True)
+    monkeypatch.setattr("keshro_cli.cli.CLAUDE_COMMANDS_DIR", commands_dir)
+
+    cli._maybe_refresh_claude()
+
+    assert not (commands_dir / "keshro.md").exists()
+
+
 def test_create_reads_context_from_file(fake_client, monkeypatch, tmp_path, capsys):
     _auth = {**_auth_with_plan(), "token": "ksh_pat_test"}
     monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: _auth)

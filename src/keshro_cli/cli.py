@@ -5522,7 +5522,7 @@ def _config_show():
             print(f"{DIM}Current repo project:{RESET} {YELLOW}{repo_plan}{RESET}")
             if repo_plan_url:
                 print(f"{DIM}Project URL:{RESET} {CYAN}{repo_plan_url}{RESET}")
-    if default_plan and plan_id != repo_plan_id:
+    if default_plan and plan_id != repo_plan_id and not repo_plan:
         app_url = _app_url_from_api_url(payload["api_url"])
         default_migration_id = payload.get("default_context_migration_id") or ""
         if default_migration_id:
@@ -5954,6 +5954,25 @@ def _maybe_refresh_codex() -> None:
         if _codex_versioned_marker() not in content:
             _install_codex_integration()
             print(f"Updated Codex agent skill to v{__version__}", file=sys.stderr)
+    except OSError:
+        pass
+
+
+def _maybe_refresh_claude() -> None:
+    """Upgrade Claude Code skill if it's a stale regular file or wrong symlink."""
+    target = CLAUDE_COMMANDS_DIR / "keshro.md"
+    if not target.exists() and not target.is_symlink():
+        return
+    try:
+        needs_update = False
+        if target.exists() and not target.is_symlink():
+            # Old pre-symlink install — regular file, always stale
+            needs_update = True
+        elif target.is_symlink() and target.resolve() != _SKILL_FILE.resolve():
+            # Symlink pointing to old install path
+            needs_update = True
+        if needs_update:
+            _install_claude_integration()
     except OSError:
         pass
 
@@ -8624,6 +8643,7 @@ def _print_request_error(exc: httpx.RequestError) -> None:
 
 def main(argv: list[str] | None = None):
     argv = sys.argv[1:] if argv is None else argv
+    _maybe_refresh_claude()
     _maybe_refresh_codex()
     if not argv:
         print(__version__)
