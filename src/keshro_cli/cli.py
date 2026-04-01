@@ -5881,7 +5881,6 @@ CLAUDE_SKILLS_DIR = Path.home() / ".claude" / "skills"
 CODEX_HOME_DIR = Path.home() / ".codex"
 
 _SKILL_FILE = Path(__file__).parent / "data" / "SKILL.md"
-_LEGACY_COMMAND_FILE = Path(__file__).parent / "data" / "keshro.md"
 try:
     KESHRO_SLASH_COMMAND = _SKILL_FILE.read_text()
 except FileNotFoundError:
