@@ -1065,10 +1065,10 @@ def _parse_field_assignments(values: list[str] | None) -> dict[str, str]:
     return parsed
 
 
-def _load_answer_file_bundle(path: str | None) -> tuple[dict[str, str], list[dict]]:
+def _load_answer_file_bundle(path: str | None) -> tuple[dict[str, str], list[dict], str]:
     raw_path = _clean(path)
     if not raw_path:
-        return ({}, [])
+        return ({}, [], "")
     try:
         payload = json.loads(Path(raw_path).read_text())
     except OSError as exc:
@@ -1078,8 +1078,11 @@ def _load_answer_file_bundle(path: str | None) -> tuple[dict[str, str], list[dic
             f"Invalid JSON in --answers-file {raw_path}: {exc}"
         ) from exc
     questions = []
+    enrichment_context = ""
     if isinstance(payload, dict) and isinstance(payload.get("questions"), list):
         questions = [q for q in payload.get("questions") or [] if isinstance(q, dict)]
+    if isinstance(payload, dict):
+        enrichment_context = _clean(payload.get("enrichment_context"))
     if isinstance(payload, dict) and isinstance(payload.get("answers"), dict):
         source = payload["answers"]
     elif isinstance(payload, dict):
@@ -1094,11 +1097,11 @@ def _load_answer_file_bundle(path: str | None) -> tuple[dict[str, str], list[dic
         answer_value = _clean(str(value))
         if question_id and answer_value:
             parsed[question_id] = answer_value
-    return parsed, questions
+    return parsed, questions, enrichment_context
 
 
 def _load_answer_file(path: str | None) -> dict[str, str]:
-    answers, _questions = _load_answer_file_bundle(path)
+    answers, _questions, _enrichment_context = _load_answer_file_bundle(path)
     return answers
 
 
@@ -1107,6 +1110,7 @@ def _write_agent_answers_file(
     heading: str,
     questions: list[dict],
     suggested_answers: dict[str, str],
+    enrichment_context: str = "",
 ) -> str:
     import tempfile
 
@@ -1114,6 +1118,7 @@ def _write_agent_answers_file(
         "heading": heading,
         "answers": suggested_answers,
         "questions": questions,
+        "enrichment_context": enrichment_context,
     }
     fd, path = tempfile.mkstemp(prefix="keshro-answers-", suffix=".json")
     with os.fdopen(fd, "w") as handle:
@@ -1137,11 +1142,13 @@ def _exit_for_agent_clarifier_feedback(
     questions: list[dict],
     suggested_answers: dict[str, str],
     rerun_command: str,
+    enrichment_context: str = "",
 ) -> None:
     answers_file = _write_agent_answers_file(
         heading=heading,
         questions=questions,
         suggested_answers=suggested_answers,
+        enrichment_context=enrichment_context,
     )
     rerun_command = f"{rerun_command} --answers-file {shlex.quote(answers_file)}"
     if _state.json:
@@ -1198,7 +1205,7 @@ def _exit_for_agent_migration_confirmation(
     agent: str,
 ) -> None:
     migration_command = (
-        f"keshro create --path {shlex.quote(template_key)} --context {shlex.quote(context)}"
+        f"keshro create --template {shlex.quote(template_key)} --context {shlex.quote(context)}"
         if template_key
         else f"keshro create --as-migration --context {shlex.quote(context)}"
     )
@@ -4254,7 +4261,7 @@ def _resolve_explicit_migration_context(
 
     raise SystemExit(
         "Could not determine the migration source and target from the provided context. "
-        "Pass --source-type and --target-type, or use --path <template-key>."
+        "Pass --source-type and --target-type, or use --template <template-key>."
     )
 
 
@@ -4309,19 +4316,18 @@ def _create_migration(
             help="Directory, GitHub URL, Linear URL, or any URL. Defaults to current directory.",
         ),
     ] = None,
-    path: Annotated[
+    template: Annotated[
         Optional[str],
         typer.Option(
-            "--path",
-            "-p",
-            help="Migration path key, e.g. aws-batch-to-airflow. Run 'keshro migration templates' to see all paths.",
+            "--template",
+            "-t",
+            help="Migration template key, e.g. aws-batch-to-airflow. Run 'keshro migration templates' to see all templates.",
         ),
     ] = None,
     field: Annotated[
         Optional[list[str]],
         typer.Option(
             "--field",
-            "-f",
             help="Advanced template field override.",
             hidden=True,
         ),
@@ -4349,6 +4355,7 @@ def _create_migration(
         Optional[str],
         typer.Option(
             "--context-file",
+            "-f",
             help="Read additional context from a file.",
         ),
     ] = None,
@@ -4356,7 +4363,7 @@ def _create_migration(
         Optional[str], typer.Option("--github-url", "-g", help="GitHub URL to attach.")
     ] = None,
     resource_url: Annotated[
-        Optional[str], typer.Option("--resource-url", help="Reference URL to attach.")
+        Optional[str], typer.Option("--resource-url", "-u", help="Reference URL to attach.")
     ] = None,
     org_id: Annotated[
         Optional[str], typer.Option("--org-id", "-o", help="Create under an org.")
@@ -4389,6 +4396,7 @@ def _create_migration(
         bool,
         typer.Option(
             "--as-migration",
+            "-m",
             help="Force migration mode. Detects source/target from context unless --source-type and --target-type are provided explicitly.",
         ),
     ] = False,
@@ -4412,18 +4420,19 @@ def _create_migration(
         str,
         typer.Option(
             "--agent",
+            "-a",
             help="Coding agent to use for discovery and clarifying questions: auto, claude, or codex.",
         ),
     ] = "auto",
 ):
     """Create a migration or project from a repo, issue, URL, or freeform request."""
-    if path and (
+    if template and (
         as_migration
         or _clean(source_type_override)
         or _clean(target_type_override)
     ):
         raise SystemExit(
-            "--path already selects migration mode. Do not combine it with --as-migration, --source-type, or --target-type."
+            "--template already selects migration mode. Do not combine it with --as-migration, --source-type, or --target-type."
         )
 
     file_context = _read_context_file(context_file)
@@ -4472,16 +4481,16 @@ def _create_migration(
 
     try:
         provided_clarifier_answers = _parse_field_assignments(answer)
-        file_answers, resume_questions = _load_answer_file_bundle(answers_file)
+        file_answers, resume_questions, resume_enrichment_context = _load_answer_file_bundle(answers_file)
         provided_clarifier_answers.update(file_answers)
         context_entered_interactively = False
-        if path:
+        if template:
             if not _state.json:
                 print(f"{DIM}Using {_prompt_agent_display_name(agent)}{RESET}\n")
             # Migration mode — use the existing migration flow
             answers = _parse_field_assignments(field)
             return _create_migration_inner(
-                path,
+                template,
                 answers,
                 context,
                 github_url,
@@ -4582,7 +4591,7 @@ def _create_migration(
                 if not template_key:
                     raise SystemExit(
                         f"No migration template found for {source_tech} → {target_tech}. "
-                        "Pass --path <template-key> or add a matching migration template."
+                        "Pass --template <template-key> or add a matching migration template."
                     )
                 answers = _parse_field_assignments(field)
                 if detected_driver:
@@ -4603,7 +4612,7 @@ def _create_migration(
 
             # Detect migration intent and offer the migration pipeline
             migration_match = _detect_migration_intent(description)
-            if migration_match and not path:
+            if migration_match and not template:
                 if len(migration_match) == 2:
                     source_tech, target_tech = migration_match
                     detected_driver = None
@@ -4683,7 +4692,7 @@ def _create_migration(
 
             # Step 2: Get clarifying questions from the preview endpoint
             questions: list[dict] = list(resume_questions)
-            enrichment_context = ""
+            enrichment_context = resume_enrichment_context
             if not skip_questions and not questions:
                 if not _state.json:
                     print(f"{CYAN}Generating clarifying questions...{RESET}")
@@ -4743,6 +4752,7 @@ def _create_migration(
                         questions=questions,
                         suggested_answers={**answered, **suggested_for_missing},
                         rerun_command=rerun_command,
+                        enrichment_context=enrichment_context,
                     )
                 if not _state.json:
                     suggested_count = sum(
@@ -4924,8 +4934,6 @@ def _should_scan_default_work_dir(work_dir: str, *, explicit_target: bool = Fals
         "Makefile",
         "Dockerfile",
         ".github",
-        "src",
-        "app",
     }
     if any((root / marker).exists() for marker in strong_markers):
         return True
@@ -5147,7 +5155,7 @@ def _create_migration_inner(
                                 )
                     if not provided_clarifier_answers:
                         rerun_command = (
-                            f"keshro create --path {shlex.quote(path)}"
+                            f"keshro create --template {shlex.quote(path)}"
                             f" --context {shlex.quote(context or '')}"
                         ).rstrip()
                         if agent != "auto":
@@ -5421,6 +5429,7 @@ def _config_set(
         Optional[str],
         typer.Option(
             "--agent",
+            "-a",
             help="Default coding agent for create/continue: auto, claude, or codex.",
         ),
     ] = None,
@@ -5668,6 +5677,7 @@ def _continue_command(
         str,
         typer.Option(
             "--agent",
+            "-a",
             help="Coding agent to use for prompt-based resume flows: auto, claude, or codex.",
         ),
     ] = "auto",
@@ -5760,7 +5770,7 @@ keshro create --context "Refactor the auth module to support API keys"
 
 If the request is clearly a migration, prefer:
 ```bash
-keshro create --as-migration --context "migrate Jenkins pipelines to GitHub Actions"
+keshro create -m --context "migrate Jenkins pipelines to GitHub Actions"
 ```
 
 For longer descriptions, write to a temp file:
@@ -5769,7 +5779,7 @@ cat > /tmp/keshro-context.txt <<'EOF'
 Refactor the auth module to support API keys and rate limiting.
 The current JWT implementation needs to stay for backward compatibility.
 EOF
-keshro create --context-file /tmp/keshro-context.txt
+keshro create -f /tmp/keshro-context.txt
 ```
 
 Creation can take a bit — Keshro scans the repo, gathers context, and builds the migration or project. Do not assume it failed.

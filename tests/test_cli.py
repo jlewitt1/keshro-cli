@@ -875,7 +875,7 @@ def test_create_migration_from_path_key_prompts_and_posts_payload(
         )
 
     monkeypatch.setattr("subprocess.run", _fake_run)
-    cli.main(["create", "--path", "aws-batch-to-airflow"])
+    cli.main(["create", "--template", "aws-batch-to-airflow"])
 
     out = ANSI_RE.sub("", capsys.readouterr().out)
     clarifier_call = next(
@@ -940,7 +940,7 @@ def test_create_migration_from_path_key_can_use_codex(fake_client, monkeypatch, 
 
     monkeypatch.setattr("subprocess.run", _fake_run)
 
-    code = cli.main(["create", "--path", "aws-batch-to-airflow", "--agent", "codex"])
+    code = cli.main(["create", "--template", "aws-batch-to-airflow", "--agent", "codex"])
 
     assert code == 0
     out = ANSI_RE.sub("", capsys.readouterr().out)
@@ -994,7 +994,7 @@ def test_create_migration_from_path_key_applies_shared_clarifiers(
     cli.main(
         [
             "create",
-            "--path",
+            "--template",
             "aws-batch-to-airflow",
             "--answer",
             "rollback_strategy=switch back to Batch scheduling immediately",
@@ -1016,7 +1016,7 @@ def test_create_migration_from_path_key_requires_claude_code(fake_client, monkey
     monkeypatch.delenv("CLAUDE_CODE_ENTRYPOINT", raising=False)
     monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
     monkeypatch.setattr("shutil.which", lambda name: None)
-    exit_code = cli.main(["create", "--path", "aws-batch-to-airflow"])
+    exit_code = cli.main(["create", "--template", "aws-batch-to-airflow"])
     assert exit_code == 1
 
 
@@ -1357,7 +1357,7 @@ def test_continue_allows_codex_for_parallel_mode(fake_client, monkeypatch, capsy
         lambda coro: (parallel_called.update({"yes": True}), coro.close())[1],
     )
 
-    exit_code = cli.main(["continue", "--agent", "codex"])
+    exit_code = cli.main(["continue", "-a", "codex"])
     out = ANSI_RE.sub("", capsys.readouterr().out)
 
     assert exit_code == 0
@@ -1473,7 +1473,7 @@ def test_setup_claude_creates_slash_command(monkeypatch, tmp_path, capsys):
     content = target.read_text()
     assert "keshro continue" in content
     assert "Do NOT use Keshro MCP tools" in content
-    assert "keshro create --context-file /tmp/keshro-context.txt" in content
+    assert "keshro create -f /tmp/keshro-context.txt" in content
 
 
 def test_setup_claude_overwrites_existing(monkeypatch, tmp_path, capsys):
@@ -2017,7 +2017,7 @@ def test_create_inside_coding_agent_explicit_migration_still_routes(monkeypatch)
         "keshro_cli.cli._create_migration_inner", _fake_create_migration_inner
     )
 
-    code = cli.main(["create", "--path", "aws-batch-to-airflow", "--context", "migrate from aws batch to airflow"])
+    code = cli.main(["create", "--template", "aws-batch-to-airflow", "--context", "migrate from aws batch to airflow"])
 
     assert code == 0
     assert captured["path"] == "aws-batch-to-airflow"
@@ -2048,7 +2048,7 @@ def test_create_inside_coding_agent_stops_for_detected_migration_confirmation(
     assert code == 0
     out = ANSI_RE.sub("", capsys.readouterr().out)
     assert "This looks like a migration (AWS Batch -> Airflow)." in out
-    assert "keshro create --path aws-batch-to-airflow --context 'migrate from aws batch to airflow'" in out
+    assert "keshro create --template aws-batch-to-airflow --context 'migrate from aws batch to airflow'" in out
 
 
 def test_create_inside_coding_agent_stops_before_generation_when_answers_missing(
@@ -2260,6 +2260,7 @@ def test_create_inside_coding_agent_rerun_with_answers_file_skips_new_preview(
                         "question": "Where will the new workflow run?",
                     }
                 ],
+                "enrichment_context": "Prefer changes that preserve existing deployment conventions.",
             }
         )
     )
@@ -2276,6 +2277,9 @@ def test_create_inside_coding_agent_rerun_with_answers_file_skips_new_preview(
 
     assert code == 0
     assert preview_calls == 0
+    assert "Prefer changes that preserve existing deployment conventions." in str(
+        captured["description"]
+    )
     assert "Where will the new workflow run?" in str(captured["description"])
     assert "A: mwaa" in str(captured["description"])
 
@@ -2421,7 +2425,7 @@ def test_config_set_saves_default_agent(monkeypatch, capsys):
         lambda payload: saved.update(payload) or saved,
     )
 
-    code = cli.main(["config", "set", "--agent", "codex"])
+    code = cli.main(["config", "set", "-a", "codex"])
 
     assert code == 0
     out = ANSI_RE.sub("", capsys.readouterr().out)
