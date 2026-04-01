@@ -5877,9 +5877,11 @@ def _continue_command(
 
 
 CLAUDE_COMMANDS_DIR = Path.home() / ".claude" / "commands"
+CLAUDE_SKILLS_DIR = Path.home() / ".claude" / "skills"
 CODEX_HOME_DIR = Path.home() / ".codex"
 
-_SKILL_FILE = Path(__file__).parent / "data" / "keshro.md"
+_SKILL_FILE = Path(__file__).parent / "data" / "SKILL.md"
+_LEGACY_COMMAND_FILE = Path(__file__).parent / "data" / "keshro.md"
 try:
     KESHRO_SLASH_COMMAND = _SKILL_FILE.read_text()
 except FileNotFoundError:
@@ -5890,21 +5892,23 @@ except FileNotFoundError:
     )
 
 def _install_claude_integration() -> Path:
-    CLAUDE_COMMANDS_DIR.mkdir(parents=True, exist_ok=True)
-    target = CLAUDE_COMMANDS_DIR / "keshro.md"
+    # Install as a skill (auto-triggered) in ~/.claude/skills/keshro/
+    skill_dir = CLAUDE_SKILLS_DIR / "keshro"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    target = skill_dir / "SKILL.md"
     was_regular_file = target.exists() and not target.is_symlink()
     was_stale_symlink = target.is_symlink() and target.resolve() != _SKILL_FILE.resolve()
-    # Symlink to the package's skill file so editable installs auto-update
-    # and regular installs update on `pip install --upgrade`.
     if target.is_symlink() or target.exists():
         target.unlink()
     try:
         target.symlink_to(_SKILL_FILE)
     except (OSError, NotImplementedError):
-        # Windows without developer mode — fall back to a copy
         import shutil
-
         shutil.copy2(_SKILL_FILE, target)
+    # Clean up legacy ~/.claude/commands/keshro.md
+    legacy = CLAUDE_COMMANDS_DIR / "keshro.md"
+    if legacy.is_symlink() or legacy.exists():
+        legacy.unlink()
     if was_regular_file or was_stale_symlink:
         print(
             f"  Updated agent skill to v{__version__} (future updates are automatic)",
@@ -5959,17 +5963,19 @@ def _maybe_refresh_codex() -> None:
 
 
 def _maybe_refresh_claude() -> None:
-    """Upgrade Claude Code skill if it's a stale regular file or wrong symlink."""
-    target = CLAUDE_COMMANDS_DIR / "keshro.md"
-    if not target.exists() and not target.is_symlink():
-        return
+    """Upgrade Claude Code skill if stale, wrong location, or wrong symlink."""
     try:
+        skill_target = CLAUDE_SKILLS_DIR / "keshro" / "SKILL.md"
+        legacy_target = CLAUDE_COMMANDS_DIR / "keshro.md"
         needs_update = False
-        if target.exists() and not target.is_symlink():
-            # Old pre-symlink install — regular file, always stale
+        if legacy_target.exists() or legacy_target.is_symlink():
+            # Old commands/ install — migrate to skills/
             needs_update = True
-        elif target.is_symlink() and target.resolve() != _SKILL_FILE.resolve():
-            # Symlink pointing to old install path
+        elif not skill_target.exists() and not skill_target.is_symlink():
+            return
+        elif skill_target.exists() and not skill_target.is_symlink():
+            needs_update = True
+        elif skill_target.is_symlink() and skill_target.resolve() != _SKILL_FILE.resolve():
             needs_update = True
         if needs_update:
             _install_claude_integration()
@@ -5985,9 +5991,9 @@ def _install_agent_integrations(silent: bool = False) -> tuple[list[str], list[s
     installed: list[str] = []
     already_present: list[str] = []
 
-    # Claude Code — ~/.claude/commands/keshro.md
+    # Claude Code — ~/.claude/skills/keshro/SKILL.md
     try:
-        target_path = CLAUDE_COMMANDS_DIR / "keshro.md"
+        target_path = CLAUDE_SKILLS_DIR / "keshro" / "SKILL.md"
         existing = target_path.read_text() if target_path.exists() else None
         target = _install_claude_integration()
         label = f"Claude Code: {target}"
@@ -6045,8 +6051,8 @@ def _setup_claude():
     if _state.json:
         print_output({"status": "ok", "path": str(target)}, True)
     else:
-        print(f"Installed Claude Code slash command v{__version__} at {target}")
-        print("You can now use /keshro in any Claude Code session.")
+        print(f"Installed Claude Code skill v{__version__} at {target}")
+        print("Keshro will auto-trigger in Claude Code for migration and refactor tasks.")
 
 
 @app.command("setup-codex", hidden=True)

@@ -1512,15 +1512,16 @@ def test_continue_exits_when_token_expired(fake_client, monkeypatch):
     assert exit_code == 1
 
 
-def test_setup_claude_creates_slash_command(monkeypatch, tmp_path, capsys):
-    commands_dir = tmp_path / "commands"
-    monkeypatch.setattr("keshro_cli.cli.CLAUDE_COMMANDS_DIR", commands_dir)
+def test_setup_claude_creates_skill(monkeypatch, tmp_path, capsys):
+    skills_dir = tmp_path / "skills"
+    monkeypatch.setattr("keshro_cli.cli.CLAUDE_SKILLS_DIR", skills_dir)
+    monkeypatch.setattr("keshro_cli.cli.CLAUDE_COMMANDS_DIR", tmp_path / "legacy_commands")
 
     cli.main(["setup-claude"])
 
     out = capsys.readouterr().out
-    assert "Installed Claude Code slash command" in out
-    target = commands_dir / "keshro.md"
+    assert "Installed Claude Code skill" in out
+    target = skills_dir / "keshro" / "SKILL.md"
     assert target.exists()
     content = target.read_text()
     assert "keshro continue" in content
@@ -1532,64 +1533,68 @@ def test_setup_claude_creates_slash_command(monkeypatch, tmp_path, capsys):
     assert "If the status is still `analyzing`, simply tell the user it was created" in content
     assert "Do not summarize findings, comment on elapsed time, or offer to keep polling by default." in content
     assert "move from X to Y" in content
+    # Must have YAML frontmatter with description for auto-triggering
+    assert content.startswith("---")
+    assert "description:" in content
 
 
-def test_slash_command_has_trigger_conditions():
-    """The skill description must front-load trigger keywords so Claude Code
-    invokes it automatically — even from the truncated skill list preview."""
-    first_line = cli.KESHRO_SLASH_COMMAND.split("\n")[0]
-    # ~/.claude/commands/ files truncate at ~100 chars in the skill list preview.
-    # TRIGGER and key verbs must be on the FIRST LINE to survive truncation.
-    assert first_line.startswith("TRIGGER when:"), (
-        "First line must start with TRIGGER — commands/*.md truncates at ~100 chars"
-    )
-    for keyword in ["migrate", "refactor", "upgrade", "convert"]:
-        assert keyword in first_line, (
-            f"'{keyword}' must appear in the first line so it survives truncation"
+def test_skill_has_trigger_conditions():
+    """The SKILL.md frontmatter description must contain trigger keywords
+    so Claude Code auto-invokes Keshro for migration/refactor tasks."""
+    content = cli.KESHRO_SLASH_COMMAND
+    assert content.startswith("---"), "SKILL.md must have YAML frontmatter"
+    # Extract the frontmatter description block
+    parts = content.split("---", 2)
+    frontmatter = parts[1]
+    assert "description:" in frontmatter
+    for keyword in ["TRIGGER when:", "migrate", "refactor", "upgrade", "convert"]:
+        assert keyword in frontmatter, (
+            f"'{keyword}' must appear in SKILL.md frontmatter description"
         )
-
-    # Negative trigger: don't fire when working on Keshro's own codebase.
-    assert "DO NOT TRIGGER" in cli.KESHRO_SLASH_COMMAND
+    assert "DO NOT TRIGGER" in frontmatter
 
 
 def test_setup_claude_overwrites_existing(monkeypatch, tmp_path, capsys):
-    commands_dir = tmp_path / "commands"
-    commands_dir.mkdir(parents=True)
-    (commands_dir / "keshro.md").write_text("old content")
-    monkeypatch.setattr("keshro_cli.cli.CLAUDE_COMMANDS_DIR", commands_dir)
+    skills_dir = tmp_path / "skills"
+    skill_dir = skills_dir / "keshro"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("old content")
+    monkeypatch.setattr("keshro_cli.cli.CLAUDE_SKILLS_DIR", skills_dir)
+    monkeypatch.setattr("keshro_cli.cli.CLAUDE_COMMANDS_DIR", tmp_path / "legacy_commands")
 
     cli.main(["setup-claude"])
 
-    content = (commands_dir / "keshro.md").read_text()
+    content = (skill_dir / "SKILL.md").read_text()
     assert "old content" not in content
     assert "keshro continue" in content
 
 
 def test_setup_claude_creates_symlink(monkeypatch, tmp_path, capsys):
-    """setup-claude should create a symlink to the package's skill file,
-    not a copy. This ensures editable installs auto-update."""
-    commands_dir = tmp_path / "commands"
-    monkeypatch.setattr("keshro_cli.cli.CLAUDE_COMMANDS_DIR", commands_dir)
+    """setup-claude should create a symlink to the package's SKILL.md file."""
+    skills_dir = tmp_path / "skills"
+    monkeypatch.setattr("keshro_cli.cli.CLAUDE_SKILLS_DIR", skills_dir)
+    monkeypatch.setattr("keshro_cli.cli.CLAUDE_COMMANDS_DIR", tmp_path / "legacy_commands")
 
     cli.main(["setup-claude"])
 
-    target = commands_dir / "keshro.md"
-    assert target.is_symlink(), "keshro.md should be a symlink, not a regular file"
+    target = skills_dir / "keshro" / "SKILL.md"
+    assert target.is_symlink(), "SKILL.md should be a symlink, not a regular file"
     assert target.resolve() == cli._SKILL_FILE.resolve()
-    # Content should be readable through the symlink
     assert "TRIGGER when:" in target.read_text()
 
 
 def test_setup_claude_replaces_regular_file_with_symlink(monkeypatch, tmp_path, capsys):
     """If an old regular file exists (pre-symlink installs), replace it."""
-    commands_dir = tmp_path / "commands"
-    commands_dir.mkdir(parents=True)
-    (commands_dir / "keshro.md").write_text("old copied content")
-    monkeypatch.setattr("keshro_cli.cli.CLAUDE_COMMANDS_DIR", commands_dir)
+    skills_dir = tmp_path / "skills"
+    skill_dir = skills_dir / "keshro"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("old copied content")
+    monkeypatch.setattr("keshro_cli.cli.CLAUDE_SKILLS_DIR", skills_dir)
+    monkeypatch.setattr("keshro_cli.cli.CLAUDE_COMMANDS_DIR", tmp_path / "legacy_commands")
 
     cli.main(["setup-claude"])
 
-    target = commands_dir / "keshro.md"
+    target = skill_dir / "SKILL.md"
     assert target.is_symlink()
     assert "old copied content" not in target.read_text()
     assert "TRIGGER when:" in target.read_text()
@@ -1602,29 +1607,48 @@ def test_skill_file_lives_in_package():
     assert content == cli.KESHRO_SLASH_COMMAND
 
 
-def test_maybe_refresh_claude_upgrades_regular_file(monkeypatch, tmp_path):
-    """Auto-refresh should replace a stale regular file with a symlink."""
-    commands_dir = tmp_path / "commands"
-    commands_dir.mkdir(parents=True)
-    target = commands_dir / "keshro.md"
-    target.write_text("old regular file content")
-    monkeypatch.setattr("keshro_cli.cli.CLAUDE_COMMANDS_DIR", commands_dir)
+def test_setup_claude_removes_legacy_command(monkeypatch, tmp_path, capsys):
+    """setup-claude should remove old ~/.claude/commands/keshro.md."""
+    skills_dir = tmp_path / "skills"
+    legacy_dir = tmp_path / "legacy_commands"
+    legacy_dir.mkdir(parents=True)
+    (legacy_dir / "keshro.md").write_text("old command file")
+    monkeypatch.setattr("keshro_cli.cli.CLAUDE_SKILLS_DIR", skills_dir)
+    monkeypatch.setattr("keshro_cli.cli.CLAUDE_COMMANDS_DIR", legacy_dir)
+
+    cli.main(["setup-claude"])
+
+    assert not (legacy_dir / "keshro.md").exists()
+    assert (skills_dir / "keshro" / "SKILL.md").exists()
+
+
+def test_maybe_refresh_claude_migrates_legacy_command(monkeypatch, tmp_path):
+    """Auto-refresh should migrate from commands/ to skills/ on upgrade."""
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir(parents=True)
+    legacy_dir = tmp_path / "legacy_commands"
+    legacy_dir.mkdir(parents=True)
+    (legacy_dir / "keshro.md").write_text("old command content")
+    monkeypatch.setattr("keshro_cli.cli.CLAUDE_SKILLS_DIR", skills_dir)
+    monkeypatch.setattr("keshro_cli.cli.CLAUDE_COMMANDS_DIR", legacy_dir)
 
     cli._maybe_refresh_claude()
 
-    assert target.is_symlink()
-    assert "TRIGGER when:" in target.read_text()
+    assert not (legacy_dir / "keshro.md").exists()
+    assert (skills_dir / "keshro" / "SKILL.md").is_symlink()
 
 
 def test_maybe_refresh_claude_upgrades_stale_symlink(monkeypatch, tmp_path):
     """Auto-refresh should replace a symlink pointing to old install path."""
-    commands_dir = tmp_path / "commands"
-    commands_dir.mkdir(parents=True)
-    target = commands_dir / "keshro.md"
-    old_file = tmp_path / "old_keshro.md"
+    skills_dir = tmp_path / "skills"
+    skill_dir = skills_dir / "keshro"
+    skill_dir.mkdir(parents=True)
+    target = skill_dir / "SKILL.md"
+    old_file = tmp_path / "old_skill.md"
     old_file.write_text("stale symlink target")
     target.symlink_to(old_file)
-    monkeypatch.setattr("keshro_cli.cli.CLAUDE_COMMANDS_DIR", commands_dir)
+    monkeypatch.setattr("keshro_cli.cli.CLAUDE_SKILLS_DIR", skills_dir)
+    monkeypatch.setattr("keshro_cli.cli.CLAUDE_COMMANDS_DIR", tmp_path / "legacy_commands")
 
     cli._maybe_refresh_claude()
 
@@ -1634,27 +1658,30 @@ def test_maybe_refresh_claude_upgrades_stale_symlink(monkeypatch, tmp_path):
 
 def test_maybe_refresh_claude_skips_when_current(monkeypatch, tmp_path):
     """Auto-refresh should not touch a correct symlink."""
-    commands_dir = tmp_path / "commands"
-    commands_dir.mkdir(parents=True)
-    target = commands_dir / "keshro.md"
+    skills_dir = tmp_path / "skills"
+    skill_dir = skills_dir / "keshro"
+    skill_dir.mkdir(parents=True)
+    target = skill_dir / "SKILL.md"
     target.symlink_to(cli._SKILL_FILE)
     mtime_before = target.lstat().st_mtime
-    monkeypatch.setattr("keshro_cli.cli.CLAUDE_COMMANDS_DIR", commands_dir)
+    monkeypatch.setattr("keshro_cli.cli.CLAUDE_SKILLS_DIR", skills_dir)
+    monkeypatch.setattr("keshro_cli.cli.CLAUDE_COMMANDS_DIR", tmp_path / "legacy_commands")
 
     cli._maybe_refresh_claude()
 
     assert target.lstat().st_mtime == mtime_before
 
 
-def test_maybe_refresh_claude_skips_when_no_file(monkeypatch, tmp_path):
-    """Auto-refresh should not create keshro.md if not installed."""
-    commands_dir = tmp_path / "commands"
-    commands_dir.mkdir(parents=True)
-    monkeypatch.setattr("keshro_cli.cli.CLAUDE_COMMANDS_DIR", commands_dir)
+def test_maybe_refresh_claude_skips_when_not_installed(monkeypatch, tmp_path):
+    """Auto-refresh should not create skill dir if not installed."""
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir(parents=True)
+    monkeypatch.setattr("keshro_cli.cli.CLAUDE_SKILLS_DIR", skills_dir)
+    monkeypatch.setattr("keshro_cli.cli.CLAUDE_COMMANDS_DIR", tmp_path / "legacy_commands")
 
     cli._maybe_refresh_claude()
 
-    assert not (commands_dir / "keshro.md").exists()
+    assert not (skills_dir / "keshro").exists()
 
 
 def test_create_reads_context_from_file(fake_client, monkeypatch, tmp_path, capsys):
