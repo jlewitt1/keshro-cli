@@ -779,6 +779,58 @@ def test_main_without_args_prints_version(capsys):
     assert capsys.readouterr().out.strip() == __version__
 
 
+def test_plan_generate_rejects_migration_like_requests(capsys, monkeypatch):
+    monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
+    monkeypatch.setattr(
+        "keshro_cli.cli._detect_migration_intent",
+        lambda _description: ("Prometheus", "SigNoz"),
+    )
+
+    code = cli.main(
+        [
+            "plan",
+            "generate",
+            "migrate all otel and prometheus related activities to signoz",
+        ]
+    )
+
+    assert code == 1
+    err = ANSI_RE.sub("", capsys.readouterr().err)
+    assert "This request looks like a migration." in err
+    assert "keshro create -m --context" in err
+
+
+def test_plan_generate_accepts_non_migration_requests(fake_client, capsys, monkeypatch):
+    monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
+    monkeypatch.setattr("keshro_cli.cli._detect_migration_intent", lambda _description: None)
+
+    original_post = fake_client.post
+
+    def _post(path, json=None, timeout=None):
+        if path == "/v1/plans/generate":
+            return _FakeResponse(
+                {
+                    "id": "plan-generic-1",
+                    "title": "Refactor auth module",
+                    "status": "draft",
+                    "plan_steps": [
+                        {"order": 1, "title": "Review existing auth flows"},
+                        {"order": 2, "title": "Implement API key support"},
+                    ],
+                }
+            )
+        return original_post(path, json=json, timeout=timeout)
+
+    fake_client.post = _post
+
+    code = cli.main(["plan", "generate", "refactor the auth module"])
+
+    assert code == 0
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+    assert "Project created: Refactor auth module" in out
+    assert "Tasks: 2" in out
+
+
 def test_templates_alias_lists_template_ids_by_default(fake_client, capsys):
     cli.main(["templates"])
     out = capsys.readouterr().out.strip().splitlines()
@@ -1474,6 +1526,12 @@ def test_setup_claude_creates_slash_command(monkeypatch, tmp_path, capsys):
     assert "keshro continue" in content
     assert "Do NOT use Keshro MCP tools" in content
     assert "keshro create -f /tmp/keshro-context.txt" in content
+    assert "Do not inspect the codebase first to decide whether Keshro is relevant." in content
+    assert "the first pass may take a bit before follow-up questions appear" in content
+    assert "immediately surface the dashboard URL to the user" in content
+    assert "If the status is still `analyzing`, simply tell the user it was created" in content
+    assert "Do not summarize findings, comment on elapsed time, or offer to keep polling by default." in content
+    assert "move from X to Y" in content
 
 
 def test_setup_claude_overwrites_existing(monkeypatch, tmp_path, capsys):

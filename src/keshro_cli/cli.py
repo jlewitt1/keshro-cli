@@ -5894,12 +5894,16 @@ The command is `keshro login`. There is no `auth` subcommand.
 keshro create
 ```
 Run from the project directory. Keshro scans the project, detects if it's a migration, surfaces follow-up questions back to the user, and creates the right project or migration with its execution context.
+When you start `keshro create`, tell the user the first pass may take a bit before follow-up questions appear so it does not look stalled.
 
-Before doing repo analysis, code search, or manual planning, if the request sounds like a migration, call Keshro first with:
+MANDATORY first step for migration-like requests:
+- Before doing repo analysis, code search, or manual planning, if the request sounds like a migration, call Keshro first with:
 ```bash
 keshro create -m --context "<user request>"
 ```
-Do not do your own migration discovery before Keshro has had a chance to create or resume the migration project.
+- Do not inspect the codebase first to decide whether Keshro is relevant.
+- Do not ask your own migration scoping questions before Keshro has created or resumed the migration project.
+- Do not do your own migration discovery before Keshro has had a chance to create or resume the migration project.
 
 Also accepts URLs:
 ```bash
@@ -5941,7 +5945,8 @@ EOF
 keshro create -f /tmp/keshro-context.txt
 ```
 
-Creation can take a bit — Keshro scans the repo, gathers context, and builds the migration or project. Do not assume it failed.
+Creation can take a bit — Keshro scans the repo, gathers context, and builds the migration or project. Do not assume it failed, and do not leave the user guessing about that delay.
+As soon as the migration or project is created, run `keshro status` and immediately surface the dashboard URL to the user.
 
 If the request has been identified and confirmed as a migration:
 - do not fall back to a generic project if Keshro returns an error
@@ -6013,7 +6018,8 @@ Keshro remembers your active execution context. No need to pass `-p` every time.
 1. Run `keshro create` (or with context/URL)
 2. If Keshro stops for migration confirmation or follow-up questions, surface them to the user conversationally and wait.
 3. If Keshro gave you an `--answers-file` resume path, update that file with the user's answers and rerun the exact resume command.
-4. Run `keshro status` — show the migration/project
+4. Run `keshro status` — show the migration/project and include the dashboard URL immediately
+   If the status is still `analyzing`, simply tell the user it was created, that analysis is still running, and give them the dashboard URL. Do not summarize findings, comment on elapsed time, or offer to keep polling by default.
 5. **STOP and ask the user**: "Here's the plan with N tasks. Ready to execute?"
 6. Do NOT run `keshro continue` until the user says to proceed
 
@@ -8232,6 +8238,15 @@ def _plan_generate(
 ):
     """Generate a plan from a description using AI."""
     _ensure_authenticated()
+
+    detected_migration = _detect_migration_intent(description)
+    if detected_migration:
+        raise SystemExit(
+            "This request looks like a migration. Use "
+            f"`keshro create -m --context {shlex.quote(description)}` "
+            "so Keshro can ask migration-specific follow-up questions and create a migration project."
+        )
+
     client = make_client()
 
     print(f"{CYAN}Generating plan from description...{RESET}")
