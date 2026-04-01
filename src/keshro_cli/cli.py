@@ -5895,6 +5895,12 @@ keshro create
 ```
 Run from the project directory. Keshro scans the project, detects if it's a migration, surfaces follow-up questions back to the user, and creates the right project or migration with its execution context.
 
+Before doing repo analysis, code search, or manual planning, if the request sounds like a migration, call Keshro first with:
+```bash
+keshro create -m --context "<user request>"
+```
+Do not do your own migration discovery before Keshro has had a chance to create or resume the migration project.
+
 Also accepts URLs:
 ```bash
 keshro create https://github.com/org/repo
