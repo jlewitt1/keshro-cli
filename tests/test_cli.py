@@ -2056,6 +2056,10 @@ def test_create_explicit_migration_without_template_uses_custom_migration_path(
 ):
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
     monkeypatch.setattr("keshro_cli.cli._collect_generic_discovery", lambda _: None)
+    monkeypatch.setattr(
+        "keshro_cli.cli._prompt_for_optional_cli_context",
+        lambda _label, existing: existing,
+    )
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
     monkeypatch.setattr(
         "keshro_cli.cli._find_migration_template", lambda _source, _target: None
