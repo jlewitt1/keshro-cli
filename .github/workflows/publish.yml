@@ -2,21 +2,56 @@ name: Publish CLI
 
 on:
   workflow_dispatch:
-  release:
-    types: [published]
+    inputs:
+      version:
+        description: Optional package version to publish. Defaults to pyproject.toml.
+        required: false
+        type: string
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     permissions:
       id-token: write  # Required for PyPI trusted publishing
+      contents: write
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+
+      - name: Resolve version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          python - <<'PY' >> "$GITHUB_ENV"
+          import os
+          import pathlib
+          import tomllib
+
+          data = tomllib.loads(pathlib.Path("pyproject.toml").read_text())
+          pyproject_version = str(data["project"]["version"]).strip()
+          requested_version = str(os.environ.get("INPUT_VERSION") or "").strip()
+
+          if requested_version and requested_version != pyproject_version:
+              raise SystemExit(
+                  f"Input version {requested_version!r} does not match pyproject version {pyproject_version!r}."
+              )
+
+          print(f"PACKAGE_VERSION={pyproject_version}")
+          print(f"RELEASE_TAG=v{pyproject_version}")
+          PY
+
+      - name: Ensure release tag does not already exist
+        run: |
+          if git rev-parse "${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "Tag ${RELEASE_TAG} already exists."
+            exit 1
+          fi
 
       - name: Install build tools
         run: pip install build
@@ -26,3 +61,12 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${RELEASE_TAG}" \
+            --title "${RELEASE_TAG}" \
+            --target "${GITHUB_SHA}" \
+            --generate-notes

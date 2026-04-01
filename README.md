@@ -66,3 +66,12 @@ Keshro can also create general projects from repos, issues, and freeform descrip
 ## License
 
 MIT
+# Releases
+
+Publish the CLI with one GitHub Actions run after you bump `pyproject.toml`:
+
+```bash
+gh workflow run "Publish CLI"
+```
+
+That workflow reads the package version from `pyproject.toml`, publishes the package to PyPI, then creates the matching `vX.Y.Z` GitHub release automatically.
