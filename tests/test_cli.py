@@ -2051,6 +2051,90 @@ def test_create_inside_coding_agent_stops_for_detected_migration_confirmation(
     assert "keshro create --template aws-batch-to-airflow --context 'migrate from aws batch to airflow'" in out
 
 
+def test_create_explicit_migration_without_template_uses_custom_migration_path(
+    monkeypatch,
+):
+    monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
+    monkeypatch.setattr("keshro_cli.cli._collect_generic_discovery", lambda _: None)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr(
+        "keshro_cli.cli._find_migration_template", lambda _source, _target: None
+    )
+
+    captured: dict[str, object] = {}
+
+    def _fake_create_custom_migration_inner(
+        source,
+        target,
+        context,
+        github_url,
+        resource_url,
+        org_id,
+        work_dir,
+        **kwargs,
+    ):
+        captured["source"] = source
+        captured["target"] = target
+        captured["context"] = context
+
+    monkeypatch.setattr(
+        "keshro_cli.cli._create_custom_migration_inner",
+        _fake_create_custom_migration_inner,
+    )
+
+    code = cli.main(
+        [
+            "create",
+            "-m",
+            "--source-type",
+            "Prometheus",
+            "--target-type",
+            "SigNoz",
+            "--context",
+            "migrate the python client from prometheus to signoz",
+        ]
+    )
+
+    assert code == 0
+    assert captured == {
+        "source": "Prometheus",
+        "target": "SigNoz",
+        "context": "migrate the python client from prometheus to signoz",
+    }
+
+
+def test_create_inside_coding_agent_stops_for_custom_migration_confirmation(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
+    monkeypatch.setattr("keshro_cli.cli._collect_generic_discovery", lambda _: None)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: True)
+    monkeypatch.setattr(
+        "keshro_cli.cli._prompt_agent_display_name", lambda _agent: "Claude Code"
+    )
+    monkeypatch.setattr(
+        "keshro_cli.cli._detect_migration_intent",
+        lambda _description: ("Prometheus", "SigNoz"),
+    )
+    monkeypatch.setattr(
+        "keshro_cli.cli._find_migration_template", lambda _source, _target: None
+    )
+
+    code = cli.main(
+        ["create", "--context", "move from prometheus to signoz in the python client"]
+    )
+
+    assert code == 0
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+    assert "This looks like a migration (Prometheus -> SigNoz)." in out
+    assert (
+        "keshro create -m --context 'move from prometheus to signoz in the python client'"
+        in out
+    )
+    assert "Treat as migration" in out
+
+
 def test_create_inside_coding_agent_stops_before_generation_when_answers_missing(
     fake_client, monkeypatch, capsys
 ):

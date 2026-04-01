@@ -1207,12 +1207,12 @@ def _exit_for_agent_migration_confirmation(
     migration_command = (
         f"keshro create --template {shlex.quote(template_key)} --context {shlex.quote(context)}"
         if template_key
-        else f"keshro create --as-migration --context {shlex.quote(context)}"
+        else f"keshro create -m --context {shlex.quote(context)}"
     )
     general_command = f"keshro create --context {shlex.quote(context)}"
     if agent != "auto":
-        migration_command += f" --agent {shlex.quote(agent)}"
-        general_command += f" --agent {shlex.quote(agent)}"
+        migration_command += f" -a {shlex.quote(agent)}"
+        general_command += f" -a {shlex.quote(agent)}"
     if _state.json:
         print_output(
             {
@@ -4589,9 +4589,23 @@ def _create_migration(
                 source_tech, target_tech, detected_driver = explicit_migration
                 template_key = _find_migration_template(source_tech, target_tech)
                 if not template_key:
-                    raise SystemExit(
-                        f"No migration template found for {source_tech} → {target_tech}. "
-                        "Pass --template <template-key> or add a matching migration template."
+                    if not _state.json:
+                        print(
+                            f"{DIM}No specific template found for {source_tech} → {target_tech}. "
+                            f"Continuing as a custom migration path.{RESET}\n"
+                        )
+                    return _create_custom_migration_inner(
+                        source_tech,
+                        target_tech,
+                        context,
+                        github_url,
+                        resource_url,
+                        org_id,
+                        work_dir,
+                        clarifier_answers=provided_clarifier_answers,
+                        skip_questions=skip_questions,
+                        prompt_for_context=not context_entered_interactively,
+                        agent=agent,
                     )
                 answers = _parse_field_assignments(field)
                 if detected_driver:
@@ -4677,16 +4691,24 @@ def _create_migration(
                                 agent=agent,
                             )
                         else:
-                            # No template found — continue with generic but flag as migration
-                            description = (
-                                f"MIGRATION: {source_tech} → {target_tech}\n\n"
-                                + description
-                            )
                             if not _state.json:
                                 print(
                                     f"{DIM}No specific template found for {source_tech} → {target_tech}. "
-                                    f"Generating as a migration-aware project.{RESET}\n"
+                                    f"Continuing as a custom migration path.{RESET}\n"
                                 )
+                            return _create_custom_migration_inner(
+                                source_tech,
+                                target_tech,
+                                context,
+                                github_url,
+                                resource_url,
+                                org_id,
+                                work_dir,
+                                clarifier_answers=provided_clarifier_answers,
+                                skip_questions=skip_questions,
+                                prompt_for_context=not context_entered_interactively,
+                                agent=agent,
+                            )
 
             client = make_client()
 
@@ -5177,6 +5199,123 @@ def _create_migration_inner(
             elif not _state.json:
                 print("No additional follow-up questions needed.")
     _create_migration_from_payload(payload, template, work_dir=resolved_work_dir)
+
+
+def _create_custom_migration_inner(
+    source: str,
+    target: str,
+    context: str | None,
+    github_url: str | None,
+    resource_url: str | None,
+    org_id: str | None,
+    work_dir: str | None,
+    clarifier_answers: dict[str, str] | None = None,
+    skip_questions: bool = False,
+    prompt_for_context: bool = True,
+    agent: str = "auto",
+) -> None:
+    with make_client(_state.api_url, _state.token) as client:
+        resolved_work_dir = str(Path(work_dir).resolve()) if work_dir else None
+        discovered_context = None
+        if resolved_work_dir and os.path.isdir(resolved_work_dir):
+            if _should_scan_default_work_dir(
+                resolved_work_dir, explicit_target=bool(work_dir)
+            ):
+                scan_target = (
+                    "the current working directory"
+                    if resolved_work_dir == str(Path.cwd().resolve())
+                    else f"the project directory ({resolved_work_dir})"
+                )
+                with _Spinner(
+                    f"Analyzing {scan_target} for {source} -> {target} migration context..."
+                ):
+                    discovered_context = _collect_generic_discovery(resolved_work_dir)
+
+        if prompt_for_context:
+            context = _prompt_for_optional_cli_context(f"{source} -> {target}", context)
+        merged_context = f"CLI bootstrap for {source} -> {target}."
+        if _clean(context):
+            merged_context = f"{merged_context}\n\n{_clean(context)}"
+
+        custom_fields: dict[str, str] = {}
+        if discovered_context:
+            custom_fields["__keshro_discovered_context"] = discovered_context
+            merged_context = "\n\n".join(
+                [
+                    merged_context,
+                    "Discovered project context",
+                    discovered_context,
+                ]
+            )
+
+        payload = {
+            "source_type": source,
+            "target_type": target,
+            "input_method": "cli_agent",
+            "context": merged_context,
+            "files": [],
+            "github_url": _clean(github_url) or None,
+            "resource_url": _clean(resource_url) or None,
+            "org_id": _clean(org_id) or None,
+            "custom_fields": custom_fields or None,
+        }
+        if not skip_questions:
+            with _Spinner(
+                "Checking for high-impact follow-up questions (this can take a bit)..."
+            ):
+                clarifier_questions = _get_migration_clarifiers(client, payload)
+            if clarifier_questions:
+                suggested_answers: dict[str, str] = {}
+                provided_clarifier_answers = dict(clarifier_answers or {})
+                if provided_clarifier_answers:
+                    missing_ids = _missing_question_ids(
+                        clarifier_questions, provided_clarifier_answers
+                    )
+                    if missing_ids:
+                        raise SystemExit(
+                            "Missing --answer values for: " + ", ".join(missing_ids)
+                        )
+                if _inside_coding_agent():
+                    if not provided_clarifier_answers:
+                        with _Spinner(
+                            "Collecting suggested follow-up answers (this can take a bit)..."
+                        ):
+                            try:
+                                suggested_answers = _collect_clarifier_answers_from_claude(
+                                    {},
+                                    payload,
+                                    clarifier_questions,
+                                    work_dir=resolved_work_dir,
+                                    agent=agent,
+                                )
+                            except SystemExit as exc:
+                                suggested_answers = {}
+                                _print_agent_collection_warning(
+                                    f"Skipping suggested clarifier answers: {exc}"
+                                )
+                    if not provided_clarifier_answers:
+                        rerun_command = (
+                            f"keshro create -m --context {shlex.quote(context or '')}"
+                        ).rstrip()
+                        if agent != "auto":
+                            rerun_command += f" -a {shlex.quote(agent)}"
+                        _exit_for_agent_clarifier_feedback(
+                            heading="Keshro needs user answers before it can create this migration.",
+                            questions=clarifier_questions,
+                            suggested_answers=suggested_answers,
+                            rerun_command=rerun_command,
+                        )
+                    resolved_clarifier_answers = provided_clarifier_answers
+                else:
+                    resolved_clarifier_answers = _prompt_for_migration_clarifiers(
+                        clarifier_questions, suggested_answers
+                    )
+                payload = _merge_clarifier_answers(
+                    payload, clarifier_questions, resolved_clarifier_answers
+                )
+            elif not _state.json:
+                print("No additional follow-up questions needed.")
+    _create_migration_from_payload(payload, {}, work_dir=resolved_work_dir)
 
 
 @migration_app.command("list")
@@ -5773,6 +5912,20 @@ If the request is clearly a migration, prefer:
 keshro create -m --context "migrate Jenkins pipelines to GitHub Actions"
 ```
 
+Treat these phrasings as strong migration signals:
+- `migrate X to Y`
+- `move from X to Y`
+- `replace X with Y`
+- `switch from X to Y`
+- `from X to Y`
+
+When you see one of those patterns:
+- do not use `keshro plan generate`
+- do not invent flags like `--no-migration`
+- do not create a generic project first
+- start with `keshro create -m --context "<user request>"`
+- if no saved template exists, Keshro should continue as a custom migration path
+
 For longer descriptions, write to a temp file:
 ```bash
 cat > /tmp/keshro-context.txt <<'EOF'
@@ -5783,6 +5936,11 @@ keshro create -f /tmp/keshro-context.txt
 ```
 
 Creation can take a bit — Keshro scans the repo, gathers context, and builds the migration or project. Do not assume it failed.
+
+If the request has been identified and confirmed as a migration:
+- do not fall back to a generic project if Keshro returns an error
+- do not generate your own non-Keshro migration plan as a substitute
+- if Keshro is unavailable, tell the user Keshro is unavailable and stop unless they explicitly ask to proceed without it
 
 If another execution context is currently active, just create the new one. It becomes the active one.
 
