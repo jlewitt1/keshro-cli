@@ -5972,10 +5972,12 @@ def _maybe_refresh_claude() -> None:
             needs_update = True
         elif not skill_target.exists() and not skill_target.is_symlink():
             return
-        elif skill_target.exists() and not skill_target.is_symlink():
-            needs_update = True
         elif skill_target.is_symlink() and skill_target.resolve() != _SKILL_FILE.resolve():
             needs_update = True
+        elif not skill_target.is_symlink():
+            # Regular file (e.g. Windows copy fallback) — only update if content differs
+            if skill_target.read_text(errors="replace") != KESHRO_SLASH_COMMAND:
+                needs_update = True
         if needs_update:
             _install_claude_integration()
     except OSError:
