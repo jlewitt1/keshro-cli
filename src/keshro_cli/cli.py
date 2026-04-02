@@ -6869,7 +6869,40 @@ def _collect_task_outcome(work_dir: str | None = None) -> dict | None:
             cwd=cwd,
         )
         checkpoint = (checkpoint_result.stdout or "").strip()
-        diff_range = f"{checkpoint}..HEAD" if checkpoint else "HEAD~1..HEAD"
+        diff_range = f"{checkpoint}..HEAD"
+        if not checkpoint:
+            merge_base = ""
+            for base_ref in ("origin/main", "main", "origin/master", "master"):
+                merge_base_result = subprocess.run(
+                    ["git", "merge-base", "HEAD", base_ref],
+                    capture_output=True,
+                    text=True,
+                    cwd=cwd,
+                    check=False,
+                )
+                candidate = (merge_base_result.stdout or "").strip()
+                if candidate:
+                    merge_base = candidate
+                    break
+
+            if merge_base:
+                diff_range = f"{merge_base}..HEAD"
+            else:
+                root_commit_result = subprocess.run(
+                    ["git", "rev-list", "--max-parents=0", "HEAD"],
+                    capture_output=True,
+                    text=True,
+                    cwd=cwd,
+                    check=False,
+                )
+                root_commits = [
+                    commit.strip()
+                    for commit in (root_commit_result.stdout or "").splitlines()
+                    if commit.strip()
+                ]
+                if not root_commits:
+                    return None
+                diff_range = f"{root_commits[0]}..HEAD"
 
         # git diff --numstat for files_changed
         numstat = subprocess.run(

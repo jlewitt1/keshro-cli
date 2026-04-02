@@ -177,6 +177,114 @@ def test_merge_codex_worktree_changes_resets_repo_after_apply_failure(monkeypatc
     )
 
 
+def test_collect_task_outcome_uses_merge_base_when_no_checkpoint(monkeypatch):
+    seen_ranges = []
+
+    def _fake_run(cmd, capture_output=None, text=None, cwd=None, check=None):
+        if cmd == ["git", "log", "--grep=keshro: checkpoint", "-1", "--format=%H"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd == ["git", "merge-base", "HEAD", "origin/main"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="merge-base-sha\n", stderr=""
+            )
+        if cmd[:3] == ["git", "diff", "--numstat"]:
+            seen_ranges.append(cmd[3])
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="3\t1\tsrc/demo.py\n", stderr=""
+            )
+        if cmd[:3] == ["git", "diff", "--name-status"]:
+            assert cmd[3] == "merge-base-sha..HEAD"
+            return subprocess.CompletedProcess(cmd, 0, stdout="M\tsrc/demo.py\n", stderr="")
+        if cmd[:3] == ["git", "log", "--format=%H"]:
+            assert cmd[3] == "merge-base-sha..HEAD"
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="commit-1\ncommit-2\n", stderr=""
+            )
+        if cmd[:3] == ["git", "diff", "--stat"]:
+            assert cmd[3] == "merge-base-sha..HEAD"
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=(
+                    " src/demo.py | 4 ++--\n"
+                    " 1 file changed, 3 insertions(+), 1 deletion(-)\n"
+                ),
+                stderr="",
+            )
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr("keshro_cli.cli.subprocess.run", _fake_run)
+
+    outcome = cli._collect_task_outcome("/tmp/demo")
+
+    assert seen_ranges == ["merge-base-sha..HEAD"]
+    assert outcome == {
+        "files_changed": [
+            {
+                "path": "src/demo.py",
+                "lines_added": 3,
+                "lines_removed": 1,
+                "change_type": "modified",
+            }
+        ],
+        "commits": ["commit-1", "commit-2"],
+        "diff_stat": "1 file changed, 3 insertions(+), 1 deletion(-)",
+    }
+
+
+def test_collect_task_outcome_falls_back_to_root_commit_without_merge_base(monkeypatch):
+    seen_ranges = []
+
+    def _fake_run(cmd, capture_output=None, text=None, cwd=None, check=None):
+        if cmd == ["git", "log", "--grep=keshro: checkpoint", "-1", "--format=%H"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[:3] == ["git", "merge-base", "HEAD"]:
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+        if cmd == ["git", "rev-list", "--max-parents=0", "HEAD"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="root-sha\n", stderr="")
+        if cmd[:3] == ["git", "diff", "--numstat"]:
+            seen_ranges.append(cmd[3])
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="5\t0\tsrc/rooted.py\n", stderr=""
+            )
+        if cmd[:3] == ["git", "diff", "--name-status"]:
+            assert cmd[3] == "root-sha..HEAD"
+            return subprocess.CompletedProcess(cmd, 0, stdout="A\tsrc/rooted.py\n", stderr="")
+        if cmd[:3] == ["git", "log", "--format=%H"]:
+            assert cmd[3] == "root-sha..HEAD"
+            return subprocess.CompletedProcess(cmd, 0, stdout="commit-1\n", stderr="")
+        if cmd[:3] == ["git", "diff", "--stat"]:
+            assert cmd[3] == "root-sha..HEAD"
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=(
+                    " src/rooted.py | 5 +++++\n"
+                    " 1 file changed, 5 insertions(+)\n"
+                ),
+                stderr="",
+            )
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr("keshro_cli.cli.subprocess.run", _fake_run)
+
+    outcome = cli._collect_task_outcome("/tmp/demo")
+
+    assert seen_ranges == ["root-sha..HEAD"]
+    assert outcome == {
+        "files_changed": [
+            {
+                "path": "src/rooted.py",
+                "lines_added": 5,
+                "lines_removed": 0,
+                "change_type": "added",
+            }
+        ],
+        "commits": ["commit-1"],
+        "diff_stat": "1 file changed, 5 insertions(+)",
+    }
+
+
 def test_launch_single_agent_marks_task_blocked_when_codex_merge_fails(monkeypatch):
     import asyncio
 
