@@ -2708,6 +2708,76 @@ async def _git_stdout(*args: str, cwd: str) -> str:
     return (stdout or b"").decode(errors="replace").strip()
 
 
+async def _git_changed_files(cwd: str, max_files: int = 25) -> list[str]:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "status",
+            "--short",
+            "--untracked-files=all",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=cwd,
+        )
+        stdout, _stderr = await proc.communicate()
+    except Exception:
+        return []
+    if proc.returncode != 0:
+        return []
+
+    changed_files: list[str] = []
+    for raw_line in (stdout or b"").decode(errors="replace").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        path = line[3:] if len(line) > 3 else line
+        if "->" in path:
+            path = path.split("->", 1)[1].strip()
+        path = path.strip()
+        if not path or path in changed_files:
+            continue
+        changed_files.append(path)
+        if len(changed_files) >= max_files:
+            break
+    return changed_files
+
+
+async def _post_agent_heartbeat_async(
+    client: httpx.AsyncClient,
+    plan_id: str,
+    task_id: str,
+    *,
+    session_id: str,
+    exec_dir: str,
+    commit_sha: str = "",
+    changed_files: list[str] | None = None,
+    status: str = "running",
+    current_phase: str | None = None,
+    progress_message: str | None = None,
+    recent_error: str | None = None,
+    runtime_context: dict | None = None,
+) -> None:
+    payload: dict[str, object] = {
+        "commit_sha": commit_sha,
+        "changed_files": changed_files or [],
+        "task_id": task_id,
+        "agent_session_id": session_id,
+        "status": status,
+    }
+    if current_phase:
+        payload["current_phase"] = current_phase
+    if progress_message:
+        payload["progress_message"] = progress_message[:1000]
+    if recent_error:
+        payload["recent_error"] = recent_error[:2000]
+    if runtime_context:
+        payload["runtime_context"] = runtime_context
+    try:
+        await client.post(f"/v1/agent/plans/{plan_id}/heartbeat", json=payload)
+    except Exception:
+        pass
+
+
 def _build_agent_exec_command(
     agent_name: str,
     agent_bin: str,
@@ -2852,20 +2922,6 @@ async def _launch_single_agent(
 
     async with semaphore:
         print(f"  {YELLOW}▶{RESET} {task_title} {DIM}starting...{RESET}")
-        # Report start with session ID via agent API (also sets status to in_progress)
-        try:
-            await api_client.post(
-                f"/v1/agent/plans/{plan_id}/task-event",
-                json={
-                    "task_id": task_id,
-                    "event": "start",
-                    "agent_session_id": session_id,
-                },
-            )
-        except Exception:
-            # Fallback to plain status update if agent endpoint fails
-            await _mark_task_status_async(api_client, plan_id, task_id, "in_progress")
-
         # Register with Collaborator/Conductor if available
         collab_session_id = f"keshro-{task_id}"
         launched_in_terminal = False
@@ -2967,6 +3023,104 @@ async def _launch_single_agent(
             work_dir=exec_dir,
             worktree_name=worktree_name,
         )
+        runtime_context = _collect_task_runtime_context_for(exec_dir)
+        latest_stdout_lines: list[str] = []
+        latest_stderr_lines: list[str] = []
+        stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
+        heartbeat_active = False
+        heartbeat_task: asyncio.Task | None = None
+
+        # Report start with session ID via agent API (also sets status to in_progress)
+        try:
+            await api_client.post(
+                f"/v1/agent/plans/{plan_id}/task-event",
+                json={
+                    "task_id": task_id,
+                    "event": "start",
+                    "agent_session_id": session_id,
+                    "current_phase": "starting",
+                    "progress_message": "Launching isolated agent worktree",
+                    "runtime_context": runtime_context,
+                },
+            )
+        except Exception:
+            # Fallback to plain status update if agent endpoint fails
+            await _mark_task_status_async(api_client, plan_id, task_id, "in_progress")
+
+        async def _heartbeat_loop() -> None:
+            try:
+                while heartbeat_active:
+                    try:
+                        commit_sha = ""
+                        try:
+                            commit_sha = await _git_stdout(
+                                "git", "rev-parse", "HEAD", cwd=exec_dir
+                            )
+                        except Exception:
+                            commit_sha = ""
+                        changed_files = await _git_changed_files(exec_dir)
+                        latest_error = _clean(
+                            latest_stderr_lines[-1] if latest_stderr_lines else ""
+                        )
+                        latest_output = _clean(
+                            latest_stdout_lines[-1] if latest_stdout_lines else ""
+                        )
+                        if latest_error:
+                            current_phase = "error"
+                            progress_message = latest_error
+                        elif changed_files:
+                            current_phase = "editing"
+                            progress_message = (
+                                f"Editing {', '.join(changed_files[:3])}"
+                                if changed_files
+                                else "Editing files"
+                            )
+                        elif launched_in_terminal:
+                            current_phase = "visible_terminal"
+                            progress_message = (
+                                "Running in a visible Conductor terminal"
+                            )
+                        else:
+                            current_phase = "running"
+                            progress_message = latest_output or "Agent running"
+                        await _post_agent_heartbeat_async(
+                            api_client,
+                            plan_id,
+                            task_id,
+                            session_id=session_id,
+                            exec_dir=exec_dir,
+                            commit_sha=commit_sha,
+                            changed_files=changed_files,
+                            status="running",
+                            current_phase=current_phase,
+                            progress_message=progress_message,
+                            recent_error=latest_error or None,
+                            runtime_context=runtime_context,
+                        )
+                    except Exception:
+                        pass
+                    await asyncio.sleep(3)
+            except asyncio.CancelledError:
+                return
+
+        async def _consume_stream(
+            stream: asyncio.StreamReader | None,
+            latest_lines: list[str],
+            chunks: list[str],
+        ) -> None:
+            if stream is None:
+                return
+            while True:
+                line = await stream.readline()
+                if not line:
+                    break
+                decoded = line.decode(errors="replace")
+                chunks.append(decoded)
+                cleaned = decoded.strip()
+                if cleaned:
+                    latest_lines.append(cleaned)
+                    del latest_lines[:-20]
 
         if collab_active and visible:
             tile_title = f"keshro: {task_title[:40]}"
@@ -2989,6 +3143,9 @@ async def _launch_single_agent(
                 launched_in_terminal = False
                 visible_fallback_reason = "Collaborator/Conductor integration failed; falling back to headless execution"
                 session_start(collab_session_id, work_dir)
+
+        heartbeat_active = True
+        heartbeat_task = asyncio.create_task(_heartbeat_loop())
 
         if launched_in_terminal:
             # Agent is running in a visible Conductor terminal tile.
@@ -3037,9 +3194,30 @@ async def _launch_single_agent(
                     stderr=asyncio.subprocess.PIPE,
                     cwd=exec_dir,
                 )
-                stdout_bytes, stderr_bytes = await proc.communicate()
-                exit_code = proc.returncode or 0
+                if getattr(proc, "stdout", None) is None or getattr(proc, "stderr", None) is None:
+                    stdout_bytes, stderr_bytes = await proc.communicate()
+                    stdout_text = (stdout_bytes or b"").decode(errors="replace").strip()
+                    stderr_text = (stderr_bytes or b"").decode(errors="replace").strip()
+                    exit_code = proc.returncode or 0
+                else:
+                    readers = [
+                        asyncio.create_task(
+                            _consume_stream(proc.stdout, latest_stdout_lines, stdout_chunks)
+                        ),
+                        asyncio.create_task(
+                            _consume_stream(proc.stderr, latest_stderr_lines, stderr_chunks)
+                        ),
+                    ]
+                    await proc.wait()
+                    await asyncio.gather(*readers, return_exceptions=True)
+                    exit_code = proc.returncode or 0
+                    stdout_text = "".join(stdout_chunks).strip()
+                    stderr_text = "".join(stderr_chunks).strip()
             except Exception as exc:
+                heartbeat_active = False
+                if heartbeat_task is not None:
+                    heartbeat_task.cancel()
+                    await asyncio.gather(heartbeat_task, return_exceptions=True)
                 if codex_worktree_path:
                     await _cleanup_worktree(work_dir, codex_worktree_path)
                 if codex_worktree_branch:
@@ -3069,9 +3247,10 @@ async def _launch_single_agent(
                     stderr=str(exc),
                     duration_seconds=time.monotonic() - start,
                 )
-
-            stdout_text = (stdout_bytes or b"").decode(errors="replace").strip()
-            stderr_text = (stderr_bytes or b"").decode(errors="replace").strip()
+        heartbeat_active = False
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
 
         duration = time.monotonic() - start
 
@@ -3133,6 +3312,7 @@ async def _launch_single_agent(
 
         if exit_code == 0:
             # Build a detailed completion note
+            touched_files = await _git_changed_files(exec_dir)
             cost_parts = [f"{duration:.0f}s"]
             if tokens_used > 0:
                 cost_parts.append(f"{tokens_used:,} tokens")
@@ -3152,10 +3332,14 @@ async def _launch_single_agent(
                         "task_id": task_id,
                         "event": "done",
                         "agent_session_id": session_id,
+                        "current_phase": "completed",
+                        "progress_message": note,
+                        "touched_files": touched_files,
                         "duration_seconds": duration,
                         "tokens_used": tokens_used,
                         "cost_usd": cost_usd,
                         "model": model_name,
+                        "runtime_context": runtime_context,
                     },
                 )
             except Exception:
@@ -3165,6 +3349,22 @@ async def _launch_single_agent(
             await _mark_task_status_async(
                 api_client, plan_id, task_id, "blocked", blocked_reason=reason
             )
+            try:
+                await api_client.post(
+                    f"/v1/agent/plans/{plan_id}/task-event",
+                    json={
+                        "task_id": task_id,
+                        "event": "block",
+                        "reason": reason,
+                        "agent_session_id": session_id,
+                        "current_phase": "blocked",
+                        "recent_error": reason,
+                        "touched_files": await _git_changed_files(exec_dir),
+                        "runtime_context": runtime_context,
+                    },
+                )
+            except Exception:
+                pass
 
         # End Collaborator session + notify
         if collab_active:
@@ -3218,7 +3418,6 @@ async def _run_parallel(
 
     resolved_plan_id = _require_plan_context(plan_id)
     resolved_dir = str(Path(work_dir).resolve()) if work_dir else os.getcwd()
-    session_id = f"agent-{_uuid.uuid4().hex[:8]}"
 
     # Verify that the resolved agent binary exists (raises SystemExit if not found)
     _resolve_prompt_agent(agent)
@@ -3354,7 +3553,7 @@ async def _run_parallel(
                     len(actionable),
                     semaphore,
                     api_client,
-                    session_id=session_id,
+                    session_id=f"agent-{_clean(task.get('id'))[:8]}-{_uuid.uuid4().hex[:6]}",
                     agent=agent,
                     visible=visible,
                 )
@@ -3382,6 +3581,7 @@ async def _run_parallel(
 
                 _start_time = _poll_time.monotonic()
                 _last_heartbeat = 0  # seconds since last heartbeat message
+                _seen_sessions: dict[str, tuple] = {}
                 try:
                     while not _poller_done:
                         await asyncio.sleep(5)
@@ -3409,6 +3609,64 @@ async def _run_parallel(
                                     _last_heartbeat = elapsed
                                 continue
                             fresh = resp.json()
+                            for session in fresh.get("agent_sessions", []):
+                                session_id = _clean(session.get("session_id"))
+                                if not session_id:
+                                    continue
+                                status = _clean(session.get("status")).lower()
+                                phase = _clean(session.get("current_phase"))
+                                progress_message = _clean(
+                                    session.get("progress_message")
+                                )
+                                touched_files = tuple(
+                                    (session.get("touched_files") or [])[:3]
+                                )
+                                conflicting_files = tuple(
+                                    (session.get("conflicting_files") or [])[:3]
+                                )
+                                recent_errors = session.get("recent_errors") or []
+                                latest_error = _clean(
+                                    recent_errors[-1] if recent_errors else ""
+                                )
+                                signature = (
+                                    status,
+                                    phase,
+                                    progress_message,
+                                    touched_files,
+                                    conflicting_files,
+                                    latest_error,
+                                )
+                                if _seen_sessions.get(session_id) == signature:
+                                    continue
+                                _seen_sessions[session_id] = signature
+                                label = (
+                                    _clean(session.get("task_title"))
+                                    or _clean(session.get("task_id"))
+                                    or session_id
+                                )
+                                details = []
+                                if phase:
+                                    details.append(phase)
+                                if progress_message:
+                                    details.append(progress_message)
+                                if touched_files:
+                                    details.append(
+                                        f"files: {', '.join(touched_files)}"
+                                    )
+                                if conflicting_files:
+                                    details.append(
+                                        f"conflicts: {', '.join(conflicting_files)}"
+                                    )
+                                if latest_error:
+                                    details.append(f"error: {latest_error}")
+                                if not details:
+                                    details.append(status or "running")
+                                print(
+                                    f"  {DIM}[{label} · {session_id}]{RESET} {' | '.join(details)}"
+                                )
+                                _last_heartbeat = (
+                                    _poll_time.monotonic() - _start_time
+                                )
                             for s in fresh.get("plan_steps", []):
                                 sid = s.get("id", "")
                                 status = (s.get("status") or "").lower()
@@ -6799,8 +7057,8 @@ def _python_runtime_details() -> tuple[str | None, str | None]:
     return python_exec, version
 
 
-def _collect_task_runtime_context() -> dict:
-    cwd = str(Path.cwd().resolve())
+def _collect_task_runtime_context_for(cwd: str) -> dict:
+    cwd = str(Path(cwd).resolve())
     repo_root = _discover_repo_root(cwd)
     python_exec, python_version = _python_runtime_details()
     available_tools: list[str] = []
@@ -6830,6 +7088,10 @@ def _collect_task_runtime_context() -> dict:
         "os": f"{sys.platform} ({os.name})",
     }
     return {key: value for key, value in context.items() if value not in (None, [], "")}
+
+
+def _collect_task_runtime_context() -> dict:
+    return _collect_task_runtime_context_for(str(Path.cwd().resolve()))
 
 
 def _extract_session_id(value: str | None) -> str:
