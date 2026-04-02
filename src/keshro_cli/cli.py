@@ -6863,7 +6863,7 @@ def _collect_task_outcome(work_dir: str | None = None) -> dict | None:
         cwd = work_dir or os.getcwd()
         # Find last keshro checkpoint commit
         checkpoint_result = subprocess.run(
-            ["git", "log", "--oneline", "--grep=keshro: checkpoint", "-1", "--format=%H"],
+            ["git", "log", "--grep=keshro: checkpoint", "-1", "--format=%H"],
             capture_output=True,
             text=True,
             cwd=cwd,
@@ -6938,7 +6938,7 @@ def _collect_task_outcome(work_dir: str | None = None) -> dict | None:
             outcome["commits"] = commits
         if diff_stat:
             outcome["diff_stat"] = diff_stat
-        return outcome or None
+        return outcome
     except Exception:
         return None
 
@@ -6946,7 +6946,7 @@ def _collect_task_outcome(work_dir: str | None = None) -> dict | None:
 async def _collect_task_outcome_async(work_dir: str | None = None) -> dict | None:
     import functools
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
         None, functools.partial(_collect_task_outcome, work_dir)
     )
