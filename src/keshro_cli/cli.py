@@ -697,8 +697,12 @@ def _print_migration_detail(
     if migration.get("confidence_explanation"):
         print()
         basis = migration.get("confidence_basis")
-        label = "Confidence (outcome-based)" if basis == "outcome_based" else "Confidence (AI-estimated)"
-        print(f"Assessment  {DIM}[{label}]{RESET}")
+        if basis == "outcome_based":
+            print(f"Assessment  {DIM}[Confidence (outcome-based)]{RESET}")
+        elif basis == "ai_estimated":
+            print(f"Assessment  {DIM}[Confidence (AI-estimated)]{RESET}")
+        else:
+            print("Assessment")
         _print_wrapped_block(
             "Confidence explanation", migration["confidence_explanation"]
         )
