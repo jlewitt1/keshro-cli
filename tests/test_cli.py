@@ -1091,6 +1091,30 @@ def test_main_without_args_prints_version(capsys):
     assert capsys.readouterr().out.strip() == __version__
 
 
+def test_main_version_skips_agent_refresh(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_maybe_refresh_claude", lambda: (_ for _ in ()).throw(AssertionError("should not refresh claude")))
+    monkeypatch.setattr(cli, "_maybe_refresh_codex", lambda: (_ for _ in ()).throw(AssertionError("should not refresh codex")))
+
+    code = cli.main(["--version"])
+
+    assert code == 0
+    captured = capsys.readouterr()
+    assert captured.out.strip() == __version__
+    assert captured.err == ""
+
+
+def test_main_help_skips_agent_refresh(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_maybe_refresh_claude", lambda: (_ for _ in ()).throw(AssertionError("should not refresh claude")))
+    monkeypatch.setattr(cli, "_maybe_refresh_codex", lambda: (_ for _ in ()).throw(AssertionError("should not refresh codex")))
+
+    code = cli.main(["--help"])
+
+    assert code == 0
+    captured = capsys.readouterr()
+    assert "Usage:" in captured.out
+    assert captured.err == ""
+
+
 def test_plan_generate_rejects_migration_like_requests(capsys, monkeypatch):
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
     monkeypatch.setattr(

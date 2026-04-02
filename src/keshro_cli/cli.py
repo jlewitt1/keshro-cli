@@ -9410,11 +9410,20 @@ def _print_request_error(exc: httpx.RequestError) -> None:
 
 def main(argv: list[str] | None = None):
     argv = sys.argv[1:] if argv is None else argv
-    _maybe_refresh_claude()
-    _maybe_refresh_codex()
     if not argv:
         print(__version__)
         return 0
+    if "--version" in argv or "--help" in argv:
+        try:
+            app(argv, standalone_mode=False)
+            return 0
+        except SystemExit as exc:
+            if isinstance(exc.code, str):
+                print(f"{RED}{exc.code}{RESET}", file=sys.stderr)
+                return 1
+            return exc.code if isinstance(exc.code, int) and exc.code != 0 else 0
+    _maybe_refresh_claude()
+    _maybe_refresh_codex()
     # Allow --json anywhere in the command line by hoisting it to the front
     if "--json" in argv[1:]:
         argv = [arg for arg in argv if arg != "--json"]
