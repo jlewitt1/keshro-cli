@@ -27,7 +27,7 @@ What Keshro does:
 1. Builds a migration-aware execution context with risks, open questions, task ordering, and acceptance criteria
 2. Runs agents in parallel in isolated git worktrees
 3. Carries learnings from one task into related future tasks
-4. Tracks progress, decisions, and rollback points through execution
+4. Tracks progress, decisions, rollback points, and live per-agent telemetry through execution
 
 ## Create a migration or project
 
@@ -47,7 +47,7 @@ Keshro drives the full execution loop — picks up the next task, gives the agen
 keshro continue
 ```
 
-By default, `keshro continue` runs the next ready wave in parallel when the environment supports it. Use `--no-parallel` only when you explicitly want one task at a time.
+By default, `keshro continue` runs the next ready wave in parallel when the environment supports it. Each launched agent gets its own session ID and heartbeats live status back to Keshro, including touched files, progress messages, recent errors, and mid-task conflict detection. Use `--no-parallel` only when you explicitly want one task at a time.
 
 ## Monitor
 
