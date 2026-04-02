@@ -3842,22 +3842,13 @@ def _next_actionable_task(plan: dict, parallel: bool = False) -> dict | None:
     steps = sorted(plan.get("plan_steps") or [], key=lambda step: step.get("order", 0))
     if parallel:
         # In parallel mode: skip in_progress tasks (another agent owns them),
-        # only pick up todo tasks whose dependencies are met
+        # only pick up todo tasks whose dependencies are met.
+        # _dependencies_met already rejects tasks with blocked deps (requires "completed").
         for step in steps:
             if _clean(step.get("status") or "todo").lower() != "todo":
                 continue
             if not _dependencies_met(step, steps):
                 continue
-            # Also skip if any earlier task is blocked (fallback when no explicit deps)
-            has_explicit_deps = bool(step.get("depends_on"))
-            if not has_explicit_deps:
-                blocked_earlier = any(
-                    _clean(s.get("status")).lower() == "blocked"
-                    for s in steps
-                    if s.get("order", 0) < step.get("order", 0)
-                )
-                if blocked_earlier:
-                    continue
             return step
         return None
     # Default: pick up in_progress first (resume), then first todo
