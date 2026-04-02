@@ -3815,6 +3815,11 @@ def _dependencies_met(step: dict, steps: list[dict]) -> bool:
 
 def _next_actionable_task(plan: dict, parallel: bool = False) -> dict | None:
     steps = sorted(plan.get("plan_steps") or [], key=lambda step: step.get("order", 0))
+    blocked_ids = {
+        _clean(s.get("id"))
+        for s in steps
+        if _clean(s.get("status") or "todo").lower() == "blocked"
+    }
     if parallel:
         # In parallel mode: skip in_progress tasks (another agent owns them),
         # only pick up todo tasks whose dependencies are met
@@ -3823,16 +3828,10 @@ def _next_actionable_task(plan: dict, parallel: bool = False) -> dict | None:
                 continue
             if not _dependencies_met(step, steps):
                 continue
-            # Also skip if any earlier task is blocked (fallback when no explicit deps)
-            has_explicit_deps = bool(step.get("depends_on"))
-            if not has_explicit_deps:
-                blocked_earlier = any(
-                    _clean(s.get("status")).lower() == "blocked"
-                    for s in steps
-                    if s.get("order", 0) < step.get("order", 0)
-                )
-                if blocked_earlier:
-                    continue
+            # Skip if any dependency is blocked (dependency-aware, not order-based)
+            deps = step.get("depends_on") or []
+            if any(_clean(dep) in blocked_ids for dep in deps):
+                continue
             return step
         return None
     # Default: pick up in_progress first (resume), then first todo
@@ -3858,12 +3857,19 @@ def _all_actionable_tasks(plan: dict) -> list[dict]:
         for s in steps
         if _clean(s.get("status") or "todo").lower() == "completed"
     }
+    blocked_ids = {
+        _clean(s.get("id"))
+        for s in steps
+        if _clean(s.get("status") or "todo").lower() == "blocked"
+    }
     actionable = []
     for step in steps:
         status = _clean(step.get("status") or "todo").lower()
         if status not in ("todo", "in_progress"):
             continue
         deps = step.get("depends_on") or []
+        if any(_clean(dep) in blocked_ids for dep in deps):
+            continue
         if all(_clean(dep) in completed_ids for dep in deps):
             actionable.append(step)
     return actionable
