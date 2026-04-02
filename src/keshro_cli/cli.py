@@ -596,7 +596,9 @@ def _print_migration_summary(
         if migration.get("outcome_status"):
             print(f"  {DIM}Outcome:{RESET} {migration['outcome_status']}")
         if migration.get("confidence_score") is not None:
-            print(f"  {DIM}Confidence:{RESET} {migration['confidence_score']}")
+            basis = migration.get("confidence_basis")
+            tag = " (from real outcomes)" if basis == "outcome_based" else ""
+            print(f"  {DIM}Confidence:{RESET} {migration['confidence_score']}{tag}")
 
 
 def _summarize_plan_progress(plan: dict | None) -> str | None:
@@ -694,7 +696,13 @@ def _print_migration_detail(
         )
     if migration.get("confidence_explanation"):
         print()
-        print("Assessment")
+        basis = migration.get("confidence_basis")
+        if basis == "outcome_based":
+            print(f"Assessment  {DIM}[Confidence (outcome-based)]{RESET}")
+        elif basis == "ai_estimated":
+            print(f"Assessment  {DIM}[Confidence (AI-estimated)]{RESET}")
+        else:
+            print("Assessment")
         _print_wrapped_block(
             "Confidence explanation", migration["confidence_explanation"]
         )
@@ -905,6 +913,7 @@ def _print_plan_analysis(
         return
 
     confidence = analysis.get("confidence_score")
+    confidence_basis = analysis.get("confidence_basis")
     risks = analysis.get("risks") if isinstance(analysis.get("risks"), list) else []
     unknowns = (
         analysis.get("unknowns") if isinstance(analysis.get("unknowns"), list) else []
@@ -912,7 +921,8 @@ def _print_plan_analysis(
 
     summary_parts: list[str] = []
     if confidence is not None:
-        summary_parts.append(f"confidence: {confidence}%")
+        tag = " ✓" if confidence_basis == "outcome_based" else ""
+        summary_parts.append(f"confidence: {confidence}%{tag}")
     if risks:
         summary_parts.append(f"{len(risks)} risk{'s' if len(risks) != 1 else ''}")
     if unknowns:

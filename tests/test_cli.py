@@ -2890,6 +2890,7 @@ def test_migration_view_shows_detail(fake_client, capsys, monkeypatch):
     assert "Plan:" not in out
     assert "Confidence explanation:" in out
     assert "Assessment" in out
+    assert "Confidence (AI-estimated)" not in out
     assert "Effort:" in out
     assert "Cost:" in out
     assert "Risks" in out

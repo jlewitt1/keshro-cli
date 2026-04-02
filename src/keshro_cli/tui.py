@@ -186,12 +186,14 @@ class PlanInsights(Static):
                 lines.append("")
 
         confidence = analysis.get("confidence_score")
+        confidence_basis = analysis.get("confidence_basis")
         risks = analysis.get("risks") or []
         unknowns = analysis.get("unknowns") or []
         summary_bits: list[str] = []
         confidence_percent = _confidence_percent(confidence)
         if confidence_percent is not None:
-            summary_bits.append(f"confidence {confidence_percent}%")
+            tag = " ✓" if confidence_basis == "outcome_based" else ""
+            summary_bits.append(f"confidence {confidence_percent}%{tag}")
         if risks:
             summary_bits.append(f"{len(risks)} risks")
         if unknowns:
