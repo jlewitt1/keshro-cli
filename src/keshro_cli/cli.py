@@ -2428,6 +2428,17 @@ def _build_continue_prompt(
         history_lines.extend(topical_lines)
         history_lines.append("")
 
+    # Failure pattern warnings — known pitfalls from past executions
+    raw_warnings = task.get("failure_warnings")
+    if isinstance(raw_warnings, list):
+        failure_warnings = "\n".join(_clean(w) for w in raw_warnings if _clean(w))
+    else:
+        failure_warnings = _clean(raw_warnings)
+    if failure_warnings:
+        history_lines.append("⚠ KNOWN FAILURE PATTERNS:")
+        history_lines.append(_truncate_text(failure_warnings, limit=600))
+        history_lines.append("")
+
     # Git state since last checkpoint
     git_state = _get_git_state_summary(work_dir)
     git_lines: list[str] = []
