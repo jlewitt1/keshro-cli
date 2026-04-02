@@ -139,6 +139,7 @@ def test_merge_codex_worktree_changes_resets_repo_after_apply_failure(monkeypatc
             self._stderr = stderr
 
         async def communicate(self, _input=None):
+            await asyncio.sleep(0)
             return self._stdout, self._stderr
 
     async def _fake_git_stdout(*args, cwd):
@@ -187,6 +188,7 @@ def test_launch_single_agent_marks_task_blocked_when_codex_merge_fails(monkeypat
             self._stderr = stderr
 
         async def communicate(self, _input=None):
+            await asyncio.sleep(0)
             return self._stdout, self._stderr
 
     class _FakeAsyncClient:
@@ -279,6 +281,7 @@ def test_launch_single_agent_marks_task_blocked_when_codex_worktree_create_fails
             self._stderr = stderr
 
         async def communicate(self, _input=None):
+            await asyncio.sleep(0)
             return self._stdout, self._stderr
 
     class _FakeAsyncClient:
@@ -357,6 +360,7 @@ def test_launch_single_agent_deletes_codex_branch_when_subprocess_launch_fails(
             self._stderr = stderr
 
         async def communicate(self, _input=None):
+            await asyncio.sleep(0)
             return self._stdout, self._stderr
 
     class _FakeAsyncClient:
@@ -435,6 +439,7 @@ def test_launch_single_agent_retries_codex_after_live_conflict(monkeypatch):
             self._stderr = stderr
 
         async def communicate(self, _input=None):
+            await asyncio.sleep(0)
             return self._stdout, self._stderr
 
         async def wait(self):
@@ -568,6 +573,74 @@ class _FakeResponse:
 
     def json(self):
         return self._payload
+
+
+def test_find_plan_task_supports_all_plan_task_shapes():
+    assert cli._find_plan_task({"plan_steps": [{"id": "task-1"}]}, "task-1") == {
+        "id": "task-1"
+    }
+    assert cli._find_plan_task({"tasks": [{"id": "task-2"}]}, "task-2") == {
+        "id": "task-2"
+    }
+    assert cli._find_plan_task(
+        {"plan": {"tasks": [{"id": "task-3"}]}}, "task-3"
+    ) == {"id": "task-3"}
+
+
+def test_wait_for_conflict_resolution_skips_first_active_poll(monkeypatch):
+    import asyncio
+
+    responses = [
+        _FakeResponse({"tasks": [{"id": "task-1", "runtime_status": "active"}]}),
+        _FakeResponse({"tasks": [{"id": "task-1", "runtime_status": "needs_rebase"}]}),
+    ]
+    sleep_calls = []
+
+    class _PollingClient:
+        def __init__(self, payloads):
+            self._payloads = payloads
+            self.calls = 0
+
+        async def get(self, path):
+            assert path == "/v1/plans/plan-1"
+            response = self._payloads[min(self.calls, len(self._payloads) - 1)]
+            self.calls += 1
+            return response
+
+    async def _fake_sleep(delay):
+        sleep_calls.append(delay)
+
+    monkeypatch.setattr(cli.asyncio, "sleep", _fake_sleep)
+
+    client = _PollingClient(responses)
+    result = asyncio.run(
+        cli._wait_for_conflict_resolution(client, "plan-1", "task-1")
+    )
+
+    assert result["action"] == "needs_rebase"
+    assert client.calls == 2
+    assert sleep_calls == [cli._LIVE_CONFLICT_POLL_SECONDS]
+
+
+def test_commit_codex_worktree_snapshot_skips_git_add_when_clean(monkeypatch):
+    import asyncio
+
+    calls = []
+
+    async def _fake_git_stdout(*args, cwd):
+        calls.append((args, cwd))
+        if args == ("git", "status", "--short"):
+            return ""
+        raise AssertionError(f"Unexpected git command: {args}")
+
+    monkeypatch.setattr(cli, "_git_stdout", _fake_git_stdout)
+
+    result = asyncio.run(
+        cli._commit_codex_worktree_snapshot("/tmp/worktree", "task-1")
+    )
+
+    assert result is False
+    assert calls == [(("git", "status", "--short"), "/tmp/worktree")]
 
 
 class _FakeClient:

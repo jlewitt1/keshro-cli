@@ -2843,7 +2843,13 @@ async def _terminate_subprocess(proc: asyncio.subprocess.Process) -> None:
 
 
 def _find_plan_task(plan_payload: dict, task_id: str) -> dict | None:
-    for step in plan_payload.get("plan_steps") or []:
+    steps = (
+        plan_payload.get("plan_steps")
+        or plan_payload.get("tasks")
+        or (plan_payload.get("plan") or {}).get("tasks")
+        or []
+    )
+    for step in steps:
         if _clean(step.get("id")) == task_id:
             return step
     return None
@@ -2879,10 +2885,10 @@ async def _watch_live_conflicts(
 
 
 async def _commit_codex_worktree_snapshot(worktree_path: str, task_id: str) -> bool:
-    await _git_stdout("git", "add", "-A", cwd=worktree_path)
     status = await _git_stdout("git", "status", "--short", cwd=worktree_path)
     if not status.strip():
         return False
+    await _git_stdout("git", "add", "-A", cwd=worktree_path)
 
     proc = await asyncio.create_subprocess_exec(
         "git",
@@ -2949,6 +2955,7 @@ async def _wait_for_conflict_resolution(
     task_id: str,
 ) -> dict:
     started = time.monotonic()
+    first_poll = True
     while time.monotonic() - started < _LIVE_CONFLICT_WAIT_TIMEOUT_SECONDS:
         try:
             resp = await client.get(f"/v1/plans/{plan_id}")
@@ -2958,12 +2965,13 @@ async def _wait_for_conflict_resolution(
                     runtime_status = _clean(task.get("runtime_status")).lower()
                     if runtime_status == "needs_rebase":
                         return {"action": "needs_rebase", "task": task}
-                    if runtime_status in ("", "active"):
+                    if not first_poll and runtime_status in ("", "active"):
                         return {"action": "resume", "task": task}
                     if _clean(task.get("status")).lower() == "blocked":
                         return {"action": "blocked", "task": task}
         except Exception:
             pass
+        first_poll = False
         await asyncio.sleep(_LIVE_CONFLICT_POLL_SECONDS)
     return {"action": "timeout", "task": {}}
 
@@ -3336,9 +3344,10 @@ async def _launch_single_agent(
                     )
                 stdout_bytes, stderr_bytes = await proc.communicate()
                 if heartbeat_task is not None:
+                    heartbeat_task.cancel()
                     try:
                         live_pause_response = await heartbeat_task
-                    except Exception:
+                    except (Exception, asyncio.CancelledError):
                         live_pause_response = {}
                 exit_code = proc.returncode or 0
             except Exception as exc:
