@@ -2305,7 +2305,8 @@ def _extract_topical_context(
         if step.get("status") != "completed" or step.get("id") == target_id:
             continue
         notes = (step.get("notes") or "").strip()
-        if not notes:
+        outcome = step.get("outcome")
+        if not notes and not outcome:
             continue
         step_tags = {t.lower() for t in (step.get("tags") or [])}
         shared = target_tags & step_tags
@@ -2314,16 +2315,35 @@ def _extract_topical_context(
 
         # Filter out explicit handoff lines (already in the sequential handoff section)
         lines = []
-        for line in notes.split("\n"):
-            stripped = line.strip()
-            if not stripped:
-                continue
-            lower = stripped.lower()
-            if lower.startswith("next task should know:") or lower.startswith(
-                "context for next task:"
-            ):
-                continue
-            lines.append(stripped)
+        if notes:
+            for line in notes.split("\n"):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                lower = stripped.lower()
+                if lower.startswith("next task should know:") or lower.startswith(
+                    "context for next task:"
+                ):
+                    continue
+                lines.append(stripped)
+
+        # Include outcome data when available
+        if outcome and isinstance(outcome, dict):
+            if outcome.get("files_changed"):
+                paths = ", ".join(
+                    f.get("path", "") for f in outcome["files_changed"] if f.get("path")
+                )
+                if paths:
+                    lines.append(f"Files changed: {paths}")
+            if outcome.get("errors_encountered"):
+                for err in outcome["errors_encountered"]:
+                    err_parts = [err.get("error_type", ""), err.get("message", "")]
+                    if err.get("resolution"):
+                        err_parts.append(f"resolved: {err['resolution']}")
+                    lines.append("Error: " + " — ".join(p for p in err_parts if p))
+            if outcome.get("approach"):
+                lines.append(f"Approach: {outcome['approach']}")
+
         if not lines:
             continue
 
@@ -3144,19 +3164,24 @@ async def _launch_single_agent(
             await _mark_task_status_async(
                 api_client, plan_id, task_id, "completed", notes=note
             )
+            # Collect structured outcome data
+            outcome = await _collect_task_outcome_async(exec_dir)
             # Report structured metrics via agent API
             try:
+                done_payload: dict[str, object] = {
+                    "task_id": task_id,
+                    "event": "done",
+                    "agent_session_id": session_id,
+                    "duration_seconds": duration,
+                    "tokens_used": tokens_used,
+                    "cost_usd": cost_usd,
+                    "model": model_name,
+                }
+                if outcome:
+                    done_payload["outcome"] = outcome
                 await api_client.post(
                     f"/v1/agent/plans/{plan_id}/task-event",
-                    json={
-                        "task_id": task_id,
-                        "event": "done",
-                        "agent_session_id": session_id,
-                        "duration_seconds": duration,
-                        "tokens_used": tokens_used,
-                        "cost_usd": cost_usd,
-                        "model": model_name,
-                    },
+                    json=done_payload,
                 )
             except Exception:
                 pass
@@ -6832,6 +6857,134 @@ def _collect_task_runtime_context() -> dict:
     return {key: value for key, value in context.items() if value not in (None, [], "")}
 
 
+def _collect_task_outcome(work_dir: str | None = None) -> dict | None:
+    """Collect structured git diff data since last keshro checkpoint."""
+    try:
+        cwd = work_dir or os.getcwd()
+        # Find last keshro checkpoint commit
+        checkpoint_result = subprocess.run(
+            ["git", "log", "--grep=keshro: checkpoint", "-1", "--format=%H"],
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+        )
+        checkpoint = (checkpoint_result.stdout or "").strip()
+        diff_range = f"{checkpoint}..HEAD"
+        if not checkpoint:
+            merge_base = ""
+            for base_ref in ("origin/main", "main", "origin/master", "master"):
+                merge_base_result = subprocess.run(
+                    ["git", "merge-base", "HEAD", base_ref],
+                    capture_output=True,
+                    text=True,
+                    cwd=cwd,
+                    check=False,
+                )
+                candidate = (merge_base_result.stdout or "").strip()
+                if candidate:
+                    merge_base = candidate
+                    break
+
+            if merge_base:
+                diff_range = f"{merge_base}..HEAD"
+            else:
+                root_commit_result = subprocess.run(
+                    ["git", "rev-list", "--max-parents=0", "HEAD"],
+                    capture_output=True,
+                    text=True,
+                    cwd=cwd,
+                    check=False,
+                )
+                root_commits = [
+                    commit.strip()
+                    for commit in (root_commit_result.stdout or "").splitlines()
+                    if commit.strip()
+                ]
+                if not root_commits:
+                    return None
+                diff_range = f"{root_commits[0]}..HEAD"
+
+        # git diff --numstat for files_changed
+        numstat = subprocess.run(
+            ["git", "diff", "--numstat", diff_range],
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+        )
+        # git diff --name-status for change_type
+        name_status = subprocess.run(
+            ["git", "diff", "--name-status", diff_range],
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+        )
+        status_map: dict[str, str] = {}
+        type_mapping = {"A": "added", "D": "deleted", "M": "modified", "R": "renamed"}
+        for line in (name_status.stdout or "").strip().splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 2:
+                code = parts[0][0] if parts[0] else "M"
+                path = parts[-1]
+                status_map[path] = type_mapping.get(code, "modified")
+
+        files_changed: list[dict] = []
+        for line in (numstat.stdout or "").strip().splitlines():
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            added, removed, path = parts[0], parts[1], parts[2]
+            files_changed.append({
+                "path": path,
+                "lines_added": int(added) if added != "-" else 0,
+                "lines_removed": int(removed) if removed != "-" else 0,
+                "change_type": status_map.get(path, "modified"),
+            })
+            if len(files_changed) >= 200:
+                break
+
+        # git log for commits
+        log_result = subprocess.run(
+            ["git", "log", "--format=%H", diff_range],
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+        )
+        commits = [h for h in (log_result.stdout or "").strip().splitlines() if h][:50]
+
+        # git diff --stat for summary
+        stat_result = subprocess.run(
+            ["git", "diff", "--stat", diff_range],
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+        )
+        stat_lines = (stat_result.stdout or "").strip().splitlines()
+        diff_stat = stat_lines[-1].strip() if stat_lines else ""
+
+        if not files_changed and not commits:
+            return None
+
+        outcome: dict[str, object] = {}
+        if files_changed:
+            outcome["files_changed"] = files_changed
+        if commits:
+            outcome["commits"] = commits
+        if diff_stat:
+            outcome["diff_stat"] = diff_stat
+        return outcome
+    except Exception:
+        return None
+
+
+async def _collect_task_outcome_async(work_dir: str | None = None) -> dict | None:
+    import functools
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None, functools.partial(_collect_task_outcome, work_dir)
+    )
+
+
 def _extract_session_id(value: str | None) -> str:
     cleaned = _clean(value)
     if cleaned.startswith("session:"):
@@ -6882,6 +7035,7 @@ def _post_agent_task_event(
     tokens_used: int | None = None,
     cost_usd: float | None = None,
     model: str | None = None,
+    outcome: dict | None = None,
 ) -> None:
     payload: dict[str, object] = {
         "task_id": task_id,
@@ -6891,6 +7045,8 @@ def _post_agent_task_event(
         payload["reason"] = reason
     if note:
         payload["note"] = note
+    if outcome:
+        payload["outcome"] = outcome
     agent_client = _infer_agent_client()
     if agent_client:
         payload["agent_client"] = agent_client
@@ -7110,6 +7266,7 @@ def _do_task_done(
     resolved_plan_id = _require_plan_context(plan_id)
     inferred = _infer_task_done_context(resolved_plan_id, task_id)
     inferred_model = _infer_model_name()
+    outcome = _collect_task_outcome()
     _post_agent_task_event(
         resolved_plan_id,
         task_id,
@@ -7120,6 +7277,7 @@ def _do_task_done(
         if inferred.get("duration_seconds") is not None
         else None,
         model=inferred_model or None,
+        outcome=outcome,
     )
 
 
