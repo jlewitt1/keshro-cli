@@ -419,6 +419,137 @@ def test_launch_single_agent_deletes_codex_branch_when_subprocess_launch_fails(
     )
 
 
+def test_launch_single_agent_retries_codex_after_live_conflict(monkeypatch):
+    import asyncio
+
+    calls = []
+    task_updates = []
+    merge_calls = []
+    note_events = []
+    heartbeat_checks = []
+
+    class _FakeProc:
+        def __init__(self, returncode=0, stdout=b"", stderr=b""):
+            self.returncode = returncode
+            self._stdout = stdout
+            self._stderr = stderr
+
+        async def communicate(self, _input=None):
+            return self._stdout, self._stderr
+
+        async def wait(self):
+            return self.returncode
+
+    class _FakeAsyncClient:
+        async def post(self, path, json=None):
+            calls.append(("post", path, json))
+            if json and json.get("event") == "note":
+                note_events.append(json.get("note") or "")
+            return None
+
+    codex_runs = [
+        _FakeProc(returncode=0, stdout=b"first attempt", stderr=b""),
+        _FakeProc(returncode=0, stdout=b"second attempt", stderr=b""),
+    ]
+
+    async def _fake_mark_task_status_async(
+        client, plan_id, task_id, status, notes=None, blocked_reason=None
+    ):
+        task_updates.append(
+            {
+                "plan_id": plan_id,
+                "task_id": task_id,
+                "status": status,
+                "notes": notes,
+                "blocked_reason": blocked_reason,
+            }
+        )
+
+    async def _fake_git_stdout(*args, cwd):
+        if args[:3] == ("git", "rev-parse", "HEAD"):
+            return "base-rev"
+        return ""
+
+    async def _fake_cleanup_worktree(repo_dir, worktree_path):
+        return None
+
+    async def _fake_merge_codex_worktree_changes(
+        repo_dir, worktree_path, base_rev, task_id
+    ):
+        merge_calls.append((repo_dir, worktree_path, base_rev, task_id))
+
+    async def _fake_watch_live_conflicts(
+        client, plan_id, task_id, *, worktree_path, proc, session_id=""
+    ):
+        heartbeat_checks.append((plan_id, task_id, worktree_path, session_id))
+        if len(heartbeat_checks) == 1:
+            return {
+                "action": "pause",
+                "conflict_task_id": "task-9",
+                "reason": "Live overlap detected with task-9 on src/shared/util.py.",
+            }
+        return {}
+
+    async def _fake_wait_for_conflict_resolution(client, plan_id, task_id):
+        return {"action": "needs_rebase", "task": {"runtime_status": "needs_rebase"}}
+
+    async def _fake_rebase_codex_worktree_onto_latest(repo_dir, worktree_path, task_id):
+        calls.append(("rebase", repo_dir, worktree_path, task_id))
+        return "rebased-base"
+
+    async def _fake_create_subprocess_exec(*args, **kwargs):
+        calls.append(("subprocess", args, kwargs.get("cwd")))
+        if args[:3] == ("git", "worktree", "add"):
+            return _FakeProc(returncode=0)
+        if args and args[:3] == ("git", "branch", "-D"):
+            return _FakeProc(returncode=0)
+        if args and args[0] == "codex":
+            return codex_runs.pop(0)
+        raise AssertionError(f"Unexpected subprocess args: {args}")
+
+    monkeypatch.setattr(cli, "_resolve_prompt_agent", lambda agent: ("codex", "codex"))
+    monkeypatch.setattr(
+        cli,
+        "_build_parallel_prompt",
+        lambda plan, task, total_agents, work_dir=None: "prompt",
+    )
+    monkeypatch.setattr(cli, "_mark_task_status_async", _fake_mark_task_status_async)
+    monkeypatch.setattr(cli, "_git_stdout", _fake_git_stdout)
+    monkeypatch.setattr(cli, "_cleanup_worktree", _fake_cleanup_worktree)
+    monkeypatch.setattr(
+        cli, "_merge_codex_worktree_changes", _fake_merge_codex_worktree_changes
+    )
+    monkeypatch.setattr(cli, "_watch_live_conflicts", _fake_watch_live_conflicts)
+    monkeypatch.setattr(
+        cli, "_wait_for_conflict_resolution", _fake_wait_for_conflict_resolution
+    )
+    monkeypatch.setattr(
+        cli, "_rebase_codex_worktree_onto_latest", _fake_rebase_codex_worktree_onto_latest
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+
+    result = asyncio.run(
+        cli._launch_single_agent(
+            {"id": "task-1", "title": "Test task"},
+            {"id": "plan-1"},
+            "plan-1",
+            "/tmp/project",
+            1,
+            asyncio.Semaphore(1),
+            _FakeAsyncClient(),
+            session_id="session-1",
+            agent="codex",
+        )
+    )
+
+    assert result.exit_code == 0
+    assert len(heartbeat_checks) == 2
+    assert any(call[0] == "rebase" for call in calls)
+    assert merge_calls[-1][2] == "rebased-base"
+    assert any(update["status"] == "completed" for update in task_updates)
+    assert any("Resuming after rebasing" in note for note in note_events)
+
+
 class _FakeResponse:
     def __init__(self, payload, status_code=200):
         self._payload = payload

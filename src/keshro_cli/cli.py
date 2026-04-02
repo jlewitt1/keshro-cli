@@ -33,6 +33,9 @@ YELLOW = "\033[33m"
 RED = "\033[31m"
 
 _codex_merge_lock = asyncio.Lock()
+_LIVE_CONFLICT_POLL_SECONDS = 3
+_LIVE_CONFLICT_WAIT_TIMEOUT_SECONDS = 15 * 60
+_LIVE_CONFLICT_MAX_RETRIES = 3
 
 
 # ---------------------------------------------------------------------------
@@ -2666,6 +2669,29 @@ class AgentResult:
     model: str = ""
 
 
+def _parse_git_status_changed_files(raw_status: str) -> list[str]:
+    files: list[str] = []
+    seen: set[str] = set()
+    for raw_line in raw_status.splitlines():
+        line = raw_line.rstrip()
+        if len(line) < 4:
+            continue
+        path_text = line[3:].strip()
+        if not path_text:
+            continue
+        candidates = (
+            [part.strip().strip('"') for part in path_text.split(" -> ", 1)]
+            if " -> " in path_text
+            else [path_text.strip('"')]
+        )
+        for candidate in candidates:
+            if not candidate or candidate in seen:
+                continue
+            files.append(candidate)
+            seen.add(candidate)
+    return files
+
+
 async def _mark_task_status_async(
     client: httpx.AsyncClient,
     plan_id: str,
@@ -2684,6 +2710,27 @@ async def _mark_task_status_async(
         res.raise_for_status()
     except Exception as exc:
         print(f"  {DIM}[warn] status update failed: {exc}{RESET}", file=sys.stderr)
+
+
+async def _post_agent_note_async(
+    client: httpx.AsyncClient,
+    plan_id: str,
+    task_id: str,
+    note: str,
+    *,
+    session_id: str = "",
+) -> None:
+    payload: dict[str, str] = {
+        "task_id": task_id,
+        "event": "note",
+        "note": note,
+    }
+    if session_id:
+        payload["agent_session_id"] = session_id
+    try:
+        await client.post(f"/v1/agent/plans/{plan_id}/task-event", json=payload)
+    except Exception:
+        pass
 
 
 async def _cleanup_worktree(repo_dir: str, worktree_path: str) -> None:
@@ -2717,6 +2764,210 @@ async def _git_stdout(*args: str, cwd: str) -> str:
             (stderr or b"").decode(errors="replace").strip() or "git command failed"
         )
     return (stdout or b"").decode(errors="replace").strip()
+
+
+async def _collect_git_changed_files(cwd: str) -> list[str]:
+    try:
+        status = await _git_stdout(
+            "git",
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            cwd=cwd,
+        )
+    except Exception:
+        return []
+    return _parse_git_status_changed_files(status)
+
+
+async def _post_agent_heartbeat_async(
+    client: httpx.AsyncClient,
+    plan_id: str,
+    task_id: str,
+    *,
+    worktree_path: str,
+    session_id: str = "",
+) -> dict:
+    changed_files = await _collect_git_changed_files(worktree_path)
+    try:
+        commit_sha = await _git_stdout("git", "rev-parse", "HEAD", cwd=worktree_path)
+    except Exception:
+        commit_sha = "unknown"
+
+    payload: dict[str, object] = {
+        "task_id": task_id,
+        "commit_sha": commit_sha,
+        "changed_files": changed_files,
+    }
+    if session_id:
+        payload["agent_session_id"] = session_id
+
+    try:
+        resp = await client.post(f"/v1/agent/plans/{plan_id}/heartbeat", json=payload)
+    except Exception:
+        return {}
+    if resp is None or not hasattr(resp, "json"):
+        return {}
+    try:
+        return resp.json() or {}
+    except Exception:
+        return {}
+
+
+async def _terminate_subprocess(proc: asyncio.subprocess.Process) -> None:
+    if getattr(proc, "returncode", None) is not None:
+        return
+    try:
+        proc.terminate()
+    except ProcessLookupError:
+        return
+    except Exception:
+        return
+
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=5)
+        return
+    except Exception:
+        pass
+
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        return
+    except Exception:
+        return
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=5)
+    except Exception:
+        pass
+
+
+def _find_plan_task(plan_payload: dict, task_id: str) -> dict | None:
+    for step in plan_payload.get("plan_steps") or []:
+        if _clean(step.get("id")) == task_id:
+            return step
+    return None
+
+
+async def _watch_live_conflicts(
+    client: httpx.AsyncClient,
+    plan_id: str,
+    task_id: str,
+    *,
+    worktree_path: str,
+    proc: asyncio.subprocess.Process,
+    session_id: str = "",
+) -> dict:
+    while getattr(proc, "returncode", None) is None:
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=_LIVE_CONFLICT_POLL_SECONDS)
+            break
+        except asyncio.TimeoutError:
+            pass
+        heartbeat = await _post_agent_heartbeat_async(
+            client,
+            plan_id,
+            task_id,
+            worktree_path=worktree_path,
+            session_id=session_id,
+        )
+        if _clean(str(heartbeat.get("action"))).lower() != "pause":
+            continue
+        await _terminate_subprocess(proc)
+        return heartbeat
+    return {}
+
+
+async def _commit_codex_worktree_snapshot(worktree_path: str, task_id: str) -> bool:
+    await _git_stdout("git", "add", "-A", cwd=worktree_path)
+    status = await _git_stdout("git", "status", "--short", cwd=worktree_path)
+    if not status.strip():
+        return False
+
+    proc = await asyncio.create_subprocess_exec(
+        "git",
+        "-c",
+        "user.name=Keshro",
+        "-c",
+        "user.email=bot@keshro.dev",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "commit",
+        "-m",
+        f"WIP pause snapshot for {task_id}",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=worktree_path,
+    )
+    _stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(
+            (stderr or b"").decode(errors="replace").strip()
+            or "failed to snapshot paused worktree state"
+        )
+    return True
+
+
+async def _rebase_codex_worktree_onto_latest(
+    repo_dir: str, worktree_path: str, task_id: str
+) -> str:
+    snapshot_committed = await _commit_codex_worktree_snapshot(worktree_path, task_id)
+    latest_base = await _git_stdout("git", "rev-parse", "HEAD", cwd=repo_dir)
+    current_head = await _git_stdout("git", "rev-parse", "HEAD", cwd=worktree_path)
+    if current_head == latest_base and not snapshot_committed:
+        return latest_base
+
+    proc = await asyncio.create_subprocess_exec(
+        "git",
+        "rebase",
+        latest_base,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=worktree_path,
+    )
+    _stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        abort_proc = await asyncio.create_subprocess_exec(
+            "git",
+            "rebase",
+            "--abort",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=worktree_path,
+        )
+        await abort_proc.communicate()
+        raise RuntimeError(
+            (stderr or b"").decode(errors="replace").strip()
+            or "failed to rebase paused worktree"
+        )
+    return latest_base
+
+
+async def _wait_for_conflict_resolution(
+    client: httpx.AsyncClient,
+    plan_id: str,
+    task_id: str,
+) -> dict:
+    started = time.monotonic()
+    while time.monotonic() - started < _LIVE_CONFLICT_WAIT_TIMEOUT_SECONDS:
+        try:
+            resp = await client.get(f"/v1/plans/{plan_id}")
+            if resp.status_code == 200:
+                task = _find_plan_task(resp.json(), task_id)
+                if task:
+                    runtime_status = _clean(task.get("runtime_status")).lower()
+                    if runtime_status == "needs_rebase":
+                        return {"action": "needs_rebase", "task": task}
+                    if runtime_status in ("", "active"):
+                        return {"action": "resume", "task": task}
+                    if _clean(task.get("status")).lower() == "blocked":
+                        return {"action": "blocked", "task": task}
+        except Exception:
+            pass
+        await asyncio.sleep(_LIVE_CONFLICT_POLL_SECONDS)
+    return {"action": "timeout", "task": {}}
+
+
 
 
 def _build_agent_exec_command(
@@ -2856,7 +3107,6 @@ async def _launch_single_agent(
     task_id = _clean(task.get("id")) or "unknown"
     task_title = _clean(task.get("title")) or "Untitled"
     worktree_name = f"keshro-{task_id[:8]}"
-    prompt = _build_parallel_prompt(plan, task, total_agents, work_dir=work_dir)
 
     # Resolve agent binary (_resolve_prompt_agent raises SystemExit if not found)
     agent_name, agent_bin = _resolve_prompt_agent(agent)
@@ -2968,78 +3218,101 @@ async def _launch_single_agent(
                     duration_seconds=0,
                 )
 
-        start = time.monotonic()
         exec_dir = codex_worktree_path if agent_name == "codex" else work_dir
-        command = _build_agent_exec_command(
-            agent_name,
-            agent_bin,
-            prompt,
-            task_title=task_title,
-            work_dir=exec_dir,
-            worktree_name=worktree_name,
-        )
+        overall_start = time.monotonic()
+        stdout_text = ""
+        stderr_text = ""
+        result_text = ""
+        exit_code = 0
+        cost_usd = 0.0
+        tokens_used = 0
+        model_name = ""
+        live_retry_note = ""
+        live_retry_count = 0
 
-        if collab_active and visible:
-            tile_title = f"keshro: {task_title[:40]}"
-            try:
-                from .collaborator import launch_terminal
-
-                tile_id = launch_terminal(
-                    command=shlex.join(command),
-                    cwd=exec_dir,
-                    title=tile_title,
-                    session_id=collab_session_id,
+        while True:
+            prompt = _build_parallel_prompt(plan, task, total_agents, work_dir=work_dir)
+            if live_retry_note:
+                prompt = (
+                    prompt
+                    + "\n\nExecution update:\n"
+                    + live_retry_note
+                    + "\nReview the current codebase state before continuing."
                 )
-                launched_in_terminal = tile_id is not None
-                if launched_in_terminal:
-                    print(f"    {DIM}Visible tile launched in Conductor.{RESET}")
-                else:
-                    visible_fallback_reason = "visible terminal launch RPC unavailable"
-                    session_start(collab_session_id, work_dir)
-            except Exception:
-                launched_in_terminal = False
-                visible_fallback_reason = "Collaborator/Conductor integration failed; falling back to headless execution"
-                session_start(collab_session_id, work_dir)
+            command = _build_agent_exec_command(
+                agent_name,
+                agent_bin,
+                prompt,
+                task_title=task_title,
+                work_dir=exec_dir,
+                worktree_name=worktree_name,
+            )
 
-        if launched_in_terminal:
-            # Agent is running in a visible Conductor terminal tile.
-            # Poll the Keshro API for task completion instead of reading stdout.
-            exit_code = 0
-            stdout_text = ""
-            stderr_text = ""
-            poll_interval = 5
-            while True:
-                await asyncio.sleep(poll_interval)
+            if collab_active and visible and not launched_in_terminal:
+                tile_title = f"keshro: {task_title[:40]}"
                 try:
-                    resp = await api_client.get(f"/v1/plans/{plan_id}")
-                    if resp.status_code == 200:
-                        plan_data = resp.json()
-                        tasks_list = (
-                            plan_data.get("plan_steps")
-                            or plan_data.get("tasks")
-                            or plan_data.get("plan", {}).get("tasks")
-                            or []
-                        )
-                        for t in tasks_list:
-                            if t.get("id") == task_id:
-                                status = t.get("status", "")
-                                if status in ("completed", "done"):
-                                    break
-                                elif status == "blocked":
-                                    exit_code = 1
-                                    stderr_text = t.get(
-                                        "blocked_reason", "Agent blocked"
-                                    )
-                                    break
-                        else:
-                            poll_interval = min(poll_interval + 2, 15)
-                            continue
-                        break
-                except Exception:
-                    pass
-                poll_interval = min(poll_interval + 2, 15)
+                    from .collaborator import launch_terminal
 
-        else:
+                    tile_id = launch_terminal(
+                        command=shlex.join(command),
+                        cwd=exec_dir,
+                        title=tile_title,
+                        session_id=collab_session_id,
+                    )
+                    launched_in_terminal = tile_id is not None
+                    if launched_in_terminal:
+                        print(f"    {DIM}Visible tile launched in Conductor.{RESET}")
+                    else:
+                        visible_fallback_reason = (
+                            "visible terminal launch RPC unavailable"
+                        )
+                        session_start(collab_session_id, work_dir)
+                except Exception:
+                    launched_in_terminal = False
+                    visible_fallback_reason = (
+                        "Collaborator/Conductor integration failed; falling back to headless execution"
+                    )
+                    session_start(collab_session_id, work_dir)
+
+            if launched_in_terminal:
+                # Agent is running in a visible Conductor terminal tile.
+                # Poll the Keshro API for task completion instead of reading stdout.
+                exit_code = 0
+                stdout_text = ""
+                stderr_text = ""
+                poll_interval = 5
+                while True:
+                    await asyncio.sleep(poll_interval)
+                    try:
+                        resp = await api_client.get(f"/v1/plans/{plan_id}")
+                        if resp.status_code == 200:
+                            plan_data = resp.json()
+                            tasks_list = (
+                                plan_data.get("plan_steps")
+                                or plan_data.get("tasks")
+                                or plan_data.get("plan", {}).get("tasks")
+                                or []
+                            )
+                            for t in tasks_list:
+                                if t.get("id") == task_id:
+                                    status = t.get("status", "")
+                                    if status in ("completed", "done"):
+                                        break
+                                    elif status == "blocked":
+                                        exit_code = 1
+                                        stderr_text = t.get(
+                                            "blocked_reason", "Agent blocked"
+                                        )
+                                        break
+                            else:
+                                poll_interval = min(poll_interval + 2, 15)
+                                continue
+                            break
+                    except Exception:
+                        pass
+                    poll_interval = min(poll_interval + 2, 15)
+                break
+
             # Standard subprocess mode — pipe stdout for agent output parsing
             try:
                 proc = await asyncio.create_subprocess_exec(
@@ -3048,7 +3321,25 @@ async def _launch_single_agent(
                     stderr=asyncio.subprocess.PIPE,
                     cwd=exec_dir,
                 )
+                heartbeat_task = None
+                live_pause_response: dict = {}
+                if agent_name == "codex" and codex_worktree_path:
+                    heartbeat_task = asyncio.create_task(
+                        _watch_live_conflicts(
+                            api_client,
+                            plan_id,
+                            task_id,
+                            worktree_path=codex_worktree_path,
+                            proc=proc,
+                            session_id=session_id,
+                        )
+                    )
                 stdout_bytes, stderr_bytes = await proc.communicate()
+                if heartbeat_task is not None:
+                    try:
+                        live_pause_response = await heartbeat_task
+                    except Exception:
+                        live_pause_response = {}
                 exit_code = proc.returncode or 0
             except Exception as exc:
                 if codex_worktree_path:
@@ -3078,18 +3369,106 @@ async def _launch_single_agent(
                     exit_code=1,
                     stdout="",
                     stderr=str(exc),
-                    duration_seconds=time.monotonic() - start,
+                    duration_seconds=time.monotonic() - overall_start,
                 )
 
             stdout_text = (stdout_bytes or b"").decode(errors="replace").strip()
             stderr_text = (stderr_bytes or b"").decode(errors="replace").strip()
 
-        duration = time.monotonic() - start
+            if live_pause_response:
+                live_retry_count += 1
+                blocker_id = (
+                    _clean(str(live_pause_response.get("conflict_task_id")))
+                    or "another task"
+                )
+                pause_reason = (
+                    _clean(str(live_pause_response.get("reason")))
+                    or f"Live overlap detected with {blocker_id}."
+                )
+                print(f"    {YELLOW}!{RESET} {pause_reason}")
+                await _post_agent_note_async(
+                    api_client,
+                    plan_id,
+                    task_id,
+                    f"CLI paused this worktree after live conflict detection: {pause_reason}",
+                    session_id=session_id,
+                )
+                if live_retry_count > _LIVE_CONFLICT_MAX_RETRIES:
+                    exit_code = 1
+                    stderr_text = (
+                        "Exceeded live conflict retry limit while waiting to resume."
+                    )
+                    result_text = ""
+                    break
+
+                resolution = await _wait_for_conflict_resolution(
+                    api_client, plan_id, task_id
+                )
+                action = _clean(resolution.get("action")).lower()
+                task_state = resolution.get("task") or {}
+                if action == "needs_rebase":
+                    try:
+                        codex_worktree_base_rev = await _rebase_codex_worktree_onto_latest(
+                            work_dir,
+                            codex_worktree_path,
+                            task_id,
+                        )
+                    except Exception as exc:
+                        exit_code = 1
+                        stderr_text = str(exc)
+                        result_text = ""
+                        break
+                    live_retry_note = (
+                        f"An earlier attempt was paused because task '{blocker_id}' touched the same files. "
+                        "The worktree has been rebased onto the latest base."
+                    )
+                    await _post_agent_note_async(
+                        api_client,
+                        plan_id,
+                        task_id,
+                        f"Resuming after rebasing this worktree onto the latest base following overlap with '{blocker_id}'.",
+                        session_id=session_id,
+                    )
+                    print(
+                        f"    {CYAN}↺{RESET} {task_title} {DIM}rebased after {blocker_id}; resuming...{RESET}"
+                    )
+                    continue
+                if action == "resume":
+                    live_retry_note = (
+                        f"An earlier attempt was paused because task '{blocker_id}' touched the same files. "
+                        "That conflicting task stopped before landing changes."
+                    )
+                    await _post_agent_note_async(
+                        api_client,
+                        plan_id,
+                        task_id,
+                        f"Conflicting task '{blocker_id}' stopped before landing. Resuming this worktree.",
+                        session_id=session_id,
+                    )
+                    print(
+                        f"    {CYAN}↺{RESET} {task_title} {DIM}conflict cleared; resuming...{RESET}"
+                    )
+                    continue
+                if action == "blocked":
+                    exit_code = 1
+                    stderr_text = _clean(task_state.get("blocked_reason")) or (
+                        f"Task became blocked while waiting for '{blocker_id}' to finish."
+                    )
+                    result_text = ""
+                    break
+                exit_code = 1
+                stderr_text = (
+                    _clean(task_state.get("runtime_status_reason"))
+                    or "Timed out waiting for the conflicting task to finish."
+                )
+                result_text = ""
+                break
+
+            break
+
+        duration = time.monotonic() - overall_start
 
         # Parse cost and token data from agent's JSON output (Claude only)
-        cost_usd = 0.0
-        tokens_used = 0
-        model_name = ""
         try:
             claude_output = json.loads(stdout_text)
             cost_usd = claude_output.get("total_cost_usd", 0) or 0

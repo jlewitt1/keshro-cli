@@ -26,8 +26,9 @@ Examples:
 What Keshro does:
 1. Builds a migration-aware execution context with risks, open questions, task ordering, and acceptance criteria
 2. Runs agents in parallel in isolated git worktrees
-3. Carries learnings from one task into related future tasks
-4. Tracks progress, decisions, and rollback points through execution
+3. Detects live file overlap in Codex worktrees, pauses the lagging agent, and resumes after rebasing onto the winning task's changes
+4. Carries learnings from one task into related future tasks
+5. Tracks progress, decisions, and rollback points through execution
 
 ## Create a migration or project
 
