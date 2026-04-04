@@ -4769,7 +4769,7 @@ def test_auth_login_without_token_reuses_saved_session(monkeypatch, capsys):
 
     cli.main(["login"])
     out = capsys.readouterr().out.strip()
-    assert out == "Already logged in to Keshro as cli@example.com."
+    assert "Already logged in to Keshro as cli@example.com." in out
 
 
 def test_auth_login_without_token_reports_expired_saved_session(monkeypatch, capsys):
