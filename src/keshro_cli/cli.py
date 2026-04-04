@@ -430,7 +430,9 @@ def _execution_context_arg(plan: dict | None = None, plan_id: str | None = None)
     return _clean(plan_id) or _clean((plan or {}).get("id")) or ""
 
 
-def _execution_dashboard_url(plan: dict | None = None, plan_id: str | None = None) -> str:
+def _execution_dashboard_url(
+    plan: dict | None = None, plan_id: str | None = None
+) -> str:
     migration_id = _clean((plan or {}).get("migration_id"))
     if migration_id:
         return f"{_current_app_url()}/migrations/{migration_id}"
@@ -1078,7 +1080,9 @@ def _parse_field_assignments(values: list[str] | None) -> dict[str, str]:
     return parsed
 
 
-def _load_answer_file_bundle(path: str | None) -> tuple[dict[str, str], list[dict], str]:
+def _load_answer_file_bundle(
+    path: str | None,
+) -> tuple[dict[str, str], list[dict], str]:
     raw_path = _clean(path)
     if not raw_path:
         return ({}, [], "")
@@ -1087,9 +1091,7 @@ def _load_answer_file_bundle(path: str | None) -> tuple[dict[str, str], list[dic
     except OSError as exc:
         raise SystemExit(f"Could not read --answers-file {raw_path}: {exc}") from exc
     except json.JSONDecodeError as exc:
-        raise SystemExit(
-            f"Invalid JSON in --answers-file {raw_path}: {exc}"
-        ) from exc
+        raise SystemExit(f"Invalid JSON in --answers-file {raw_path}: {exc}") from exc
     questions = []
     enrichment_context = ""
     if isinstance(payload, dict) and isinstance(payload.get("questions"), list):
@@ -1197,9 +1199,11 @@ def _exit_for_agent_clarifier_feedback(
                     option.get("value")
                 )
                 rec = _format_recommended_suffix(title, bool(option.get("recommended")))
-                marker = " (suggested)" if suggested and suggested == _clean(
-                    option.get("value")
-                ) else ""
+                marker = (
+                    " (suggested)"
+                    if suggested and suggested == _clean(option.get("value"))
+                    else ""
+                )
                 print(f"     {DIM}{option_index}. {title}{rec}{marker}{RESET}")
         elif suggested:
             print(f"     {DIM}Suggested answer: {suggested}{RESET}")
@@ -1234,8 +1238,16 @@ def _exit_for_agent_migration_confirmation(
                 "question": f"This looks like a migration ({source_tech} -> {target_tech}). Should Keshro treat it as a migration or a general project?",
                 "recommended": "migration",
                 "options": [
-                    {"id": "migration", "label": "Treat as migration", "rerun_command": migration_command},
-                    {"id": "general", "label": "Treat as a general project", "rerun_command": general_command},
+                    {
+                        "id": "migration",
+                        "label": "Treat as migration",
+                        "rerun_command": migration_command,
+                    },
+                    {
+                        "id": "general",
+                        "label": "Treat as a general project",
+                        "rerun_command": general_command,
+                    },
                 ],
             },
             True,
@@ -2835,7 +2847,9 @@ async def _post_agent_heartbeat_async(
         changed_files = await _collect_git_changed_files(resolved_path)
     if not commit_sha and resolved_path:
         try:
-            commit_sha = await _git_stdout("git", "rev-parse", "HEAD", cwd=resolved_path)
+            commit_sha = await _git_stdout(
+                "git", "rev-parse", "HEAD", cwd=resolved_path
+            )
         except Exception:
             commit_sha = "unknown"
 
@@ -3029,6 +3043,8 @@ async def _wait_for_conflict_resolution(
         first_poll = False
         await asyncio.sleep(_LIVE_CONFLICT_POLL_SECONDS)
     return {"action": "timeout", "task": {}}
+
+
 def _build_agent_exec_command(
     agent_name: str,
     agent_bin: str,
@@ -3406,9 +3422,7 @@ async def _launch_single_agent(
                         session_start(collab_session_id, work_dir)
                 except Exception:
                     launched_in_terminal = False
-                    visible_fallback_reason = (
-                        "Collaborator/Conductor integration failed; falling back to headless execution"
-                    )
+                    visible_fallback_reason = "Collaborator/Conductor integration failed; falling back to headless execution"
                     session_start(collab_session_id, work_dir)
 
             if launched_in_terminal:
@@ -3480,10 +3494,14 @@ async def _launch_single_agent(
                 else:
                     readers = [
                         asyncio.create_task(
-                            _consume_stream(proc.stdout, latest_stdout_lines, stdout_chunks)
+                            _consume_stream(
+                                proc.stdout, latest_stdout_lines, stdout_chunks
+                            )
                         ),
                         asyncio.create_task(
-                            _consume_stream(proc.stderr, latest_stderr_lines, stderr_chunks)
+                            _consume_stream(
+                                proc.stderr, latest_stderr_lines, stderr_chunks
+                            )
                         ),
                     ]
                     await proc.wait()
@@ -3558,19 +3576,25 @@ async def _launch_single_agent(
                 )
                 if live_retry_count > _LIVE_CONFLICT_MAX_RETRIES:
                     exit_code = 1
-                    stderr_text = "Exceeded live conflict retry limit while waiting to resume."
+                    stderr_text = (
+                        "Exceeded live conflict retry limit while waiting to resume."
+                    )
                     result_text = ""
                     break
 
-                resolution = await _wait_for_conflict_resolution(api_client, plan_id, task_id)
+                resolution = await _wait_for_conflict_resolution(
+                    api_client, plan_id, task_id
+                )
                 action = _clean(resolution.get("action")).lower()
                 task_state = resolution.get("task") or {}
                 if action == "needs_rebase":
                     try:
-                        codex_worktree_base_rev = await _rebase_codex_worktree_onto_latest(
-                            work_dir,
-                            codex_worktree_path,
-                            task_id,
+                        codex_worktree_base_rev = (
+                            await _rebase_codex_worktree_onto_latest(
+                                work_dir,
+                                codex_worktree_path,
+                                task_id,
+                            )
                         )
                     except Exception as exc:
                         exit_code = 1
@@ -4025,9 +4049,7 @@ async def _run_parallel(
                                 if progress_message:
                                     details.append(progress_message)
                                 if touched_files:
-                                    details.append(
-                                        f"files: {', '.join(touched_files)}"
-                                    )
+                                    details.append(f"files: {', '.join(touched_files)}")
                                 if conflicting_files:
                                     details.append(
                                         f"conflicts: {', '.join(conflicting_files)}"
@@ -4039,9 +4061,7 @@ async def _run_parallel(
                                 print(
                                     f"  {DIM}[{label} · {session_id}]{RESET} {' | '.join(details)}"
                                 )
-                                _last_heartbeat = (
-                                    _poll_time.monotonic() - _start_time
-                                )
+                                _last_heartbeat = _poll_time.monotonic() - _start_time
                             for s in fresh.get("plan_steps", []):
                                 sid = s.get("id", "")
                                 status = (s.get("status") or "").lower()
@@ -4987,7 +5007,8 @@ def _create_migration(
         Optional[str], typer.Option("--github-url", "-g", help="GitHub URL to attach.")
     ] = None,
     resource_url: Annotated[
-        Optional[str], typer.Option("--resource-url", "-u", help="Reference URL to attach.")
+        Optional[str],
+        typer.Option("--resource-url", "-u", help="Reference URL to attach."),
     ] = None,
     org_id: Annotated[
         Optional[str], typer.Option("--org-id", "-o", help="Create under an org.")
@@ -5051,9 +5072,7 @@ def _create_migration(
 ):
     """Create a migration or project from a repo, issue, URL, or freeform request."""
     if template and (
-        as_migration
-        or _clean(source_type_override)
-        or _clean(target_type_override)
+        as_migration or _clean(source_type_override) or _clean(target_type_override)
     ):
         raise SystemExit(
             "--template already selects migration mode. Do not combine it with --as-migration, --source-type, or --target-type."
@@ -5105,7 +5124,11 @@ def _create_migration(
 
     try:
         provided_clarifier_answers = _parse_field_assignments(answer)
-        file_answers, resume_questions, resume_enrichment_context = _load_answer_file_bundle(answers_file)
+        (
+            file_answers,
+            resume_questions,
+            resume_enrichment_context,
+        ) = _load_answer_file_bundle(answers_file)
         provided_clarifier_answers.update(file_answers)
         context_entered_interactively = False
         if template:
@@ -5390,7 +5413,9 @@ def _create_migration(
                         for key, value in suggested_answers.items()
                         if key in missing_ids
                     }
-                    rerun_command = f"keshro create --context {shlex.quote(context or description)}"
+                    rerun_command = (
+                        f"keshro create --context {shlex.quote(context or description)}"
+                    )
                     if agent != "auto":
                         rerun_command += f" --agent {shlex.quote(agent)}"
                     _exit_for_agent_clarifier_feedback(
@@ -5546,14 +5571,18 @@ def _collect_generic_discovery(work_dir: str) -> str | None:
     return "\n\n".join(facts) if facts else None
 
 
-def _should_scan_default_work_dir(work_dir: str, *, explicit_target: bool = False) -> bool:
+def _should_scan_default_work_dir(
+    work_dir: str, *, explicit_target: bool = False
+) -> bool:
     if explicit_target:
         return True
     root = Path(work_dir)
     if not root.is_dir():
         return False
     try:
-        visible_entries = [entry for entry in root.iterdir() if not entry.name.startswith(".")]
+        visible_entries = [
+            entry for entry in root.iterdir() if not entry.name.startswith(".")
+        ]
     except OSError:
         return False
     repo_like_children = 0
@@ -5563,7 +5592,10 @@ def _should_scan_default_work_dir(work_dir: str, *, explicit_target: bool = Fals
         if (entry / ".git").exists():
             repo_like_children += 1
             continue
-        if any((entry / marker).exists() for marker in ("package.json", "pyproject.toml", "go.mod", "Cargo.toml")):
+        if any(
+            (entry / marker).exists()
+            for marker in ("package.json", "pyproject.toml", "go.mod", "Cargo.toml")
+        ):
             repo_like_children += 1
     if repo_like_children >= 2:
         return False
@@ -5787,12 +5819,14 @@ def _create_migration_inner(
                             "Collecting suggested follow-up answers (this can take a bit)..."
                         ):
                             try:
-                                suggested_answers = _collect_clarifier_answers_from_claude(
-                                    template,
-                                    payload,
-                                    clarifier_questions,
-                                    work_dir=resolved_work_dir,
-                                    agent=agent,
+                                suggested_answers = (
+                                    _collect_clarifier_answers_from_claude(
+                                        template,
+                                        payload,
+                                        clarifier_questions,
+                                        work_dir=resolved_work_dir,
+                                        agent=agent,
+                                    )
                                 )
                             except SystemExit as exc:
                                 suggested_answers = {}
@@ -5905,12 +5939,14 @@ def _create_custom_migration_inner(
                             "Collecting suggested follow-up answers (this can take a bit)..."
                         ):
                             try:
-                                suggested_answers = _collect_clarifier_answers_from_claude(
-                                    {},
-                                    payload,
-                                    clarifier_questions,
-                                    work_dir=resolved_work_dir,
-                                    agent=agent,
+                                suggested_answers = (
+                                    _collect_clarifier_answers_from_claude(
+                                        {},
+                                        payload,
+                                        clarifier_questions,
+                                        work_dir=resolved_work_dir,
+                                        agent=agent,
+                                    )
                                 )
                             except SystemExit as exc:
                                 suggested_answers = {}
@@ -6514,19 +6550,23 @@ except FileNotFoundError:
         "Run all keshro commands via Bash.\n"
     )
 
+
 def _install_claude_integration() -> Path:
     # Install as a skill (auto-triggered) in ~/.claude/skills/keshro/
     skill_dir = CLAUDE_SKILLS_DIR / "keshro"
     skill_dir.mkdir(parents=True, exist_ok=True)
     target = skill_dir / "SKILL.md"
     was_regular_file = target.exists() and not target.is_symlink()
-    was_stale_symlink = target.is_symlink() and target.resolve() != _SKILL_FILE.resolve()
+    was_stale_symlink = (
+        target.is_symlink() and target.resolve() != _SKILL_FILE.resolve()
+    )
     if target.is_symlink() or target.exists():
         target.unlink()
     try:
         target.symlink_to(_SKILL_FILE)
     except (OSError, NotImplementedError):
         import shutil
+
         shutil.copy2(_SKILL_FILE, target)
     # Clean up legacy ~/.claude/commands/keshro.md
     legacy = CLAUDE_COMMANDS_DIR / "keshro.md"
@@ -6596,7 +6636,10 @@ def _maybe_refresh_claude() -> None:
             needs_update = True
         elif not skill_target.exists() and not skill_target.is_symlink():
             return
-        elif skill_target.is_symlink() and skill_target.resolve() != _SKILL_FILE.resolve():
+        elif (
+            skill_target.is_symlink()
+            and skill_target.resolve() != _SKILL_FILE.resolve()
+        ):
             needs_update = True
         elif not skill_target.is_symlink():
             # Regular file (e.g. Windows copy fallback) — only update if content differs
@@ -6677,7 +6720,9 @@ def _setup_claude():
         print_output({"status": "ok", "path": str(target)}, True)
     else:
         print(f"Installed Claude Code skill v{__version__} at {target}")
-        print("Keshro will auto-trigger in Claude Code for migration and refactor tasks.")
+        print(
+            "Keshro will auto-trigger in Claude Code for migration and refactor tasks."
+        )
 
 
 @app.command("setup-codex", hidden=True)
@@ -7173,7 +7218,9 @@ def _plan_status(
     plan_id: Annotated[
         Optional[str],
         typer.Option(
-            "--plan-id", "-p", help="Execution context ID. Uses saved context if omitted."
+            "--plan-id",
+            "-p",
+            help="Execution context ID. Uses saved context if omitted.",
         ),
     ] = None,
     watch: Annotated[
@@ -7198,7 +7245,9 @@ def _status_alias(
     plan_id: Annotated[
         Optional[str],
         typer.Option(
-            "--plan-id", "-p", help="Execution context ID. Uses saved context if omitted."
+            "--plan-id",
+            "-p",
+            help="Execution context ID. Uses saved context if omitted.",
         ),
     ] = None,
     watch: Annotated[
@@ -7455,6 +7504,7 @@ def _collect_task_runtime_context_for(cwd: str) -> dict:
     }
     return {key: value for key, value in context.items() if value not in (None, [], "")}
 
+
 def _collect_task_outcome(work_dir: str | None = None) -> dict | None:
     """Collect structured git diff data since last keshro checkpoint."""
     try:
@@ -7531,12 +7581,14 @@ def _collect_task_outcome(work_dir: str | None = None) -> dict | None:
             if len(parts) < 3:
                 continue
             added, removed, path = parts[0], parts[1], parts[2]
-            files_changed.append({
-                "path": path,
-                "lines_added": int(added) if added != "-" else 0,
-                "lines_removed": int(removed) if removed != "-" else 0,
-                "change_type": status_map.get(path, "modified"),
-            })
+            files_changed.append(
+                {
+                    "path": path,
+                    "lines_added": int(added) if added != "-" else 0,
+                    "lines_removed": int(removed) if removed != "-" else 0,
+                    "change_type": status_map.get(path, "modified"),
+                }
+            )
             if len(files_changed) >= 200:
                 break
 

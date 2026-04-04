@@ -3,14 +3,12 @@
 Plan and run high-stakes engineering projects with AI agents.
 
 ```bash
-pip install keshro
-```
-
-```bash
-keshro login              # opens browser to authenticate
+keshro login              # authenticate and install Claude Code + Codex integrations
 keshro create             # scan project, create the right migration/project
 keshro continue           # agents execute in parallel if possible
 ```
+
+`keshro login` authenticates the CLI and installs agent integrations on the current machine. For Codex, Keshro adds a managed block to `~/.codex/AGENTS.md` and preserves any non-Keshro content already in that file.
 
 Keshro is built for migrations first. It scans the repo, asks the follow-up questions that actually matter for the migration, creates the right migration or project, then coordinates agents to execute it safely.
 

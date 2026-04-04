@@ -122,6 +122,9 @@ def cmd_auth_login(
                     )
                 else:
                     print(f"Already logged in to Keshro as {user['email']}.")
+                    print(
+                        "Keshro login also installs agent integrations for Claude Code and Codex."
+                    )
                 return
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code not in {401, 403}:
@@ -139,6 +142,7 @@ def cmd_auth_login(
                     print_output({"status": "ok", "user": email}, True)
                 else:
                     print(f"Logged in to Keshro as {email}.")
+                    print("Installing agent integrations for Claude Code and Codex...")
                 # Install agent integrations
                 _install_integrations(json_output)
                 return
@@ -146,6 +150,7 @@ def cmd_auth_login(
         raise SystemExit(
             "Usage: keshro login <api-token>\n"
             "Or run without a token to authenticate via browser.\n"
+            "This also installs local agent integrations for Claude Code and Codex.\n"
             "Get a token from Account -> API at keshro.com"
         )
 
@@ -156,12 +161,13 @@ def cmd_auth_login(
         print_output({"status": "ok", "user": body["user"]["email"]}, True)
     else:
         print(f"Logged in to Keshro as {body['user']['email']}.")
+        print("Installing agent integrations for Claude Code and Codex...")
 
     _install_integrations(json_output)
 
 
 def _install_integrations(json_output: bool = False):
-    """Install agent integrations (Claude Code slash command, Codex instructions)."""
+    """Install agent integrations for Claude Code and Codex on this machine."""
     try:
         from .cli import _install_claude_integration, _install_codex_integration
 
@@ -169,7 +175,10 @@ def _install_integrations(json_output: bool = False):
         codex_target = _install_codex_integration()
         if not json_output:
             print(f"  {GREEN}✓{RESET} Claude Code: {claude_target}")
-            print(f"  {GREEN}✓{RESET} Codex: {codex_target}")
+            print(
+                f"  {GREEN}✓{RESET} Codex: {codex_target} "
+                "(managed block in ~/.codex/AGENTS.md)"
+            )
     except Exception:
         pass
 

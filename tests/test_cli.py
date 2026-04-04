@@ -195,7 +195,9 @@ def test_collect_task_outcome_uses_merge_base_when_no_checkpoint(monkeypatch):
             )
         if cmd[:3] == ["git", "diff", "--name-status"]:
             assert cmd[3] == "merge-base-sha..HEAD"
-            return subprocess.CompletedProcess(cmd, 0, stdout="M\tsrc/demo.py\n", stderr="")
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="M\tsrc/demo.py\n", stderr=""
+            )
         if cmd[:3] == ["git", "log", "--format=%H"]:
             assert cmd[3] == "merge-base-sha..HEAD"
             return subprocess.CompletedProcess(
@@ -250,7 +252,9 @@ def test_collect_task_outcome_falls_back_to_root_commit_without_merge_base(monke
             )
         if cmd[:3] == ["git", "diff", "--name-status"]:
             assert cmd[3] == "root-sha..HEAD"
-            return subprocess.CompletedProcess(cmd, 0, stdout="A\tsrc/rooted.py\n", stderr="")
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="A\tsrc/rooted.py\n", stderr=""
+            )
         if cmd[:3] == ["git", "log", "--format=%H"]:
             assert cmd[3] == "root-sha..HEAD"
             return subprocess.CompletedProcess(cmd, 0, stdout="commit-1\n", stderr="")
@@ -260,8 +264,7 @@ def test_collect_task_outcome_falls_back_to_root_commit_without_merge_base(monke
                 cmd,
                 0,
                 stdout=(
-                    " src/rooted.py | 5 +++++\n"
-                    " 1 file changed, 5 insertions(+)\n"
+                    " src/rooted.py | 5 +++++\n" " 1 file changed, 5 insertions(+)\n"
                 ),
                 stderr="",
             )
@@ -637,7 +640,9 @@ def test_launch_single_agent_retries_codex_after_live_conflict(monkeypatch):
         cli, "_wait_for_conflict_resolution", _fake_wait_for_conflict_resolution
     )
     monkeypatch.setattr(
-        cli, "_rebase_codex_worktree_onto_latest", _fake_rebase_codex_worktree_onto_latest
+        cli,
+        "_rebase_codex_worktree_onto_latest",
+        _fake_rebase_codex_worktree_onto_latest,
     )
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
 
@@ -690,9 +695,9 @@ def test_find_plan_task_supports_all_plan_task_shapes():
     assert cli._find_plan_task({"tasks": [{"id": "task-2"}]}, "task-2") == {
         "id": "task-2"
     }
-    assert cli._find_plan_task(
-        {"plan": {"tasks": [{"id": "task-3"}]}}, "task-3"
-    ) == {"id": "task-3"}
+    assert cli._find_plan_task({"plan": {"tasks": [{"id": "task-3"}]}}, "task-3") == {
+        "id": "task-3"
+    }
 
 
 def test_wait_for_conflict_resolution_skips_first_active_poll(monkeypatch):
@@ -721,9 +726,7 @@ def test_wait_for_conflict_resolution_skips_first_active_poll(monkeypatch):
     monkeypatch.setattr(cli.asyncio, "sleep", _fake_sleep)
 
     client = _PollingClient(responses)
-    result = asyncio.run(
-        cli._wait_for_conflict_resolution(client, "plan-1", "task-1")
-    )
+    result = asyncio.run(cli._wait_for_conflict_resolution(client, "plan-1", "task-1"))
 
     assert result["action"] == "needs_rebase"
     assert client.calls == 2
@@ -743,9 +746,7 @@ def test_commit_codex_worktree_snapshot_skips_git_add_when_clean(monkeypatch):
 
     monkeypatch.setattr(cli, "_git_stdout", _fake_git_stdout)
 
-    result = asyncio.run(
-        cli._commit_codex_worktree_snapshot("/tmp/worktree", "task-1")
-    )
+    result = asyncio.run(cli._commit_codex_worktree_snapshot("/tmp/worktree", "task-1"))
 
     assert result is False
     assert calls == [(("git", "status", "--short"), "/tmp/worktree")]
@@ -1092,8 +1093,16 @@ def test_main_without_args_prints_version(capsys):
 
 
 def test_main_version_skips_agent_refresh(monkeypatch, capsys):
-    monkeypatch.setattr(cli, "_maybe_refresh_claude", lambda: (_ for _ in ()).throw(AssertionError("should not refresh claude")))
-    monkeypatch.setattr(cli, "_maybe_refresh_codex", lambda: (_ for _ in ()).throw(AssertionError("should not refresh codex")))
+    monkeypatch.setattr(
+        cli,
+        "_maybe_refresh_claude",
+        lambda: (_ for _ in ()).throw(AssertionError("should not refresh claude")),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_maybe_refresh_codex",
+        lambda: (_ for _ in ()).throw(AssertionError("should not refresh codex")),
+    )
 
     code = cli.main(["--version"])
 
@@ -1104,8 +1113,16 @@ def test_main_version_skips_agent_refresh(monkeypatch, capsys):
 
 
 def test_main_help_skips_agent_refresh(monkeypatch, capsys):
-    monkeypatch.setattr(cli, "_maybe_refresh_claude", lambda: (_ for _ in ()).throw(AssertionError("should not refresh claude")))
-    monkeypatch.setattr(cli, "_maybe_refresh_codex", lambda: (_ for _ in ()).throw(AssertionError("should not refresh codex")))
+    monkeypatch.setattr(
+        cli,
+        "_maybe_refresh_claude",
+        lambda: (_ for _ in ()).throw(AssertionError("should not refresh claude")),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_maybe_refresh_codex",
+        lambda: (_ for _ in ()).throw(AssertionError("should not refresh codex")),
+    )
 
     code = cli.main(["--help"])
 
@@ -1138,7 +1155,9 @@ def test_plan_generate_rejects_migration_like_requests(capsys, monkeypatch):
 
 def test_plan_generate_accepts_non_migration_requests(fake_client, capsys, monkeypatch):
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
-    monkeypatch.setattr("keshro_cli.cli._detect_migration_intent", lambda _description: None)
+    monkeypatch.setattr(
+        "keshro_cli.cli._detect_migration_intent", lambda _description: None
+    )
 
     original_post = fake_client.post
 
@@ -1328,7 +1347,9 @@ def test_create_migration_from_path_key_can_use_codex(fake_client, monkeypatch, 
 
     monkeypatch.setattr("subprocess.run", _fake_run)
 
-    code = cli.main(["create", "--template", "aws-batch-to-airflow", "--agent", "codex"])
+    code = cli.main(
+        ["create", "--template", "aws-batch-to-airflow", "--agent", "codex"]
+    )
 
     assert code == 0
     out = ANSI_RE.sub("", capsys.readouterr().out)
@@ -1851,7 +1872,9 @@ def test_continue_exits_when_token_expired(fake_client, monkeypatch):
 def test_setup_claude_creates_skill(monkeypatch, tmp_path, capsys):
     skills_dir = tmp_path / "skills"
     monkeypatch.setattr("keshro_cli.cli.CLAUDE_SKILLS_DIR", skills_dir)
-    monkeypatch.setattr("keshro_cli.cli.CLAUDE_COMMANDS_DIR", tmp_path / "legacy_commands")
+    monkeypatch.setattr(
+        "keshro_cli.cli.CLAUDE_COMMANDS_DIR", tmp_path / "legacy_commands"
+    )
 
     cli.main(["setup-claude"])
 
@@ -1863,11 +1886,20 @@ def test_setup_claude_creates_skill(monkeypatch, tmp_path, capsys):
     assert "keshro continue" in content
     assert "Do NOT use Keshro MCP tools" in content
     assert "keshro create --context-file /tmp/keshro-context.txt" in content
-    assert "Do not inspect the codebase first to decide whether Keshro is relevant." in content
+    assert (
+        "Do not inspect the codebase first to decide whether Keshro is relevant."
+        in content
+    )
     assert "the first pass may take a bit before follow-up questions appear" in content
     assert "immediately surface the dashboard URL to the user" in content
-    assert "If the status is still `analyzing`, simply tell the user it was created" in content
-    assert "Do not summarize findings, comment on elapsed time, or offer to keep polling by default." in content
+    assert (
+        "If the status is still `analyzing`, simply tell the user it was created"
+        in content
+    )
+    assert (
+        "Do not summarize findings, comment on elapsed time, or offer to keep polling by default."
+        in content
+    )
     assert "move from X to Y" in content
     # Must have YAML frontmatter with description for auto-triggering
     assert content.startswith("---")
@@ -1884,9 +1916,9 @@ def test_skill_has_trigger_conditions():
     frontmatter = parts[1]
     assert "description:" in frontmatter
     for keyword in ["TRIGGER when:", "migrate", "refactor", "upgrade", "convert"]:
-        assert keyword in frontmatter, (
-            f"'{keyword}' must appear in SKILL.md frontmatter description"
-        )
+        assert (
+            keyword in frontmatter
+        ), f"'{keyword}' must appear in SKILL.md frontmatter description"
     assert "DO NOT TRIGGER" in frontmatter
 
 
@@ -1896,7 +1928,9 @@ def test_setup_claude_overwrites_existing(monkeypatch, tmp_path, capsys):
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text("old content")
     monkeypatch.setattr("keshro_cli.cli.CLAUDE_SKILLS_DIR", skills_dir)
-    monkeypatch.setattr("keshro_cli.cli.CLAUDE_COMMANDS_DIR", tmp_path / "legacy_commands")
+    monkeypatch.setattr(
+        "keshro_cli.cli.CLAUDE_COMMANDS_DIR", tmp_path / "legacy_commands"
+    )
 
     cli.main(["setup-claude"])
 
@@ -1909,7 +1943,9 @@ def test_setup_claude_creates_symlink(monkeypatch, tmp_path, capsys):
     """setup-claude should create a symlink to the package's SKILL.md file."""
     skills_dir = tmp_path / "skills"
     monkeypatch.setattr("keshro_cli.cli.CLAUDE_SKILLS_DIR", skills_dir)
-    monkeypatch.setattr("keshro_cli.cli.CLAUDE_COMMANDS_DIR", tmp_path / "legacy_commands")
+    monkeypatch.setattr(
+        "keshro_cli.cli.CLAUDE_COMMANDS_DIR", tmp_path / "legacy_commands"
+    )
 
     cli.main(["setup-claude"])
 
@@ -1926,7 +1962,9 @@ def test_setup_claude_replaces_regular_file_with_symlink(monkeypatch, tmp_path, 
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text("old copied content")
     monkeypatch.setattr("keshro_cli.cli.CLAUDE_SKILLS_DIR", skills_dir)
-    monkeypatch.setattr("keshro_cli.cli.CLAUDE_COMMANDS_DIR", tmp_path / "legacy_commands")
+    monkeypatch.setattr(
+        "keshro_cli.cli.CLAUDE_COMMANDS_DIR", tmp_path / "legacy_commands"
+    )
 
     cli.main(["setup-claude"])
 
@@ -1984,7 +2022,9 @@ def test_maybe_refresh_claude_upgrades_stale_symlink(monkeypatch, tmp_path):
     old_file.write_text("stale symlink target")
     target.symlink_to(old_file)
     monkeypatch.setattr("keshro_cli.cli.CLAUDE_SKILLS_DIR", skills_dir)
-    monkeypatch.setattr("keshro_cli.cli.CLAUDE_COMMANDS_DIR", tmp_path / "legacy_commands")
+    monkeypatch.setattr(
+        "keshro_cli.cli.CLAUDE_COMMANDS_DIR", tmp_path / "legacy_commands"
+    )
 
     cli._maybe_refresh_claude()
 
@@ -2001,7 +2041,9 @@ def test_maybe_refresh_claude_skips_when_current(monkeypatch, tmp_path):
     target.symlink_to(cli._SKILL_FILE)
     mtime_before = target.lstat().st_mtime
     monkeypatch.setattr("keshro_cli.cli.CLAUDE_SKILLS_DIR", skills_dir)
-    monkeypatch.setattr("keshro_cli.cli.CLAUDE_COMMANDS_DIR", tmp_path / "legacy_commands")
+    monkeypatch.setattr(
+        "keshro_cli.cli.CLAUDE_COMMANDS_DIR", tmp_path / "legacy_commands"
+    )
 
     cli._maybe_refresh_claude()
 
@@ -2013,7 +2055,9 @@ def test_maybe_refresh_claude_skips_when_not_installed(monkeypatch, tmp_path):
     skills_dir = tmp_path / "skills"
     skills_dir.mkdir(parents=True)
     monkeypatch.setattr("keshro_cli.cli.CLAUDE_SKILLS_DIR", skills_dir)
-    monkeypatch.setattr("keshro_cli.cli.CLAUDE_COMMANDS_DIR", tmp_path / "legacy_commands")
+    monkeypatch.setattr(
+        "keshro_cli.cli.CLAUDE_COMMANDS_DIR", tmp_path / "legacy_commands"
+    )
 
     cli._maybe_refresh_claude()
 
@@ -2066,7 +2110,9 @@ def test_should_scan_default_work_dir_accepts_repo_like_root(tmp_path):
     assert cli._should_scan_default_work_dir(str(tmp_path)) is True
 
 
-def test_should_scan_default_work_dir_skips_parent_directory_with_multiple_repos(tmp_path):
+def test_should_scan_default_work_dir_skips_parent_directory_with_multiple_repos(
+    tmp_path,
+):
     repo_one = tmp_path / "repo-one"
     repo_two = tmp_path / "repo-two"
     repo_one.mkdir()
@@ -2083,7 +2129,9 @@ def test_should_scan_default_work_dir_honors_explicit_target(tmp_path):
     repo_two.mkdir()
     (repo_one / ".git").mkdir()
     (repo_two / "package.json").write_text("{}\n")
-    assert cli._should_scan_default_work_dir(str(tmp_path), explicit_target=True) is True
+    assert (
+        cli._should_scan_default_work_dir(str(tmp_path), explicit_target=True) is True
+    )
 
 
 def test_create_skips_default_directory_scan_when_cwd_looks_unrelated(
@@ -2094,12 +2142,16 @@ def test_create_skips_default_directory_scan_when_cwd_looks_unrelated(
     (unrelated_root / "repo-one").mkdir()
     (unrelated_root / "repo-two").mkdir()
     (unrelated_root / "repo-one" / ".git").mkdir(parents=True)
-    (unrelated_root / "repo-two" / "pyproject.toml").write_text("[project]\nname='demo'\n")
+    (unrelated_root / "repo-two" / "pyproject.toml").write_text(
+        "[project]\nname='demo'\n"
+    )
 
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
     monkeypatch.setattr("keshro_cli.cli.update_auth", lambda payload: payload)
     monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
-    monkeypatch.setattr("keshro_cli.cli._prompt_agent_display_name", lambda _agent: "Claude Code")
+    monkeypatch.setattr(
+        "keshro_cli.cli._prompt_agent_display_name", lambda _agent: "Claude Code"
+    )
     collect_calls: list[str] = []
     monkeypatch.setattr(
         "keshro_cli.cli._collect_generic_discovery",
@@ -2548,7 +2600,15 @@ def test_create_inside_coding_agent_explicit_migration_still_routes(monkeypatch)
         "keshro_cli.cli._create_migration_inner", _fake_create_migration_inner
     )
 
-    code = cli.main(["create", "--template", "aws-batch-to-airflow", "--context", "migrate from aws batch to airflow"])
+    code = cli.main(
+        [
+            "create",
+            "--template",
+            "aws-batch-to-airflow",
+            "--context",
+            "migrate from aws batch to airflow",
+        ]
+    )
 
     assert code == 0
     assert captured["path"] == "aws-batch-to-airflow"
@@ -2579,7 +2639,10 @@ def test_create_inside_coding_agent_stops_for_detected_migration_confirmation(
     assert code == 0
     out = ANSI_RE.sub("", capsys.readouterr().out)
     assert "This looks like a migration (AWS Batch -> Airflow)." in out
-    assert "keshro create --template aws-batch-to-airflow --context 'migrate from aws batch to airflow'" in out
+    assert (
+        "keshro create --template aws-batch-to-airflow --context 'migrate from aws batch to airflow'"
+        in out
+    )
 
 
 def test_create_explicit_migration_without_template_uses_custom_migration_path(
@@ -2708,7 +2771,9 @@ def test_create_inside_coding_agent_stops_before_generation_when_answers_missing
                 }
             )
         if path == "/v1/plans/generate":
-            raise AssertionError("plan generation should not happen before user feedback")
+            raise AssertionError(
+                "plan generation should not happen before user feedback"
+            )
         return original_post(path, json=json, timeout=timeout)
 
     fake_client.post = _post
@@ -2760,7 +2825,9 @@ def test_create_inside_coding_agent_stops_for_clarifiers_until_user_answers(
                 }
             )
         if path == "/v1/plans/generate":
-            raise AssertionError("plan generation should not happen before user feedback")
+            raise AssertionError(
+                "plan generation should not happen before user feedback"
+            )
         return original_post(path, json=json, timeout=timeout)
 
     fake_client.post = _post
@@ -2921,9 +2988,7 @@ def test_review_agent_suggested_answers_accepts_suggestions_inside_agent(
     assert "Using agent-suggested answers" in out
 
 
-def test_create_as_migration_uses_explicit_source_and_target(
-    fake_client, monkeypatch
-):
+def test_create_as_migration_uses_explicit_source_and_target(fake_client, monkeypatch):
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
     monkeypatch.setattr("keshro_cli.cli._collect_generic_discovery", lambda _: None)
     monkeypatch.setattr("sys.stdout.isatty", lambda: False)
@@ -2981,7 +3046,9 @@ def test_create_as_migration_requires_both_source_and_target(monkeypatch, capsys
     )
 
     assert code == 1
-    assert "Pass both --source-type and --target-type together" in capsys.readouterr().err
+    assert (
+        "Pass both --source-type and --target-type together" in capsys.readouterr().err
+    )
 
 
 def test_create_as_migration_fails_when_detection_cannot_infer_path(
@@ -2995,7 +3062,9 @@ def test_create_as_migration_fails_when_detection_cannot_infer_path(
     code = cli.main(["create", "--as-migration", "--context", "move things around"])
 
     assert code == 1
-    assert "Could not determine the migration source and target" in capsys.readouterr().err
+    assert (
+        "Could not determine the migration source and target" in capsys.readouterr().err
+    )
 
 
 def test_find_migration_template_normalizes_apache_airflow(fake_client):
@@ -3005,9 +3074,7 @@ def test_find_migration_template_normalizes_apache_airflow(fake_client):
 
 
 def test_find_migration_template_normalizes_airflow_mwaa_variant(fake_client):
-    template_key = cli._find_migration_template(
-        "AWS Batch", "Apache Airflow (MWAA)"
-    )
+    template_key = cli._find_migration_template("AWS Batch", "Apache Airflow (MWAA)")
 
     assert template_key == "aws-batch-to-airflow"
 
@@ -3750,9 +3817,7 @@ def test_install_codex_integration_replaces_existing_managed_block(
     assert "TRIGGER when:" in content
 
 
-def test_install_codex_integration_replaces_old_versioned_block(
-    monkeypatch, tmp_path
-):
+def test_install_codex_integration_replaces_old_versioned_block(monkeypatch, tmp_path):
     """Codex integration should replace a block from an older CLI version."""
     monkeypatch.setattr("keshro_cli.cli.CODEX_HOME_DIR", tmp_path)
     target = tmp_path / "AGENTS.md"
