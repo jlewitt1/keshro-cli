@@ -1015,6 +1015,7 @@ def _print_task_update_summary(plan: dict, task_id: str, payload: dict) -> None:
         (step for step in steps if _clean(step.get("id")) == _clean(task_id)),
         None,
     )
+    task_data = task or {}
     if task is None:
         task_title = task_id or "task"
         status = _clean(payload.get("status")) or "updated"
@@ -1024,9 +1025,9 @@ def _print_task_update_summary(plan: dict, task_id: str, payload: dict) -> None:
     print(f"Updated task {task_title} [{status}].")
     changed_bits: list[str] = []
     if "owner" in payload:
-        changed_bits.append(f"Owner: {_clean(task.get('owner')) or 'Unassigned'}")
+        changed_bits.append(f"Owner: {_clean(task_data.get('owner')) or 'Unassigned'}")
     if "blocked_reason" in payload:
-        blocked_reason = _clean(task.get("blocked_reason"))
+        blocked_reason = _clean(task_data.get("blocked_reason"))
         changed_bits.append(
             f"Blocked: {blocked_reason}" if blocked_reason else "Blocked cleared"
         )
