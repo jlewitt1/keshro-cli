@@ -4960,6 +4960,7 @@ async def _run_parallel(
 
             # Stream results as each agent completes
             results: list[AgentResult | Exception] = []
+            stopped_task_ids: set[str] = set()
             completed_count = 0
             agent_tasks = [asyncio.create_task(c) for c in agent_coros]
             total_agents = len(agent_tasks)
@@ -4971,7 +4972,14 @@ async def _run_parallel(
                 nonlocal _sigint_count, _cancelled, _cancel_requested
                 _sigint_count += 1
                 remaining = total_agents - completed_count
-                if _sigint_count == 1:
+                if _sigint_count == 1 and remaining == 1:
+                    _cancel_requested = True
+                    _cancelled = True
+                    print(f"\n  {RED}Stopping 1 agent...{RESET}")
+                    for t in agent_tasks:
+                        if not t.done():
+                            t.cancel()
+                elif _sigint_count == 1:
                     _cancel_requested = True
                     running_label = "agent" if remaining == 1 else "agents"
                     print(f"\n  {YELLOW}⚠ {remaining} {running_label} still running.{RESET}")
@@ -4993,10 +5001,13 @@ async def _run_parallel(
                         r = await coro
                         results.append(r)
                         completed_count += 1
-                        if _cancelled:
+                        stopped_by_user = _cancel_requested and r.exit_code == 0
+                        if stopped_by_user:
+                            stopped_task_ids.add(r.task_id)
+                        if _cancelled and not stopped_by_user:
                             break
-                        if r.exit_code == 0 and _cancel_requested:
-                            status = f"{YELLOW}completed before stop{RESET}"
+                        if stopped_by_user:
+                            status = f"{YELLOW}stopped{RESET}"
                         elif r.exit_code == 0:
                             status = f"{GREEN}done{RESET}"
                         elif r.failure_kind in {"launch", "usage_limit"}:
@@ -5052,9 +5063,20 @@ async def _run_parallel(
             return
 
         succeeded = sum(
-            1 for r in results if not isinstance(r, Exception) and r.exit_code == 0
+            1
+            for r in results
+            if not isinstance(r, Exception)
+            and r.exit_code == 0
+            and r.task_id not in stopped_task_ids
         )
-        failed = len(results) - succeeded
+        stopped = sum(
+            1
+            for r in results
+            if not isinstance(r, Exception)
+            and r.exit_code == 0
+            and r.task_id in stopped_task_ids
+        )
+        failed = len(results) - succeeded - stopped
         wave_cost = sum(r.cost_usd for r in results if not isinstance(r, Exception))
         wave_tokens = sum(
             r.tokens_used for r in results if not isinstance(r, Exception)
@@ -5065,9 +5087,11 @@ async def _run_parallel(
             if wave_cost > 0
             else ""
         )
-        print(
-            f"\n{GREEN}{succeeded} succeeded{RESET}, {RED}{failed} failed{RESET}{cost_summary}"
-        )
+        summary_bits = [f"{GREEN}{succeeded} succeeded{RESET}"]
+        if stopped > 0:
+            summary_bits.append(f"{YELLOW}{stopped} stopped{RESET}")
+        summary_bits.append(f"{RED}{failed} failed{RESET}")
+        print(f"\n{', '.join(summary_bits)}{cost_summary}")
 
         # Check for blocked tasks and tell the user exactly what to do
         with make_client(_state.api_url, _state.token) as refresh_client:

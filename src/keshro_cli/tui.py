@@ -89,12 +89,24 @@ def _confidence_percent(value: object) -> int | None:
 
 
 def _app_url_from_api_url(api_url: str) -> str:
-    clean = api_url.rstrip("/")
-    if clean.endswith(":8000"):
-        return clean[:-5] + ":3000"
+    clean = _clean(api_url).rstrip("/")
+    if not clean:
+        return "https://keshro.com"
+    if "localhost" in clean or "127.0.0.1" in clean:
+        return clean.replace("://api.", "://").replace(":8000", ":3000")
+    if "api." in clean:
+        return clean.replace("://api.", "://", 1)
     if clean.endswith("/api"):
         return clean[:-4]
     return clean
+
+
+def _execution_dashboard_url(plan: dict, app_url: str) -> str:
+    migration_id = _clean(plan.get("migration_id"))
+    if migration_id:
+        return f"{app_url}/migrations/{migration_id}"
+    plan_id = _clean(plan.get("id"))
+    return f"{app_url}/plans/{plan_id}" if plan_id else ""
 
 
 class PlanOverview(Static):
@@ -217,7 +229,7 @@ class PlanInsights(Static):
                 )
 
         if self.app_url:
-            plan_url = f"{self.app_url}/plans/{plan.get('id', '')}"
+            plan_url = _execution_dashboard_url(plan, self.app_url)
             lines.extend(
                 [
                     "",
@@ -435,7 +447,7 @@ class KeshroStatusApp(App):
 
     def on_mount(self) -> None:
         self.title = "KESHRO STATUS"
-        self.sub_title = f"Plan: {self.plan_id[:20]}"
+        self.sub_title = f"Context: {self.plan_id[:20]}"
         self._fetch_and_update()
         self._start_sse()
 
@@ -529,6 +541,11 @@ class KeshroStatusApp(App):
             self.query_one("#agents", ActiveAgents).plan_data = data
             self.query_one("#graph", TaskGraph).plan_data = data
             self.query_one("#events", RecentEvents).plan_data = data
+            migration_id = _clean(data.get("migration_id"))
+            if migration_id:
+                self.sub_title = f"Migration: {migration_id[:20]}"
+            else:
+                self.sub_title = f"Plan: {self.plan_id[:20]}"
         except Exception as exc:
             overview = self.query_one("#overview", PlanOverview)
             overview.plan_data = None
