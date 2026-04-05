@@ -2234,7 +2234,7 @@ def _build_continue_brief(
         lines.append(
             f"Review full risks/questions in UI: {_current_app_url()}/plans/{resolved_plan_id}"
         )
-        lines.extend(
+    lines.extend(
         [
             "",
             "Execution reminders:",
