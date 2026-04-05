@@ -1041,7 +1041,7 @@ def _print_task_update_summary(plan: dict, task_id: str, payload: dict) -> None:
             f"Blocked: {blocked_reason}" if blocked_reason else "Blocked cleared"
         )
     if "artifact_links" in payload:
-        links = task.get("artifact_links") or []
+        links = task_data.get("artifact_links") or []
         changed_bits.append(f"Artifacts: {len(links)}")
     if "notes" in payload:
         changed_bits.append("Notes updated")
@@ -2422,7 +2422,6 @@ def _build_continue_prompt(
     plan: dict,
     task: dict,
     work_dir: str | None = None,
-    use_local_repo_context: bool = True,
     auto_continue: bool = False,
     session_id: str = "",
 ) -> str:
@@ -2513,7 +2512,7 @@ def _build_continue_prompt(
         history_lines.append("")
 
     # Git state since last checkpoint
-    git_state = _get_git_state_summary(work_dir) if use_local_repo_context else ""
+    git_state = _get_git_state_summary(work_dir) if work_dir else ""
     git_lines: list[str] = []
     if git_state:
         git_lines.append(git_state)
@@ -2535,7 +2534,7 @@ def _build_continue_prompt(
         task_block.append(f"Notes: {notes}")
     if artifacts:
         task_block.append(f"Artifacts: {', '.join(artifacts)}")
-    if use_local_repo_context and work_dir:
+    if work_dir:
         task_block.append(f"Project directory: {work_dir}")
     depends_on = task.get("depends_on") or []
     if depends_on:
@@ -2611,7 +2610,7 @@ def _build_continue_prompt(
         "- Before writing code, briefly say what this task involves and which files you expect to touch.",
         (
             "- Read existing files relevant to this task to understand the current state before making changes."
-            if use_local_repo_context
+            if work_dir
             else "- Start from the plan and task context first. Do not inspect the local working directory unless the task clearly requires repo-specific changes."
         ),
         "- If this task is blocked, do not automatically move to the next task unless the plan clearly supports parallel or out-of-order work.",
@@ -2670,14 +2669,12 @@ def _build_parallel_prompt(
     task: dict,
     total_agents: int,
     work_dir: str | None = None,
-    use_local_repo_context: bool = True,
 ) -> str:
     """Build a prompt for an unattended parallel agent working on a single task."""
     base_prompt = _build_continue_prompt(
         plan,
         task,
         work_dir=work_dir,
-        use_local_repo_context=use_local_repo_context,
         auto_continue=False,
     )
     resolved_plan_id = _clean(plan.get("id")) or "<plan-id>"
@@ -2739,7 +2736,6 @@ def _build_visible_parallel_prompt(
     task: dict,
     total_agents: int,
     work_dir: str | None = None,
-    use_local_repo_context: bool = True,
 ) -> str:
     """Build a compact prompt for visible terminal sessions."""
     task_id = _clean(task.get("id")) or "<task-id>"
@@ -2757,7 +2753,7 @@ def _build_visible_parallel_prompt(
         f"Status: {task_status}",
         f"Description: {task_description}",
     ]
-    if use_local_repo_context and work_dir:
+    if work_dir:
         parts.append(f"Project directory: {work_dir}")
     if related_files:
         parts.append(f"Related files: {', '.join(related_files[:8])}")
@@ -2781,9 +2777,9 @@ def _build_visible_parallel_prompt(
             "- The launcher already marked this task in progress. Do not run `keshro task start`.",
             "- Create a checkpoint commit before editing.",
             (
-                "- Start from the plan and task context first. Do not inspect the local working directory unless the task clearly requires repo-specific changes."
-                if not use_local_repo_context
-                else "- Read local files when they are relevant to the task before making changes."
+                "- Read local files when they are relevant to the task before making changes."
+                if work_dir
+                else "- Start from the plan and task context first. Do not inspect the local working directory unless the task clearly requires repo-specific changes."
             ),
             "- Keep terminal output minimal. Do not print command output, file listings, diffs, or long explanations unless needed for a blocker or verification.",
             "- Use the active Keshro context already selected in this repo.",
@@ -3618,7 +3614,6 @@ async def _launch_single_agent(
     plan: dict,
     plan_id: str,
     work_dir: str,
-    use_local_repo_context: bool,
     total_agents: int,
     semaphore: asyncio.Semaphore,
     api_client: httpx.AsyncClient,
@@ -3626,6 +3621,7 @@ async def _launch_single_agent(
     agent: str = "auto",
     visible: bool = False,
     launch_index: int = 0,
+    use_local_repo_context: bool = True,
 ) -> AgentResult:
     global _active_agent_procs, _active_terminal_titles, _active_temp_files, _active_terminal_pid_files
     task_id = _clean(task.get("id")) or "unknown"
@@ -3941,7 +3937,6 @@ async def _launch_single_agent(
                     task,
                     total_agents,
                     work_dir=work_dir if use_local_repo_context else None,
-                    use_local_repo_context=use_local_repo_context,
                 )
                 if visible
                 else _build_parallel_prompt(
@@ -3949,7 +3944,6 @@ async def _launch_single_agent(
                     task,
                     total_agents,
                     work_dir=work_dir if use_local_repo_context else None,
-                    use_local_repo_context=use_local_repo_context,
                 )
             )
             if live_retry_note:
@@ -4663,7 +4657,7 @@ async def _run_parallel(
 
     resolved_plan_id = _require_plan_context(plan_id)
     resolved_dir, use_local_repo_context = _resolve_continue_work_dir(
-        resolved_plan_id, work_dir
+        resolved_plan_id, work_dir, allow_prompt=True
     )
     exec_dir = resolved_dir or os.getcwd()
 
@@ -5253,7 +5247,7 @@ def _continue_with_claude(
             "Execution context or migration ID required. Pass --plan-id <id> or save one with `keshro config set --plan-id <id>`."
         )
     work_dir, use_local_repo_context = _resolve_continue_work_dir(
-        resolved_plan_id, work_dir
+        resolved_plan_id, work_dir, allow_prompt=False
     )
     plan = _get_plan_or_exit(resolved_plan_id)
 
@@ -5306,7 +5300,6 @@ def _continue_with_claude(
         plan,
         task,
         work_dir=work_dir,
-        use_local_repo_context=use_local_repo_context,
         auto_continue=auto_continue,
         session_id=session_id,
     )
@@ -5343,7 +5336,6 @@ def _continue_with_claude(
                 plan,
                 task,
                 work_dir=work_dir,
-                use_local_repo_context=use_local_repo_context,
                 session_id=session_id,
             )
         )
@@ -5541,7 +5533,7 @@ def _should_use_local_repo_context(
 
 
 def _resolve_continue_work_dir(
-    plan_id: str | None, work_dir: str | None = None
+    plan_id: str | None, work_dir: str | None = None, *, allow_prompt: bool = False
 ) -> tuple[str | None, bool]:
     explicit_work_dir = _clean(work_dir)
     if explicit_work_dir:
@@ -5567,7 +5559,7 @@ def _resolve_continue_work_dir(
     if _clean(linked_plan_id) and _clean(linked_plan_id) == _clean(plan_id):
         return resolved_repo_root, True
 
-    if _state.json or not _stdout_is_tty():
+    if not allow_prompt or _state.json or not _stdout_is_tty():
         return None, False
 
     try:
