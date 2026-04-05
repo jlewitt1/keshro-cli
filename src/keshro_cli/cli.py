@@ -2187,7 +2187,6 @@ def _build_continue_brief(
         analysis.get("unknowns") if isinstance(analysis.get("unknowns"), list) else []
     )
 
-    session_suffix = f' --reason "session:{session_id}"' if session_id else ""
     lines = [
         f"Task: {task_title}",
         f"Description: {task_description or 'No description provided.'}",
@@ -2430,7 +2429,6 @@ def _build_continue_prompt(
     )
     task_id = _clean(task.get("id")) or "<task-id>"
     task_title = _clean(task.get("title")) or "Untitled task"
-    session_suffix = f' --reason "session:{session_id}"' if session_id else ""
     task_description = _clean(task.get("description")) or "No description provided."
     task_status = _clean(task.get("status") or "todo")
     blocked_reason = _clean(task.get("blocked_reason"))
