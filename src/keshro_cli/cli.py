@@ -3522,6 +3522,13 @@ async def _launch_single_agent(
                     )
                 if not created:
                     blocked_reason = f"Failed to create worktree for Codex: {err_msg}"
+                    await _mark_task_status_async(
+                        api_client,
+                        plan_id,
+                        task_id,
+                        "blocked",
+                        blocked_reason=blocked_reason,
+                    )
                     return AgentResult(
                         task_id=task_id,
                         task_title=task_title,
@@ -3533,6 +3540,13 @@ async def _launch_single_agent(
                     )
             except Exception as exc:
                 blocked_reason = f"Failed to create worktree for Codex: {exc}"
+                await _mark_task_status_async(
+                    api_client,
+                    plan_id,
+                    task_id,
+                    "blocked",
+                    blocked_reason=blocked_reason,
+                )
                 return AgentResult(
                     task_id=task_id,
                     task_title=task_title,
@@ -3634,8 +3648,6 @@ async def _launch_single_agent(
             stream: asyncio.StreamReader | None,
             latest_lines: list[str],
             chunks: list[str],
-            *,
-            emit_live: bool = False,
         ) -> None:
             if stream is None:
                 return
@@ -3649,8 +3661,6 @@ async def _launch_single_agent(
                 if cleaned:
                     latest_lines.append(cleaned)
                     del latest_lines[:-20]
-                    if emit_live:
-                        print(f"  [{task_title}] {cleaned}")
 
         while True:
             prompt = (
@@ -3996,18 +4006,12 @@ async def _launch_single_agent(
                     readers = [
                         asyncio.create_task(
                             _consume_stream(
-                                proc.stdout,
-                                latest_stdout_lines,
-                                stdout_chunks,
-                                emit_live=not visible,
+                                proc.stdout, latest_stdout_lines, stdout_chunks
                             )
                         ),
                         asyncio.create_task(
                             _consume_stream(
-                                proc.stderr,
-                                latest_stderr_lines,
-                                stderr_chunks,
-                                emit_live=not visible,
+                                proc.stderr, latest_stderr_lines, stderr_chunks
                             )
                         ),
                     ]
@@ -4542,9 +4546,11 @@ async def _run_parallel(
                 _start_time = _poll_time.monotonic()
                 _last_heartbeat = 0  # seconds since last heartbeat message
                 _seen_sessions: dict[str, tuple] = {}
+                _POLL_INTERVAL_SECONDS = 3
+                _HEARTBEAT_INTERVAL_SECONDS = 10
                 try:
                     while not _poller_done:
-                        await asyncio.sleep(5)
+                        await asyncio.sleep(_POLL_INTERVAL_SECONDS)
                         if _poller_done:
                             break
                         elapsed = _poll_time.monotonic() - _start_time
@@ -4557,7 +4563,7 @@ async def _run_parallel(
                                 )
                             if not resp.is_success:
                                 # Heartbeat even if poll fails
-                                if elapsed - _last_heartbeat >= 30:
+                                if elapsed - _last_heartbeat >= _HEARTBEAT_INTERVAL_SECONDS:
                                     mins = int(elapsed // 60)
                                     secs = int(elapsed % 60)
                                     time_str = (
@@ -4647,7 +4653,7 @@ async def _run_parallel(
                                     )
                                     _seen_notes[sid] = len(note_lines)
                             # Heartbeat after notes — only if no new notes appeared this cycle
-                            if elapsed - _last_heartbeat >= 30:
+                            if elapsed - _last_heartbeat >= _HEARTBEAT_INTERVAL_SECONDS:
                                 mins = int(elapsed // 60)
                                 secs = int(elapsed % 60)
                                 time_str = (
@@ -6797,7 +6803,7 @@ def _config_show():
             print(f"{DIM}Current repo project:{RESET} {YELLOW}{repo_plan}{RESET}")
             if repo_plan_url:
                 print(f"{DIM}Project URL:{RESET} {CYAN}{repo_plan_url}{RESET}")
-    if default_plan and plan_id != repo_plan_id and not repo_plan:
+    if default_plan and plan_id != repo_plan_id:
         app_url = _app_url_from_api_url(payload["api_url"])
         default_migration_id = payload.get("default_context_migration_id") or ""
         if default_migration_id:
@@ -6860,6 +6866,9 @@ def _config_set(
     """Set default workspace context."""
     updates: dict = {}
     linked_repo = False
+    context_changed = False
+    resolved_plan_id: str | None = None
+    resolved_plan_title: str | None = None
     if work_dir is not None:
         updates["default_work_dir"] = (
             str(Path(work_dir).resolve()) if work_dir else None
@@ -6876,10 +6885,12 @@ def _config_set(
     if personal:
         updates["default_org_id"] = None
         updates["default_org_name"] = None
+        context_changed = True
     elif org_id is not None or org is not None:
         resolved_id, resolved_name = _resolve_org_context(org_id, org)
         updates["default_org_id"] = resolved_id
         updates["default_org_name"] = resolved_name
+        context_changed = True
     if clear_plan:
         updates["default_plan_id"] = None
         updates["default_plan_title"] = None
@@ -6890,13 +6901,22 @@ def _config_set(
         )
         updates["default_plan_id"] = resolved_plan_id
         updates["default_plan_title"] = resolved_plan_title
-    auth = update_auth(updates)
-    if not clear_plan and plan_id is not None:
-        linked_repo = _link_current_repo_to_plan(
-            auth.get("default_plan_id") or "",
-            plan_title=auth.get("default_plan_title"),
-            work_dir=auth.get("default_work_dir"),
+        effective_work_dir = (
+            str(Path(work_dir).resolve())
+            if work_dir
+            else str(Path.cwd())
         )
+        if _discover_repo_root(effective_work_dir) is not None:
+            linked_repo = _link_current_repo_to_plan(
+            resolved_plan_id or "",
+            plan_title=resolved_plan_title,
+            work_dir=effective_work_dir,
+        )
+            if not linked_repo:
+                raise SystemExit(
+                    "Failed to update the current repo link to the requested execution context. No mismatch was saved."
+                )
+    auth = update_auth(updates)
     payload = {
         "api_url": auth.get("api_url") or DEFAULT_API_URL,
         "default_agent": _clean(auth.get("default_agent")).lower() or "auto",
@@ -6908,8 +6928,9 @@ def _config_set(
     if _state.json:
         print_output(payload, True)
         return
-    org_label = auth.get("default_org_name") or auth.get("default_org_id") or "personal"
-    print(f"Saved default context: {org_label}")
+    if context_changed:
+        org_label = auth.get("default_org_name") or auth.get("default_org_id") or "personal"
+        print(f"Saved default context: {org_label}")
     if api_url is not None:
         print(f"Saved API URL: {auth.get('api_url') or DEFAULT_API_URL}")
     if agent is not None:
