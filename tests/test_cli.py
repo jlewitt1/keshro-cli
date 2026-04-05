@@ -1158,6 +1158,7 @@ def test_plan_generate_accepts_non_migration_requests(fake_client, capsys, monke
     monkeypatch.setattr(
         "keshro_cli.cli._detect_migration_intent", lambda _description: None
     )
+    monkeypatch.setattr("keshro_cli.cli.update_auth", lambda payload: payload)
 
     original_post = fake_client.post
 
@@ -3733,6 +3734,7 @@ def test_require_plan_context_can_resolve_repo_link(monkeypatch):
 
 
 def test_current_plan_id_prefers_repo_resolution_before_cached_default(monkeypatch):
+    monkeypatch.delenv("KESHRO_ACTIVE_PLAN_ID", raising=False)
     monkeypatch.setattr(
         "keshro_cli.cli.load_auth",
         lambda: {
@@ -4373,6 +4375,35 @@ def test_task_start_human_output_is_compact(fake_client, capsys):
     assert "Updated task" in out
     assert "[in_progress]." in out
     assert "Notes updated" in out
+    assert "Plan ID:" not in out
+    assert "Task ID:" not in out
+
+
+def test_task_reopen_sets_todo_and_clears_blocker(fake_client, capsys):
+    cli.main(
+        [
+            "--json",
+            "task",
+            "reopen",
+            "plan-123",
+            "task-456",
+            "--notes",
+            "Validation failed; reopening for follow-up",
+        ]
+    )
+    out = json.loads(capsys.readouterr().out)
+    assert out["path"] == "/v1/plans/plan-123/tasks/task-456"
+    assert out["payload"]["status"] == "todo"
+    assert out["payload"]["blocked_reason"] == ""
+    assert "Validation failed; reopening for follow-up" in out["payload"]["notes"]
+
+
+def test_task_reopen_human_output_is_compact(fake_client, capsys):
+    cli.main(["task", "reopen", "plan-123", "task-456"])
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+    assert "Updated task" in out
+    assert "[todo]." in out
+    assert "Blocked cleared" in out
     assert "Plan ID:" not in out
     assert "Task ID:" not in out
 

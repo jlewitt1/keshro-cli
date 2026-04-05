@@ -3630,9 +3630,16 @@ async def _launch_single_agent(
             if collab_active and not visible:
                 session_start(collab_session_id, work_dir)
             elif visible and not collab_active:
-                visible_fallback_reason = ""  # Will try native terminal fallback below
+                if sys.platform != "darwin":
+                    visible_fallback_reason = (
+                        "visible terminal sessions are unavailable on this platform; falling back to headless"
+                    )
         except Exception:
             collab_active = False
+            if visible and sys.platform != "darwin":
+                visible_fallback_reason = (
+                    "visible terminal launch unavailable; falling back to headless"
+                )
 
 
 
@@ -9074,6 +9081,23 @@ def _do_task_unblock(
     )
 
 
+def _do_task_reopen(
+    plan_id: str | None,
+    task_id: str,
+    notes: str | None = None,
+    feedback_reason: str | None = None,
+    status: str = "todo",
+):
+    _do_task_update(
+        plan_id,
+        task_id,
+        status=status,
+        notes=_build_appended_task_notes(plan_id, task_id, notes),
+        blocked_reason="",
+        feedback_reason=feedback_reason,
+    )
+
+
 # Shared option definitions for task commands
 _task_add_options = dict(
     title=typer.Option(..., "--title", "-t", help="Task title."),
@@ -9580,6 +9604,56 @@ def _task_unblock(
         resolved_plan_id = plan_id_or_task_id
         resolved_task_id = task_id
     _do_task_unblock(
+        resolved_plan_id,
+        resolved_task_id,
+        notes=notes,
+        feedback_reason=feedback_reason,
+        status=status,
+    )
+
+
+@task_app.command("reopen")
+def _task_reopen(
+    plan_id_or_task_id: Annotated[
+        str, typer.Argument(help="Plan ID, or Task ID if a default plan is saved.")
+    ],
+    task_id: Annotated[
+        Optional[str],
+        typer.Argument(help="Task ID. Optional when a default plan is saved."),
+    ] = None,
+    plan_id_option: Annotated[
+        Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
+    ] = None,
+    notes: Annotated[
+        Optional[str],
+        typer.Option(
+            "--notes", "-n", help="Short note about why the task is being reopened."
+        ),
+    ] = None,
+    status: Annotated[
+        str,
+        typer.Option(
+            "--status", "-s", help="Status to use after reopening (defaults to todo)."
+        ),
+    ] = "todo",
+    feedback_reason: Annotated[
+        Optional[str],
+        typer.Option("--reason", help="Why the task is being reopened now."),
+    ] = None,
+):
+    """Move a task out of completed state so it can be worked again."""
+    resolved_plan_id: str | None
+    resolved_task_id: str
+    if plan_id_option:
+        resolved_plan_id = plan_id_option
+        resolved_task_id = task_id or plan_id_or_task_id
+    elif task_id is None:
+        resolved_plan_id = _require_plan_context(None)
+        resolved_task_id = plan_id_or_task_id
+    else:
+        resolved_plan_id = plan_id_or_task_id
+        resolved_task_id = task_id
+    _do_task_reopen(
         resolved_plan_id,
         resolved_task_id,
         notes=notes,
