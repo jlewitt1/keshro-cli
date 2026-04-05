@@ -3770,7 +3770,8 @@ async def _launch_single_agent(
             _clear_headless_spinner_line()
             print(f"  {DIM}[{task_title}]{RESET} {message}")
 
-        # Report start with session ID via agent API (also sets status to in_progress)
+        # Report start with session ID via agent API and explicitly mark the task
+        # in progress so the plan UI reflects the active run immediately.
         try:
             await api_client.post(
                 f"/v1/agent/plans/{plan_id}/task-event",
@@ -3784,16 +3785,23 @@ async def _launch_single_agent(
                 },
             )
         except Exception:
-            await _mark_task_status_async(api_client, plan_id, task_id, "in_progress")
+            pass
+        await _mark_task_status_async(api_client, plan_id, task_id, "in_progress")
         if not visible and headless_spinner_enabled:
             headless_spinner_active = True
             headless_spinner_task = asyncio.create_task(_headless_spinner_loop())
 
         async def _heartbeat_loop() -> None:
             nonlocal last_headless_progress, last_headless_changed_files, last_headless_activity_at
+            in_progress_synced = False
             try:
                 while heartbeat_active:
                     try:
+                        if not in_progress_synced:
+                            await _mark_task_status_async(
+                                api_client, plan_id, task_id, "in_progress"
+                            )
+                            in_progress_synced = True
                         changed_files = await _git_changed_files(exec_dir)
                         if changed_files:
                             current_phase = "editing"
@@ -4956,13 +4964,15 @@ async def _run_parallel(
             agent_tasks = [asyncio.create_task(c) for c in agent_coros]
             total_agents = len(agent_tasks)
             _cancelled = False
+            _cancel_requested = False
             _sigint_count = 0
 
             def _handle_sigint():
-                nonlocal _sigint_count, _cancelled
+                nonlocal _sigint_count, _cancelled, _cancel_requested
                 _sigint_count += 1
                 remaining = total_agents - completed_count
                 if _sigint_count == 1:
+                    _cancel_requested = True
                     running_label = "agent" if remaining == 1 else "agents"
                     print(f"\n  {YELLOW}⚠ {remaining} {running_label} still running.{RESET}")
                     print(f"  {YELLOW}Press Ctrl+C again to force stop, or wait for agents to finish.{RESET}")
@@ -4985,7 +4995,9 @@ async def _run_parallel(
                         completed_count += 1
                         if _cancelled:
                             break
-                        if r.exit_code == 0:
+                        if r.exit_code == 0 and _cancel_requested:
+                            status = f"{YELLOW}completed before stop{RESET}"
+                        elif r.exit_code == 0:
                             status = f"{GREEN}done{RESET}"
                         elif r.failure_kind in {"launch", "usage_limit"}:
                             status = f"{RED}failed to launch{RESET}"
@@ -7886,6 +7898,7 @@ def _print_plan_status(plan: dict) -> None:
     path_label = f"{source} → {target}" if source and target else ""
     steps = sorted(plan.get("plan_steps") or [], key=lambda s: s.get("order", 0))
     events = plan.get("task_feedback_events") or []
+    agent_sessions = plan.get("agent_sessions") or []
 
     done = [s for s in steps if _clean(s.get("status")).lower() == "completed"]
     in_progress = [s for s in steps if _clean(s.get("status")).lower() == "in_progress"]
@@ -7925,22 +7938,78 @@ def _print_plan_status(plan: dict) -> None:
         ):
             task_latest_event[tid] = event
 
+    task_latest_session: dict[str, dict] = {}
+    for session in agent_sessions:
+        tid = _clean(session.get("task_id"))
+        if not tid:
+            continue
+        existing = task_latest_session.get(tid)
+        session_time = (
+            _clean(session.get("last_heartbeat_at"))
+            or _clean(session.get("updated_at"))
+            or _clean(session.get("created_at"))
+        )
+        existing_time = (
+            _clean((existing or {}).get("last_heartbeat_at"))
+            or _clean((existing or {}).get("updated_at"))
+            or _clean((existing or {}).get("created_at"))
+        )
+        if not existing or session_time > existing_time:
+            task_latest_session[tid] = session
+
     now = datetime.now(timezone.utc)
     detail_width = max(
         40, shutil.get_terminal_size(fallback=(100, 24)).columns - 8
     )
 
     for step in steps:
+        step_id = _clean(step.get("id"))
+        latest = task_latest_event.get(step_id)
+        latest_session = task_latest_session.get(step_id)
+        session_status = _clean((latest_session or {}).get("status")).lower()
         status = _clean(step.get("status") or "todo").lower()
+        if session_status in {
+            "running",
+            "starting",
+            "in_progress",
+            "active",
+        }:
+            status = "in_progress"
         icon = STATUS_ICON.get(status, "?")
         order = step.get("order", 0)
         step_title = _clean(step.get("title")) or "Untitled"
-        step_id = step.get("id") or ""
 
         # Build right-side info
         info_parts: list[str] = []
-        latest = task_latest_event.get(step_id)
-        if latest:
+        if latest_session:
+            source_label = _clean(latest_session.get("source")) or "agent"
+            if source_label:
+                info_parts.append(source_label)
+            session_time = (
+                _clean(latest_session.get("last_heartbeat_at"))
+                or _clean(latest_session.get("updated_at"))
+                or _clean(latest_session.get("created_at"))
+            )
+            if session_time:
+                try:
+                    event_time = datetime.fromisoformat(
+                        session_time.replace("Z", "+00:00")
+                    )
+                    delta = now - event_time
+                    if delta.days > 0:
+                        info_parts.append(f"{delta.days}d ago")
+                    elif delta.seconds > 3600:
+                        info_parts.append(f"{delta.seconds // 3600}h ago")
+                    elif delta.seconds > 60:
+                        info_parts.append(f"{delta.seconds // 60}m ago")
+                    else:
+                        info_parts.append("just now")
+                except Exception:
+                    pass
+            phase = _clean(latest_session.get("current_phase"))
+            if phase and phase not in {"running", "starting"}:
+                info_parts.append(phase)
+        elif latest:
             source_label = latest.get("source") or ""
             if source_label:
                 info_parts.append(source_label)
@@ -7960,11 +8029,18 @@ def _print_plan_status(plan: dict) -> None:
                 except Exception:
                     pass
 
-        if status == "in_progress" and latest:
-            created = latest.get("created_at") or ""
-            if created:
+        if status == "in_progress":
+            active_time = (
+                _clean((latest_session or {}).get("last_heartbeat_at"))
+                or _clean((latest_session or {}).get("updated_at"))
+                or _clean((latest_session or {}).get("created_at"))
+                or _clean((latest or {}).get("created_at"))
+            )
+            if active_time:
                 try:
-                    event_time = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                    event_time = datetime.fromisoformat(
+                        active_time.replace("Z", "+00:00")
+                    )
                     elapsed = now - event_time
                     if elapsed.seconds > 60:
                         info_parts.append(f"({elapsed.seconds // 60}m)")
@@ -7981,6 +8057,14 @@ def _print_plan_status(plan: dict) -> None:
             details = " · ".join(part for part in info_parts if part)
             for line in _format_full_value_lines(details, width=detail_width):
                 print(f"    {DIM}{line}{RESET}")
+        if status == "in_progress":
+            notes = _clean(step.get("notes"))
+            if notes:
+                note_lines = [line.strip() for line in notes.splitlines() if line.strip()]
+                if note_lines:
+                    latest_note = note_lines[-1]
+                    for line in _format_full_value_lines(latest_note, width=detail_width):
+                        print(f"    {DIM}{line}{RESET}")
 
     # Footer
     print()
@@ -10415,6 +10499,9 @@ def main(argv: list[str] | None = None):
         try:
             app(argv, standalone_mode=False)
             return 0
+        except click.ClickException as exc:
+            exc.show(file=sys.stderr)
+            return exc.exit_code
         except SystemExit as exc:
             if isinstance(exc.code, str):
                 print(f"{RED}{exc.code}{RESET}", file=sys.stderr)
