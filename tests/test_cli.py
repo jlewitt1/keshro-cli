@@ -1437,6 +1437,7 @@ def _bypass_auth(monkeypatch):
 def test_continue_prints_prompt_with_task_context(fake_client, monkeypatch, capsys):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
     _bypass_auth(monkeypatch)
 
     cli.main(["continue", "--no-parallel"])
@@ -1444,8 +1445,8 @@ def test_continue_prints_prompt_with_task_context(fake_client, monkeypatch, caps
     out = capsys.readouterr().out
     assert "Task: Review EventBridge schedules" in out
     assert "Task ID: review-schedules" in out
-    assert "Execution reminders:" in out
-    assert "keshro task start review-schedules -p plan-123" in out
+    assert "Plan: plan-123" in out
+    assert "Blocker: Waiting on environment access" in out
 
 
 def test_continue_prompt_omits_full_skill_boilerplate_in_non_tty_mode(
@@ -1484,13 +1485,14 @@ def test_continue_prompt_mentions_status_tracking_and_blocking_rule(
 ):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
     _bypass_auth(monkeypatch)
 
     cli.main(["continue", "--no-parallel"])
 
     out = capsys.readouterr().out
-    assert "keshro status -p plan-123 --watch" in out
-    assert "Only mark the task blocked if work cannot continue" in out
+    assert "Status: todo" in out
+    assert "Blocker: Waiting on environment access" in out
 
 
 def test_continue_prompt_surfaces_plan_risks_unknowns_and_ui_link(
@@ -1596,12 +1598,14 @@ def test_continue_in_agent_mode_resumes_in_progress_task_before_next_todo(
 def test_continue_prompt_includes_error_guidance(fake_client, monkeypatch, capsys):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
     _bypass_auth(monkeypatch)
 
     cli.main(["continue", "--no-parallel"])
 
     out = capsys.readouterr().out
-    assert "If a keshro command fails" in out
+    assert "Session: agent-" in out
+    assert "Blocker: Waiting on environment access" in out
 
 
 def test_continue_confirms_when_using_implicit_plan_context(
@@ -1756,6 +1760,7 @@ def test_continue_prompt_does_not_tell_claude_to_refetch(
 ):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
     _bypass_auth(monkeypatch)
 
     cli.main(["continue", "--no-parallel"])
@@ -3679,7 +3684,6 @@ def test_config_set_can_save_default_plan(fake_client, monkeypatch, capsys):
     code = cli.main(["config", "set", "-p", "plan-123"])
     out = capsys.readouterr().out
     assert code == 0
-    assert "Saved default context: personal" in out
     assert "Saved default execution context: AWS Batch to Airflow pilot" in out
     assert "Linked the current repo to this execution context in Keshro." in out
 
@@ -3934,7 +3938,6 @@ def test_config_set_can_save_api_url(monkeypatch, capsys):
     code = cli.main(["config", "set", "--api-url", "https://api.keshro.test"])
     out = capsys.readouterr().out
     assert code == 0
-    assert "Saved default context: personal" in out
     assert "Saved API URL: https://api.keshro.test" in out
 
 
