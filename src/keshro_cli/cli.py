@@ -53,6 +53,15 @@ class _State:
 _state = _State()
 
 
+def _enable_line_buffered_output() -> None:
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            if hasattr(_stream, "reconfigure"):
+                _stream.reconfigure(line_buffering=True)
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Typer apps
 # ---------------------------------------------------------------------------
@@ -4797,7 +4806,6 @@ async def _run_parallel(
                     plan,
                     resolved_plan_id,
                     exec_dir,
-                    use_local_repo_context,
                     len(actionable),
                     semaphore,
                     api_client,
@@ -4805,6 +4813,7 @@ async def _run_parallel(
                     agent=agent,
                     visible=visible,
                     launch_index=i,
+                    use_local_repo_context=use_local_repo_context,
                 )
                 for i, task in enumerate(actionable)
             ]
@@ -5527,8 +5536,14 @@ def _should_use_local_repo_context(
 ) -> bool:
     if _clean(work_dir):
         return True
-    cwd = str(Path.cwd().resolve())
-    linked_plan_id, _ = _resolve_repo_linked_plan(cwd)
+    saved_work_dir = _clean(load_auth().get("default_work_dir"))
+    if not saved_work_dir:
+        return False
+    resolved = str(Path(saved_work_dir).resolve())
+    saved_repo_root = _discover_repo_root(resolved)
+    if saved_repo_root is None:
+        return False
+    linked_plan_id, _ = _resolve_repo_linked_plan(str(saved_repo_root.resolve()))
     return bool(_clean(linked_plan_id) and _clean(linked_plan_id) == _clean(plan_id))
 
 
@@ -5556,16 +5571,23 @@ def _resolve_continue_work_dir(
 
     resolved_repo_root = str(repo_root.resolve())
     linked_plan_id, _ = _resolve_repo_linked_plan(resolved_repo_root)
-    if _clean(linked_plan_id) and _clean(linked_plan_id) == _clean(plan_id):
-        return resolved_repo_root, True
-
+    repo_link_matches = bool(
+        _clean(linked_plan_id) and _clean(linked_plan_id) == _clean(plan_id)
+    )
     if not allow_prompt or _state.json or not _stdout_is_tty():
         return None, False
 
     try:
-        use_current_repo = typer.confirm(
-            "Use the current working directory as execution context for this plan?\n"
+        prompt_lines = [
+            "Use the current working directory as execution context for this plan?",
             f"{DIM}Current directory:{RESET} {resolved_repo_root}",
+        ]
+        if repo_link_matches:
+            prompt_lines.append(
+                f"{DIM}Keshro found a repo link to this plan, but it may be stale.{RESET}"
+            )
+        use_current_repo = typer.confirm(
+            "\n".join(prompt_lines),
             default=False,
         )
     except click.Abort:
@@ -10698,6 +10720,7 @@ def _print_request_error(exc: httpx.RequestError) -> None:
 
 
 def main(argv: list[str] | None = None):
+    _enable_line_buffered_output()
     argv = sys.argv[1:] if argv is None else argv
     if not argv:
         print(__version__)

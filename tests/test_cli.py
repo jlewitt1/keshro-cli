@@ -3820,6 +3820,66 @@ def test_resolve_continue_work_dir_ignores_saved_dir_for_other_plan(
     assert use_local is False
 
 
+def test_resolve_continue_work_dir_prompts_before_using_linked_cwd_repo(
+    monkeypatch, tmp_path
+):
+    cwd_dir = tmp_path / "cwd-repo"
+    cwd_dir.mkdir()
+
+    monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: {})
+    monkeypatch.setattr(
+        "keshro_cli.cli._discover_repo_root",
+        lambda work_dir=None: Path(work_dir) if work_dir else Path(cwd_dir),
+    )
+    monkeypatch.setattr(
+        "keshro_cli.cli._resolve_repo_linked_plan",
+        lambda work_dir=None: ("plan-123", "Matching plan"),
+    )
+    monkeypatch.setattr("keshro_cli.cli._stdout_is_tty", lambda: True)
+    monkeypatch.setattr("pathlib.Path.cwd", lambda: cwd_dir)
+
+    prompts: list[str] = []
+
+    def _fake_confirm(message, default=False):
+        prompts.append(message)
+        return True
+
+    monkeypatch.setattr("keshro_cli.cli.typer.confirm", _fake_confirm)
+
+    resolved, use_local = cli._resolve_continue_work_dir(
+        "plan-123", allow_prompt=True
+    )
+
+    assert resolved == str(cwd_dir.resolve())
+    assert use_local is True
+    assert prompts
+    assert "repo link to this plan" in prompts[0]
+
+
+def test_resolve_continue_work_dir_does_not_auto_use_linked_cwd_repo_without_prompt(
+    monkeypatch, tmp_path
+):
+    cwd_dir = tmp_path / "cwd-repo"
+    cwd_dir.mkdir()
+
+    monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: {})
+    monkeypatch.setattr(
+        "keshro_cli.cli._discover_repo_root",
+        lambda work_dir=None: Path(work_dir) if work_dir else Path(cwd_dir),
+    )
+    monkeypatch.setattr(
+        "keshro_cli.cli._resolve_repo_linked_plan",
+        lambda work_dir=None: ("plan-123", "Matching plan"),
+    )
+    monkeypatch.setattr("keshro_cli.cli._stdout_is_tty", lambda: False)
+    monkeypatch.setattr("pathlib.Path.cwd", lambda: cwd_dir)
+
+    resolved, use_local = cli._resolve_continue_work_dir("plan-123")
+
+    assert resolved is None
+    assert use_local is False
+
+
 def test_current_plan_id_resolves_explicit_migration_id(monkeypatch):
     monkeypatch.setattr(
         "keshro_cli.cli._resolve_plan_or_migration_context",
