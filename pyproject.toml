@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "keshro"
-version = "0.1.26"
+version = "0.1.27"
 description = "High-stakes engineering project execution for AI coding agents"
 readme = "README.md"
 license = {text = "MIT"}
