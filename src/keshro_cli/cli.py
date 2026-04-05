@@ -5551,7 +5551,11 @@ def _resolve_continue_work_dir(
     saved_work_dir = _clean(load_auth().get("default_work_dir"))
     if saved_work_dir:
         resolved = str(Path(saved_work_dir).resolve())
-        return resolved, True
+        saved_repo_root = _discover_repo_root(resolved)
+        if saved_repo_root is not None:
+            linked_plan_id, _ = _resolve_repo_linked_plan(str(saved_repo_root.resolve()))
+            if _clean(linked_plan_id) and _clean(linked_plan_id) == _clean(plan_id):
+                return str(saved_repo_root.resolve()), True
 
     cwd = str(Path.cwd().resolve())
     repo_root = _discover_repo_root(cwd)
