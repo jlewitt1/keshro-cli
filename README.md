@@ -48,6 +48,8 @@ keshro continue
 
 By default, `keshro continue` runs the next ready wave in parallel when the environment supports it. Each launched agent gets its own session ID and heartbeats live status back to Keshro, including touched files, progress messages, recent errors, and mid-task conflict detection. Use `--no-parallel` only when you explicitly want one task at a time.
 
+If a task was marked done too early, reopen it with `keshro task reopen <task-id> -p <plan-id>`. That clears any stale blocker and moves it back to `todo` by default, or you can pass `--status in_progress` to resume work immediately.
+
 ## Monitor
 
 ```bash

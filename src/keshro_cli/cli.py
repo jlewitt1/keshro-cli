@@ -178,6 +178,15 @@ def _default_agent_preference() -> str:
     return value if value in {"auto", "claude", "codex"} else "auto"
 
 
+def _current_coding_agent_preference() -> str | None:
+    agent_name = (_coding_agent_name() or "").lower()
+    if "claude" in agent_name:
+        return "claude"
+    if "codex" in agent_name:
+        return "codex"
+    return None
+
+
 def _parse_timestamp(value: str | None) -> datetime | None:
     raw = _clean(value)
     if not raw:
@@ -386,6 +395,9 @@ def _current_plan_id(
     if explicit:
         resolved_id, _ = _resolve_plan_or_migration_context(explicit)
         return resolved_id
+    env_plan_id = _clean(os.environ.get("KESHRO_ACTIVE_PLAN_ID"))
+    if env_plan_id:
+        return env_plan_id
     repo_plan_id, repo_plan_title = _resolve_repo_linked_plan(work_dir)
     if repo_plan_id:
         update_auth(
@@ -872,6 +884,15 @@ def _truncate_text(value: str, limit: int = 110) -> str:
     return text[: limit - 1].rstrip() + "…"
 
 
+_TASK_NOTE_TIMESTAMP_PREFIX_RE = re.compile(
+    r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\]\s*"
+)
+
+
+def _format_task_note_for_terminal(value: str) -> str:
+    return _TASK_NOTE_TIMESTAMP_PREFIX_RE.sub("", _clean(value))
+
+
 def _extract_source_titles(source: dict, limit: int = 3) -> list[str]:
     titles: list[str] = []
     for item in source.get("sources") or []:
@@ -1003,6 +1024,7 @@ def _print_task_update_summary(plan: dict, task_id: str, payload: dict) -> None:
         (step for step in steps if _clean(step.get("id")) == _clean(task_id)),
         None,
     )
+    task_data = task or {}
     if task is None:
         task_title = task_id or "task"
         status = _clean(payload.get("status")) or "updated"
@@ -1012,14 +1034,14 @@ def _print_task_update_summary(plan: dict, task_id: str, payload: dict) -> None:
     print(f"Updated task {task_title} [{status}].")
     changed_bits: list[str] = []
     if "owner" in payload:
-        changed_bits.append(f"Owner: {_clean(task.get('owner')) or 'Unassigned'}")
+        changed_bits.append(f"Owner: {_clean(task_data.get('owner')) or 'Unassigned'}")
     if "blocked_reason" in payload:
-        blocked_reason = _clean(task.get("blocked_reason"))
+        blocked_reason = _clean(task_data.get("blocked_reason"))
         changed_bits.append(
             f"Blocked: {blocked_reason}" if blocked_reason else "Blocked cleared"
         )
     if "artifact_links" in payload:
-        links = task.get("artifact_links") or []
+        links = task_data.get("artifact_links") or []
         changed_bits.append(f"Artifacts: {len(links)}")
     if "notes" in payload:
         changed_bits.append("Notes updated")
@@ -2090,22 +2112,25 @@ The current task and execution context are provided below. Do not re-fetch them 
 Style:
 - Be concise. Do not narrate your thought process — just do the work and report what you did.
 - Before running any keshro command or git checkpoint, print one short sentence explaining why (e.g. "Marking task as in progress."). Then run the command.
+- Do not print internal edit summaries, diff recaps, self-critique, or course-correction commentary. If you revise an approach, just continue with the corrected work.
+- Do not print `sed`, `rg`, or similar command output unless it is directly needed to explain a blocker or verification result.
 
 Treat Keshro as the live execution record. When meaningful task progress happens, write it back while the work is happening rather than waiting until the end.
 
 During execution:
-- run `keshro task start <task-id> -p {resolved_plan_id}` as soon as work begins
+- The launcher already marked this task in progress. Do not run `keshro task start` yourself.
 - IMPORTANT: write progress notes frequently — at minimum after reading code, after each significant change, and before completion. These notes show up live in Keshro.
-  Use: `keshro task note <task-id> -p {resolved_plan_id} -n "..."` for: what you found, what you changed, what you decided, what files you touched
-- use `keshro task artifact <task-id> -p {resolved_plan_id} -l "<url>"` for PRs, commits, dashboards, issues, and runbooks
-- use `keshro task block <task-id> -p {resolved_plan_id} -r "..."` the moment a real blocker appears that prevents further progress on the task
+  Use: `keshro task note <task-id> -n "..."` for: what you found, what you changed, what you decided, what files you touched
+- use `keshro task artifact <task-id> -l "<url>"` for PRs, commits, dashboards, issues, and runbooks
+- use `keshro task block <task-id> -r "..."` the moment a real blocker appears that prevents further progress on the task
 - if an external system is unavailable but you can still continue from local code, checked-in config, or documented context, record that in a note instead of blocking the task
-- use `keshro task unblock <task-id> -p {resolved_plan_id}` when that blocker is cleared
+- use `keshro task unblock <task-id>` when that blocker is cleared
+- Do not run `keshro ... --help` or probe command syntax unless a command has already failed with a usage error.
 
 When a task is done:
 - record a concise completion note. It must include `Acceptance criteria met:` and `Verification:`. Add `Next task should know:` only when it helps the next task.
 - ask for confirmation before running `keshro task done`
-- when marking done, report your session cost if available: `keshro task done <task-id> -p {resolved_plan_id} --cost <usd_amount> --tokens <token_count> --model <model_name>` (check your session stats for cost/token info)
+- when marking done, report your session cost if available: `keshro task done <task-id> --cost <usd_amount> --tokens <token_count> --model <model_name>` (check your session stats for cost/token info)
 - after `keshro task done`, summarize what was accomplished and ask whether to continue to the next task
 - do not automatically start the next task without a clear go-ahead
 
@@ -2120,8 +2145,9 @@ Rules:
 - Keep updates concise, factual, and specific.
 - Do not silently work around blockers or plan drift.
 - Do not assume Keshro is current unless you updated it.
-- If asked how to monitor progress, point to `keshro status -p {resolved_plan_id} --watch` or `keshro status -p {resolved_plan_id} --tui`.
-- If you need more detail on any task, use `keshro task view <task-id> -p {resolved_plan_id}`."""
+- If asked how to monitor progress, point to `keshro status --watch` or `keshro status --tui`.
+- If you need more detail on any task, use `keshro task view <task-id>`.
+- Use the active Keshro context already selected in this repo. Do not try to recover by probing alternate plan IDs."""
 
 
 def _strip_injected_task_lines(text: str | None) -> tuple[str, list[str]]:
@@ -2222,13 +2248,14 @@ def _build_continue_brief(
         [
             "",
             "Execution reminders:",
-            f'- Start work with: `keshro task start {task_id} -p {resolved_plan_id} --reason "session:{session_id}"`',
-            f'- Record concise progress notes with: `keshro task note {task_id} -p {resolved_plan_id} -n "..."`',
+            "- The launcher already marked this task in progress. Do not run `keshro task start` yourself.",
+            f'- Record concise progress notes with: `keshro task note {task_id} -n "..."`',
+            "- Do not run `keshro ... --help` unless a command actually fails with a usage error.",
             "- The current task and execution context are already included below. Do not re-fetch them before you start working.",
             "- Only mark the task blocked if work cannot continue. If local sources let you proceed, note the limitation instead.",
             "- If a keshro command fails with a connection error, retry once after 5 seconds. For any other error, say what happened and keep working unless the failure blocks the task.",
             "- Before `keshro task done`, include `Acceptance criteria met:` and `Verification:` in the completion note.",
-            f"- You can monitor progress with `keshro status -p {resolved_plan_id} --watch` or `keshro status -p {resolved_plan_id} --tui`.",
+            "- You can monitor progress with `keshro status --watch` or `keshro status --tui`.",
         ]
     )
     return "\n".join(lines)
@@ -2485,7 +2512,7 @@ def _build_continue_prompt(
         history_lines.append("")
 
     # Git state since last checkpoint
-    git_state = _get_git_state_summary(work_dir)
+    git_state = _get_git_state_summary(work_dir) if work_dir else ""
     git_lines: list[str] = []
     if git_state:
         git_lines.append(git_state)
@@ -2578,10 +2605,14 @@ def _build_continue_prompt(
     continuation = [
         "",
         "Continue from this task now.",
-        f'- When starting this task, use: `keshro task start {task_id} -p {resolved_plan_id} --reason "session:{session_id}"`',
+        "- This task is already marked in progress by the launcher. Do not run `keshro task start` again.",
         f'- Before starting work, create a git checkpoint so changes can be rolled back if needed: `git add -A && git commit -m "keshro: checkpoint before {task_title}" --allow-empty`',
         "- Before writing code, briefly say what this task involves and which files you expect to touch.",
-        "- Read existing files relevant to this task to understand the current state before making changes.",
+        (
+            "- Read existing files relevant to this task to understand the current state before making changes."
+            if work_dir
+            else "- Start from the plan and task context first. Do not inspect the local working directory unless the task clearly requires repo-specific changes."
+        ),
         "- If this task is blocked, do not automatically move to the next task unless the plan clearly supports parallel or out-of-order work.",
         "- If you continue execution, keep Keshro updated as you work.",
         "- Before marking a task done, verify your changes: run linters, check syntax, or run relevant tests if they exist. Record the validation result in your completion note under `Verification:`.",
@@ -2590,10 +2621,10 @@ def _build_continue_prompt(
     if auto_continue:
         continuation.append(
             "- AUTO-CONTINUE MODE: After completing each task, automatically pull the next task with "
-            f"`keshro task next -p {resolved_plan_id}` and continue working. "
+            "`keshro task next` and continue working. "
             "Still create checkpoints, record notes, and mark tasks done — but do not pause for confirmation between tasks. "
             "If a task fails (tests don't pass, code doesn't compile, validation fails), mark it blocked with "
-            f'`keshro task block <task-id> -p {resolved_plan_id} -r "..."` and stop. '
+            '`keshro task block <task-id> -r "..."` and stop. '
             "Say what failed and why. Do not skip to the next task."
         )
 
@@ -2605,10 +2636,10 @@ def _build_continue_prompt(
                 "1. Say: 'This task can be parallelized. I will split it into sub-tasks that other agents can pick up.'",
                 "2. Analyze the task to identify independent units of work (e.g., separate files, independent components, distinct modules).",
                 "3. For each independent unit, create a sub-task using:",
-                f'   `keshro task plan {resolved_plan_id} --title "<sub-task title>" --description "<what to do>" -o "unassigned"`',
-                f"4. Record a note on this parent task: `keshro task note {task_id} -p {resolved_plan_id} "
+                '   `keshro task plan --title "<sub-task title>" --description "<what to do>" -o "unassigned"`',
+                f"4. Record a note on this parent task: `keshro task note {task_id} "
                 f'-n "Split into N sub-tasks: <list sub-task titles>. Other agents can pick these up with keshro continue."`',
-                f"5. Mark this parent task as completed: `keshro task done {task_id} -p {resolved_plan_id}`",
+                f"5. Mark this parent task as completed: `keshro task done {task_id}`",
                 "6. Then pick up and start working on the first sub-task yourself.",
                 "",
                 "The sub-tasks will appear as new todo items in the plan. Other agents running `keshro continue` will automatically pick them up.",
@@ -2634,11 +2665,17 @@ def _task_title_slug(title: str) -> str:
 
 
 def _build_parallel_prompt(
-    plan: dict, task: dict, total_agents: int, work_dir: str | None = None
+    plan: dict,
+    task: dict,
+    total_agents: int,
+    work_dir: str | None = None,
 ) -> str:
     """Build a prompt for an unattended parallel agent working on a single task."""
     base_prompt = _build_continue_prompt(
-        plan, task, work_dir=work_dir, auto_continue=False
+        plan,
+        task,
+        work_dir=work_dir,
+        auto_continue=False,
     )
     resolved_plan_id = _clean(plan.get("id")) or "<plan-id>"
     task_id = _clean(task.get("id")) or "<task-id>"
@@ -2681,8 +2718,9 @@ def _build_parallel_prompt(
         "- You are responsible for exactly ONE task. Complete it, then exit. Do NOT pull the next task.",
         f"- Create your changes on a branch named `{branch_name}`.",
         "- Do not ask the user for confirmation — execute autonomously.",
-        f"- When done, mark the task complete: `keshro task done {task_id} -p {resolved_plan_id}`",
-        f'- If the task fails, mark it blocked: `keshro task block {task_id} -p {resolved_plan_id} -r "reason"`',
+        f"- When done, mark the task complete: `keshro task done {task_id}`",
+        f'- If the task fails, mark it blocked: `keshro task block {task_id} -r "reason"`',
+        "- Ignore any earlier prompt text that includes a plan id on task commands; use the active Keshro context.",
     ]
     if other_files_lines:
         parallel_parts.append("")
@@ -2691,6 +2729,67 @@ def _build_parallel_prompt(
 
     parallel_context = "\n".join(parallel_parts)
     return base_prompt + parallel_context
+
+
+def _build_visible_parallel_prompt(
+    plan: dict,
+    task: dict,
+    total_agents: int,
+    work_dir: str | None = None,
+) -> str:
+    """Build a compact prompt for visible terminal sessions."""
+    task_id = _clean(task.get("id")) or "<task-id>"
+    task_title = _clean(task.get("title")) or "Untitled task"
+    task_description = _clean(task.get("description")) or "No description provided."
+    task_status = _clean(task.get("status") or "todo")
+    task_notes = _clean(task.get("notes"))
+    related_files = [_clean(path) for path in (task.get("related_files") or []) if _clean(path)]
+    acceptance = [_clean(item) for item in (task.get("acceptance_criteria") or []) if _clean(item)]
+    branch_name = f"keshro/{_task_title_slug(task_title)}"
+
+    parts = [
+        f"Task: {task_title}",
+        f"Task ID: {task_id}",
+        f"Status: {task_status}",
+        f"Description: {task_description}",
+    ]
+    if work_dir:
+        parts.append(f"Project directory: {work_dir}")
+    if related_files:
+        parts.append(f"Related files: {', '.join(related_files[:8])}")
+    if acceptance:
+        parts.append("Acceptance criteria:")
+        for item in acceptance[:5]:
+            parts.append(f"- {item}")
+    if task_notes:
+        note_lines = [line.strip() for line in task_notes.splitlines() if line.strip()]
+        if note_lines:
+            parts.append("Recent notes:")
+            for line in note_lines[-2:]:
+                parts.append(f"- {_truncate_text(line, limit=180)}")
+
+    parts.extend(
+        [
+            "",
+            "Execution rules:",
+            f"- You are one of {total_agents} parallel agents in isolated git worktrees.",
+            f"- Use branch `{branch_name}`.",
+            "- The launcher already marked this task in progress. Do not run `keshro task start`.",
+            "- Create a checkpoint commit before editing.",
+            (
+                "- Read local files when they are relevant to the task before making changes."
+                if work_dir
+                else "- Start from the plan and task context first. Do not inspect the local working directory unless the task clearly requires repo-specific changes."
+            ),
+            "- Keep terminal output minimal. Do not print command output, file listings, diffs, or long explanations unless needed for a blocker or verification.",
+            "- Use the active Keshro context already selected in this repo.",
+            f'- Record progress with `keshro task note {task_id} -n "..."`.',
+            f'- Mark completion with `keshro task done {task_id}`.',
+            f'- If the task cannot continue, mark it blocked with `keshro task block {task_id} -r "reason"`.',
+            "- Complete exactly this task, then exit.",
+        ]
+    )
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -2709,6 +2808,7 @@ class AgentResult:
     cost_usd: float = 0.0
     tokens_used: int = 0
     model: str = ""
+    failure_kind: str = ""
 
 
 def _parse_git_status_changed_files(raw_status: str) -> list[str]:
@@ -2793,6 +2893,29 @@ async def _cleanup_worktree(repo_dir: str, worktree_path: str) -> None:
         pass
 
 
+async def _create_codex_worktree(
+    repo_dir: str,
+    worktree_path: str,
+    branch_name: str,
+    base_rev: str,
+) -> tuple[bool, str]:
+    wt_proc = await asyncio.create_subprocess_exec(
+        "git",
+        "worktree",
+        "add",
+        "-b",
+        branch_name,
+        worktree_path,
+        base_rev,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=repo_dir,
+    )
+    wt_stdout, wt_stderr = await wt_proc.communicate()
+    output = ((wt_stderr or b"") + (wt_stdout or b"")).decode(errors="replace").strip()
+    return wt_proc.returncode == 0, output
+
+
 async def _git_stdout(*args: str, cwd: str) -> str:
     proc = await asyncio.create_subprocess_exec(
         *args,
@@ -2809,21 +2932,92 @@ async def _git_stdout(*args: str, cwd: str) -> str:
 
 
 async def _git_changed_files(cwd: str, max_files: int = 25) -> list[str]:
-    try:
-        status = await _git_stdout(
-            "git",
-            "status",
-            "--porcelain",
-            "--untracked-files=all",
-            cwd=cwd,
-        )
-    except Exception:
-        return []
-    return _parse_git_status_changed_files(status)[:max_files]
+    files: list[str] = []
+    seen: set[str] = set()
+
+    async def _collect(*args: str) -> None:
+        try:
+            output = await _git_stdout(*args, cwd=cwd)
+        except Exception:
+            return
+        for raw_line in output.splitlines():
+            candidate = raw_line.strip().strip('"')
+            if not candidate or candidate in seen:
+                continue
+            files.append(candidate)
+            seen.add(candidate)
+
+    await _collect("git", "diff", "--name-only", "HEAD", "--")
+    await _collect("git", "ls-files", "--others", "--exclude-standard")
+    return files[:max_files]
 
 
 async def _collect_git_changed_files(cwd: str) -> list[str]:
     return await _git_changed_files(cwd)
+
+
+def _classify_file_edit_from_diff(cwd: str, path: str) -> str:
+    try:
+        proc = subprocess.run(
+            ["git", "diff", "--unified=0", "--", path],
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+            check=False,
+        )
+        diff_text = proc.stdout or ""
+    except Exception:
+        return f"editing {path}"
+    added_lines = [
+        line[1:].strip()
+        for line in diff_text.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    ]
+    changed_lines = [
+        line[1:].strip()
+        for line in diff_text.splitlines()
+        if (line.startswith("+") or line.startswith("-"))
+        and not line.startswith("+++")
+        and not line.startswith("---")
+    ]
+    lowered = "\n".join(added_lines).lower()
+    if not changed_lines:
+        return f"editing {path}"
+
+    nonempty_changed = [line for line in changed_lines if line]
+    if nonempty_changed and all(
+        line.startswith(("import ", "from ")) for line in nonempty_changed
+    ):
+        return f"updating imports in {path}"
+
+    config_tokens = (
+        "=",
+        ":",
+        "config",
+        "setting",
+        "option",
+        "param",
+        "env",
+        "variable",
+        "timeout",
+        "path",
+    )
+    if any(token in lowered for token in config_tokens):
+        return f"updating configuration in {path}"
+    return f"editing {path}"
+
+
+async def _summarize_file_edits(cwd: str, changed_files: list[str], max_files: int = 2) -> str:
+    if not changed_files:
+        return ""
+    summaries: list[str] = []
+    for path in changed_files[:max_files]:
+        summaries.append(await asyncio.to_thread(_classify_file_edit_from_diff, cwd, path))
+    if not summaries:
+        return ""
+    if len(changed_files) > max_files:
+        summaries.append(f"and {len(changed_files) - max_files} more file(s)")
+    return "; ".join(summaries)
 
 
 async def _post_agent_heartbeat_async(
@@ -2906,6 +3100,66 @@ async def _terminate_subprocess(proc: asyncio.subprocess.Process) -> None:
         return
     try:
         await asyncio.wait_for(proc.wait(), timeout=5)
+    except Exception:
+        pass
+
+
+async def _terminate_pid(pid: int) -> None:
+    if pid <= 0:
+        return
+    try:
+        os.kill(pid, 15)
+    except ProcessLookupError:
+        return
+    except Exception:
+        return
+
+    deadline = asyncio.get_event_loop().time() + 5
+    while asyncio.get_event_loop().time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return
+        except Exception:
+            return
+        await asyncio.sleep(0.1)
+
+    try:
+        os.kill(pid, 9)
+    except ProcessLookupError:
+        return
+    except Exception:
+        return
+
+
+async def _close_terminal_session(title: str) -> None:
+    """Close a Terminal.app tab/window created for a visible agent session."""
+    if sys.platform != "darwin" or not title:
+        return
+    try:
+        escaped_title = title.replace("\\", "\\\\").replace('"', '\\"')
+        osa_script = (
+            'tell application "Terminal"\n'
+            "  repeat with w in windows\n"
+            "    try\n"
+            "      repeat with t in tabs of w\n"
+            f'        if custom title of t is "{escaped_title}" then\n'
+            "          close w saving no\n"
+            "          exit repeat\n"
+            "        end if\n"
+            "      end repeat\n"
+            "    end try\n"
+            "  end repeat\n"
+            "end tell"
+        )
+        proc = await asyncio.create_subprocess_exec(
+            "osascript",
+            "-e",
+            osa_script,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
     except Exception:
         pass
 
@@ -3045,12 +3299,146 @@ async def _wait_for_conflict_resolution(
     return {"action": "timeout", "task": {}}
 
 
+def _truncate_title(title: str, max_len: int = 50) -> str:
+    """Truncate a title at a word boundary."""
+    if len(title) <= max_len:
+        return title
+    truncated = title[:max_len].rsplit(" ", 1)[0]
+    return truncated if truncated else title[:max_len]
+
+
+def _usage_limit_error_from_text(text: str) -> str | None:
+    lowered = _clean(text).lower()
+    if not lowered:
+        return None
+    if "out of extra usage" in lowered or "usage limit" in lowered:
+        return "Agent usage limit reached."
+    if "hit your limit" in lowered or "out of credits" in lowered:
+        return "Agent usage limit reached."
+    return None
+
+
+def _should_ignore_agent_output_line(text: str) -> bool:
+    lowered = _clean(text).lower()
+    if not lowered:
+        return True
+    ignored_prefixes = (
+        "openai codex v",
+        "anthropic claude",
+        "workdir:",
+        "model:",
+        "provider:",
+        "approval:",
+        "sandbox:",
+        "reasoning effort:",
+        "reasoning summaries:",
+        "session id:",
+    )
+    if lowered in {"--------", "user", "mcp startup: no servers"}:
+        return True
+    return lowered.startswith(ignored_prefixes)
+
+
+def _summarize_agent_command_activity(text: str) -> str | None:
+    cleaned = _clean(text)
+    if not cleaned:
+        return None
+    lowered = cleaned.lower()
+    if (
+        " in " not in cleaned
+        or (" succeeded in " not in lowered and " exited " not in lowered)
+    ):
+        return None
+
+    command_text = cleaned
+    if " -lc " in cleaned:
+        command_text = cleaned.split(" -lc ", 1)[1].strip()
+    elif cleaned.startswith("exec "):
+        command_text = cleaned[5:].strip()
+
+    if len(command_text) >= 2 and command_text[0] == command_text[-1] and command_text[0] in {"'", '"'}:
+        command_text = command_text[1:-1]
+
+    file_matches = []
+    seen_paths: set[str] = set()
+    for match in re.findall(
+        r"([A-Za-z0-9_./-]+\.(?:py|tf|tfvars|json|ya?ml|md|txt|sh))",
+        command_text,
+    ):
+        if match not in seen_paths:
+            file_matches.append(match)
+            seen_paths.add(match)
+
+    def _format_paths(prefix: str) -> str:
+        if not file_matches:
+            return ""
+        shown = file_matches[:3]
+        suffix = ", ..." if len(file_matches) > 3 else ""
+        return f"{prefix} {', '.join(shown)}{suffix}"
+
+    if "sed -n" in command_text or "cat " in command_text:
+        return _format_paths("reading") or None
+    if "ls -l" in command_text or command_text.startswith("ls "):
+        return _format_paths("checking") or None
+    if "rg -n" in command_text and file_matches:
+        return _format_paths("searching") or None
+    if "python -m py_compile" in command_text or "python3 -m py_compile" in command_text:
+        return _format_paths("validating") or None
+    if "pytest" in command_text:
+        return _format_paths("testing") or None
+    return None
+
+
+# Registry of active agent subprocesses and terminal windows for Ctrl+C cleanup
+_active_agent_procs: set[asyncio.subprocess.Process] = set()
+_active_terminal_titles: set[str] = set()
+_active_temp_files: set[str] = set()
+_active_terminal_pid_files: set[str] = set()
+
+
+async def _cleanup_active_agents():
+    """Kill all active agent subprocesses and close Terminal.app windows."""
+    global _active_agent_procs, _active_terminal_titles, _active_temp_files, _active_terminal_pid_files
+    if sys.platform == "darwin" and _active_terminal_titles:
+        await asyncio.gather(
+            *(_close_terminal_session(title) for title in list(_active_terminal_titles)),
+            return_exceptions=True,
+        )
+    if _active_agent_procs:
+        await asyncio.gather(
+            *(_terminate_subprocess(proc) for proc in list(_active_agent_procs)),
+            return_exceptions=True,
+        )
+    for pid_file in list(_active_terminal_pid_files):
+        try:
+            pid = int(Path(pid_file).read_text().strip())
+        except Exception:
+            continue
+        await _terminate_pid(pid)
+    if sys.platform == "darwin" and _active_terminal_titles:
+        await asyncio.gather(
+            *(_close_terminal_session(title) for title in list(_active_terminal_titles)),
+            return_exceptions=True,
+        )
+    # Clean up temp files
+    for f in list(_active_temp_files):
+        try:
+            os.unlink(f)
+        except OSError:
+            pass
+    _active_agent_procs.clear()
+    _active_terminal_titles.clear()
+    _active_temp_files.clear()
+    _active_terminal_pid_files.clear()
+
+
 def _build_agent_exec_command(
     agent_name: str,
     agent_bin: str,
     prompt: str,
     *,
     task_title: str,
+    task_order: int | None = None,
     work_dir: str,
     worktree_name: str,
 ) -> list[str]:
@@ -3080,10 +3468,64 @@ def _build_agent_exec_command(
         "auto",
         "--no-session-persistence",
         "--name",
-        f"keshro: {task_title[:40]}",
+        f"keshro: {'#' + str(task_order) + ' ' if task_order is not None else ''}{_truncate_title(task_title)}",
         "--add-dir",
         work_dir,
     ]
+
+
+def _build_visible_agent_exec_command(
+    agent_name: str,
+    agent_bin: str,
+    prompt: str,
+    *,
+    task_title: str,
+    task_order: int | None = None,
+    work_dir: str,
+    worktree_name: str,
+) -> list[str]:
+    if agent_name == "codex":
+        return [
+            agent_bin,
+            "exec",
+            prompt,
+            "--cd",
+            work_dir,
+            "--sandbox",
+            "workspace-write",
+            "--skip-git-repo-check",
+            "--ephemeral",
+        ]
+    return [
+        agent_bin,
+        "-p",
+        prompt,
+        "--worktree",
+        worktree_name,
+        "--permission-mode",
+        "auto",
+        "--name",
+        f"keshro: {'#' + str(task_order) + ' ' if task_order is not None else ''}{_truncate_title(task_title)}",
+        "--add-dir",
+        work_dir,
+    ]
+
+
+def _shell_command_with_prompt_placeholder(
+    command: list[str], prompt: str, placeholder: str = '"$_KESHRO_PROMPT"'
+) -> str:
+    """Render a shell command while keeping the prompt at its original argv slot."""
+    rendered: list[str] = []
+    replaced = False
+    for arg in command:
+        if not replaced and arg == prompt:
+            rendered.append(placeholder)
+            replaced = True
+        else:
+            rendered.append(shlex.quote(arg))
+    if not replaced:
+        rendered.append(placeholder)
+    return " ".join(rendered)
 
 
 async def _merge_codex_worktree_changes(
@@ -3178,20 +3620,32 @@ async def _launch_single_agent(
     session_id: str = "",
     agent: str = "auto",
     visible: bool = False,
+    launch_index: int = 0,
+    use_local_repo_context: bool = True,
 ) -> AgentResult:
+    global _active_agent_procs, _active_terminal_titles, _active_temp_files, _active_terminal_pid_files
     task_id = _clean(task.get("id")) or "unknown"
     task_title = _clean(task.get("title")) or "Untitled"
+    task_order = task.get("order")
     worktree_name = f"keshro-{task_id[:8]}"
 
     # Resolve agent binary (_resolve_prompt_agent raises SystemExit if not found)
     agent_name, agent_bin = _resolve_prompt_agent(agent)
 
+    # Stagger agent launches to avoid git worktree lock contention
+    if launch_index > 0:
+        await asyncio.sleep(launch_index * 1.5)
+
     async with semaphore:
         print(f"  {YELLOW}▶{RESET} {task_title} {DIM}starting...{RESET}")
-        # Register with Collaborator/Conductor if available
+        # Register with Collaborator/Collaborator if available
         collab_session_id = f"keshro-{task_id}"
         launched_in_terminal = False
         visible_fallback_reason = ""
+        _terminal_temp_files: list[str] = []  # For Terminal.app cleanup
+        _terminal_title: str | None = None
+        _terminal_pid_file: str | None = None
+        _terminal_log_file: str | None = None
         try:
             from .collaborator import (
                 is_available,
@@ -3204,15 +3658,19 @@ async def _launch_single_agent(
             collab_active = is_available()
             if collab_active and not visible:
                 session_start(collab_session_id, work_dir)
-            elif visible:
-                visible_fallback_reason = "Collaborator/Conductor is not running; falling back to headless execution"
+            elif visible and not collab_active:
+                if sys.platform != "darwin":
+                    visible_fallback_reason = (
+                        "visible terminal sessions are unavailable on this platform; falling back to headless"
+                    )
         except Exception:
             collab_active = False
-            if visible:
-                visible_fallback_reason = "Collaborator/Conductor integration failed; falling back to headless execution"
+            if visible and sys.platform != "darwin":
+                visible_fallback_reason = (
+                    "visible terminal launch unavailable; falling back to headless"
+                )
 
-        if visible and not launched_in_terminal and visible_fallback_reason:
-            print(f"    {YELLOW}!{RESET} {visible_fallback_reason}")
+
 
         # For Codex, create a manual git worktree for isolation and merge the
         # resulting changes back into the main repo after the run succeeds.
@@ -3221,30 +3679,33 @@ async def _launch_single_agent(
         codex_worktree_branch = ""
         if agent_name == "codex":
             import tempfile
+            import shutil
 
-            codex_worktree_path = os.path.join(
-                tempfile.gettempdir(), f"keshro-{worktree_name}"
-            )
+            codex_worktree_path = tempfile.mkdtemp(prefix=f"keshro-{worktree_name}-")
             codex_worktree_branch = f"keshro-{task_id[:8]}-{uuid.uuid4().hex[:6]}"
             try:
                 codex_worktree_base_rev = await _git_stdout(
                     "git", "rev-parse", "HEAD", cwd=work_dir
                 )
-                wt_proc = await asyncio.create_subprocess_exec(
-                    "git",
-                    "worktree",
-                    "add",
-                    "-b",
-                    codex_worktree_branch,
+                created, err_msg = await _create_codex_worktree(
+                    work_dir,
                     codex_worktree_path,
+                    codex_worktree_branch,
                     codex_worktree_base_rev,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    cwd=work_dir,
                 )
-                wt_stdout, wt_stderr = await wt_proc.communicate()
-                if wt_proc.returncode != 0:
-                    err_msg = (wt_stderr or b"").decode(errors="replace").strip()
+                if not created and "already exists" in err_msg.lower():
+                    await _cleanup_worktree(work_dir, codex_worktree_path)
+                    try:
+                        shutil.rmtree(codex_worktree_path, ignore_errors=True)
+                    except Exception:
+                        pass
+                    created, err_msg = await _create_codex_worktree(
+                        work_dir,
+                        codex_worktree_path,
+                        codex_worktree_branch,
+                        codex_worktree_base_rev,
+                    )
+                if not created:
                     blocked_reason = f"Failed to create worktree for Codex: {err_msg}"
                     await _mark_task_status_async(
                         api_client,
@@ -3260,6 +3721,7 @@ async def _launch_single_agent(
                         stdout="",
                         stderr=blocked_reason,
                         duration_seconds=0,
+                        failure_kind="launch",
                     )
             except Exception as exc:
                 blocked_reason = f"Failed to create worktree for Codex: {exc}"
@@ -3277,9 +3739,13 @@ async def _launch_single_agent(
                     stdout="",
                     stderr=blocked_reason,
                     duration_seconds=0,
+                    failure_kind="launch",
                 )
 
         exec_dir = codex_worktree_path if agent_name == "codex" else work_dir
+        agent_env = os.environ.copy()
+        agent_env["KESHRO_ACTIVE_PLAN_ID"] = plan_id
+        agent_env["KESHRO_SUPPRESS_AGENT_SKILL_BANNER"] = "1"
         runtime_context = _collect_task_runtime_context_for(exec_dir)
         latest_stdout_lines: list[str] = []
         latest_stderr_lines: list[str] = []
@@ -3294,13 +3760,54 @@ async def _launch_single_agent(
         stderr_text = ""
         result_text = ""
         exit_code = 0
+        failure_kind = ""
         cost_usd = 0.0
         tokens_used = 0
         model_name = ""
         live_retry_note = ""
         live_retry_count = 0
+        last_headless_progress = ""
+        last_headless_command_summary = ""
+        last_headless_changed_files: tuple[str, ...] = ()
+        last_headless_activity_at = time.monotonic()
+        headless_reviewed_files: set[str] = set()
+        headless_spinner_enabled = (
+            not visible and total_agents == 1 and not _state.json and _stdout_is_tty()
+        )
+        headless_spinner_active = False
+        headless_spinner_task: asyncio.Task | None = None
 
-        # Report start with session ID via agent API (also sets status to in_progress)
+        def _clear_headless_spinner_line() -> None:
+            if not headless_spinner_enabled:
+                return
+            width = shutil.get_terminal_size(fallback=(100, 24)).columns
+            print("\r" + (" " * max(20, width - 1)) + "\r", end="", flush=True)
+
+        async def _headless_spinner_loop() -> None:
+            frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+            index = 0
+            try:
+                while headless_spinner_active:
+                    elapsed = int(time.monotonic() - overall_start)
+                    width = shutil.get_terminal_size(fallback=(100, 24)).columns
+                    label = f"  {DIM}[{task_title}]{RESET} {CYAN}{frames[index % len(frames)]}{RESET} working ({elapsed}s)"
+                    clipped = label
+                    if len(clipped) >= width:
+                        clipped = clipped[: max(1, width - 1)]
+                    print("\r" + clipped, end="", flush=True)
+                    index += 1
+                    await asyncio.sleep(0.12)
+            except asyncio.CancelledError:
+                pass
+            finally:
+                _clear_headless_spinner_line()
+
+        def _print_headless_progress(message: str) -> None:
+            _clear_headless_spinner_line()
+            print(f"  {DIM}[{task_title}]{RESET} {message}")
+
+        # Report start with session ID via agent API and explicitly mark the task
+        # in progress so the plan UI reflects the active run immediately.
         try:
             await api_client.post(
                 f"/v1/agent/plans/{plan_id}/task-event",
@@ -3314,35 +3821,59 @@ async def _launch_single_agent(
                 },
             )
         except Exception:
-            await _mark_task_status_async(api_client, plan_id, task_id, "in_progress")
+            pass
+        await _mark_task_status_async(api_client, plan_id, task_id, "in_progress")
+        if not visible and headless_spinner_enabled:
+            headless_spinner_active = True
+            headless_spinner_task = asyncio.create_task(_headless_spinner_loop())
 
         async def _heartbeat_loop() -> None:
+            nonlocal last_headless_progress, last_headless_changed_files, last_headless_activity_at
+            in_progress_synced = False
             try:
                 while heartbeat_active:
                     try:
-                        latest_error = _clean(
-                            latest_stderr_lines[-1] if latest_stderr_lines else ""
-                        )
-                        latest_output = _clean(
-                            latest_stdout_lines[-1] if latest_stdout_lines else ""
-                        )
-                        changed_files = await _git_changed_files(exec_dir)
-                        if latest_error:
-                            current_phase = "error"
-                            progress_message = latest_error
-                        elif changed_files:
-                            current_phase = "editing"
-                            progress_message = (
-                                f"Editing {', '.join(changed_files[:3])}"
-                                if changed_files
-                                else "Editing files"
+                        if not in_progress_synced:
+                            await _mark_task_status_async(
+                                api_client, plan_id, task_id, "in_progress"
                             )
+                            in_progress_synced = True
+                        changed_files = await _git_changed_files(exec_dir)
+                        if changed_files:
+                            current_phase = "editing"
+                            changed_signature = tuple(changed_files[:3])
+                            if changed_signature != last_headless_changed_files:
+                                edit_summary = await _summarize_file_edits(
+                                    exec_dir, changed_files
+                                )
+                            else:
+                                edit_summary = ""
+                            progress_message = edit_summary or (
+                                f"Editing {', '.join(changed_files[:3])}"
+                            )
+                            headless_progress = progress_message
                         elif launched_in_terminal:
                             current_phase = "visible_terminal"
-                            progress_message = "Running in a visible Conductor terminal"
+                            progress_message = "Running in a visible Collaborator terminal"
+                            headless_progress = ""
+                            changed_signature = ()
                         else:
                             current_phase = "running"
-                            progress_message = latest_output or "Agent running"
+                            progress_message = "Agent running"
+                            headless_progress = ""
+                            changed_signature = ()
+                        if (
+                            not visible
+                            and headless_progress
+                            and (
+                                headless_progress != last_headless_progress
+                                or changed_signature != last_headless_changed_files
+                            )
+                        ):
+                            _print_headless_progress(headless_progress)
+                            last_headless_progress = headless_progress
+                            last_headless_changed_files = changed_signature
+                            last_headless_activity_at = time.monotonic()
                         await _post_agent_heartbeat_async(
                             api_client,
                             plan_id,
@@ -3367,6 +3898,7 @@ async def _launch_single_agent(
             latest_lines: list[str],
             chunks: list[str],
         ) -> None:
+            nonlocal last_headless_command_summary, last_headless_progress, last_headless_activity_at
             if stream is None:
                 return
             while True:
@@ -3379,9 +3911,41 @@ async def _launch_single_agent(
                 if cleaned:
                     latest_lines.append(cleaned)
                     del latest_lines[:-20]
+                    if visible or _should_ignore_agent_output_line(cleaned):
+                        continue
+                    for match in re.findall(
+                        r"([A-Za-z0-9_./-]+\.(?:py|tf|tfvars|json|ya?ml|md|txt|sh))",
+                        cleaned,
+                    ):
+                        headless_reviewed_files.add(match)
+                    summary = _summarize_agent_command_activity(cleaned)
+                    if summary in {
+                        "switching git branch",
+                        "creating checkpoint commit",
+                    }:
+                        continue
+                    if summary and summary != last_headless_command_summary:
+                        _print_headless_progress(summary)
+                        last_headless_command_summary = summary
+                        last_headless_progress = summary
+                        last_headless_activity_at = time.monotonic()
 
         while True:
-            prompt = _build_parallel_prompt(plan, task, total_agents, work_dir=work_dir)
+            prompt = (
+                _build_visible_parallel_prompt(
+                    plan,
+                    task,
+                    total_agents,
+                    work_dir=work_dir if use_local_repo_context else None,
+                )
+                if visible
+                else _build_parallel_prompt(
+                    plan,
+                    task,
+                    total_agents,
+                    work_dir=work_dir if use_local_repo_context else None,
+                )
+            )
             if live_retry_note:
                 prompt = (
                     prompt
@@ -3394,6 +3958,16 @@ async def _launch_single_agent(
                 agent_bin,
                 prompt,
                 task_title=task_title,
+                task_order=task_order,
+                work_dir=exec_dir,
+                worktree_name=worktree_name,
+            )
+            visible_command = _build_visible_agent_exec_command(
+                agent_name,
+                agent_bin,
+                prompt,
+                task_title=task_title,
+                task_order=task_order,
                 work_dir=exec_dir,
                 worktree_name=worktree_name,
             )
@@ -3402,19 +3976,29 @@ async def _launch_single_agent(
             heartbeat_task = asyncio.create_task(_heartbeat_loop())
 
             if collab_active and visible and not launched_in_terminal:
-                tile_title = f"keshro: {task_title[:40]}"
+                order_prefix = f"#{task_order} " if task_order is not None else ""
+                tile_title = f"keshro: {order_prefix}{_truncate_title(task_title)}"
                 try:
                     from .collaborator import launch_terminal
 
                     tile_id = launch_terminal(
-                        command=shlex.join(command),
+                        command=shlex.join(
+                            [
+                                "env",
+                                f"KESHRO_ACTIVE_PLAN_ID={plan_id}",
+                                "KESHRO_SUPPRESS_AGENT_SKILL_BANNER=1",
+                                *visible_command,
+                            ]
+                        ),
                         cwd=exec_dir,
                         title=tile_title,
                         session_id=collab_session_id,
                     )
                     launched_in_terminal = tile_id is not None
                     if launched_in_terminal:
-                        print(f"    {DIM}Visible tile launched in Conductor.{RESET}")
+                        print(
+                            f"    {GREEN}Visible session launched:{RESET} {task_title} -> Collaborator ({tile_title})"
+                        )
                     else:
                         visible_fallback_reason = (
                             "visible terminal launch RPC unavailable"
@@ -3422,16 +4006,166 @@ async def _launch_single_agent(
                         session_start(collab_session_id, work_dir)
                 except Exception:
                     launched_in_terminal = False
-                    visible_fallback_reason = "Collaborator/Conductor integration failed; falling back to headless execution"
+                    visible_fallback_reason = "Collaborator launch failed"
                     session_start(collab_session_id, work_dir)
+
+            # Native terminal fallback — open a new Terminal.app tab on macOS
+            if visible and not launched_in_terminal and sys.platform == "darwin":
+                try:
+                    import tempfile
+
+                    order_prefix = f"#{task_order} " if task_order is not None else ""
+                    tab_title = f"keshro: {order_prefix}{_truncate_title(task_title)}"
+
+                    # Write prompt to a separate file to avoid shell quoting
+                    # issues (prompt often contains single quotes).
+                    prompt_file = tempfile.NamedTemporaryFile(
+                        mode="w", suffix=".txt", prefix="keshro-prompt-", delete=False
+                    )
+                    prompt_text = prompt
+                    command_line = _shell_command_with_prompt_placeholder(
+                        visible_command, prompt
+                    )
+                    prompt_file.write(prompt_text)
+                    prompt_file.close()
+
+                    pid_file = tempfile.NamedTemporaryFile(
+                        mode="w", suffix=".pid", prefix="keshro-agent-", delete=False
+                    )
+                    pid_file.close()
+
+                    log_file = tempfile.NamedTemporaryFile(
+                        mode="w", suffix=".log", prefix="keshro-agent-", delete=False
+                    )
+                    log_file.close()
+
+                    script_file = tempfile.NamedTemporaryFile(
+                        mode="w", suffix=".sh", prefix="keshro-agent-", delete=False
+                    )
+                    script_file.write("#!/usr/bin/env zsh\n")
+                    # Set the terminal tab/window title via escape sequence
+                    esc_title = tab_title.replace("\\", "\\\\").replace('"', '\\"')
+                    script_file.write(f'printf "\\033]0;{esc_title}\\007"\n')
+                    # Clear the screen and scrollback so Terminal.app startup noise
+                    # and the temp script path do not remain visible above the agent.
+                    script_file.write('printf "\\033c\\033[3J\\033[H\\033[2J"\n')
+                    # Add claude to PATH (common install locations)
+                    script_file.write('export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:$PATH"\n')
+                    script_file.write(
+                        f'export KESHRO_ACTIVE_PLAN_ID={shlex.quote(plan_id)}\n'
+                    )
+                    script_file.write('export KESHRO_SUPPRESS_AGENT_SKILL_BANNER=1\n')
+                    script_file.write(f"cd {shlex.quote(exec_dir)} || exit 1\n")
+                    # Read prompt from file to avoid shell quoting issues.
+                    script_file.write(
+                        f'_KESHRO_PROMPT="$(cat {shlex.quote(prompt_file.name)})"\n'
+                    )
+                    script_file.write(
+                        f'exec > >(tee -a {shlex.quote(log_file.name)}) 2>&1\n'
+                    )
+                    script_file.write(f'echo $$ > {shlex.quote(pid_file.name)}\n')
+                    script_file.write(f"exec {command_line}\n")
+                    script_file.close()
+                    os.chmod(script_file.name, 0o755)
+
+                    # Escape for AppleScript string (double backslashes and double quotes)
+                    osa_path = script_file.name.replace("\\", "\\\\").replace('"', '\\"')
+                    osa_title = tab_title.replace("\\", "\\\\").replace('"', '\\"')
+                    osa_script = (
+                        'tell application "Terminal"\n'
+                        "  activate\n"
+                        f'  do script "{osa_path}"\n'
+                        f'  set custom title of selected tab of front window to "{osa_title}"\n'
+                        "end tell"
+                    )
+                    osa_proc = await asyncio.create_subprocess_exec(
+                        "osascript", "-e", osa_script,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    _osa_out, osa_err = await osa_proc.communicate()
+                    if osa_proc.returncode == 0:
+                        launched_in_terminal = True
+                        _terminal_temp_files = [
+                            script_file.name,
+                            prompt_file.name,
+                            pid_file.name,
+                            log_file.name,
+                        ]
+                        _terminal_title = tab_title
+                        _terminal_pid_file = pid_file.name
+                        _terminal_log_file = log_file.name
+                        _active_terminal_titles.add(tab_title)
+                        _active_temp_files.update(_terminal_temp_files)
+                        _active_terminal_pid_files.add(pid_file.name)
+                        print(
+                            f"    {GREEN}Visible session launched:{RESET} {task_title} -> Terminal.app ({tab_title})"
+                        )
+                    else:
+                        err_detail = (osa_err or b"").decode(errors="replace").strip()
+                        visible_fallback_reason = (
+                            "Failed to launch Terminal.app"
+                            + (f": {err_detail}" if err_detail else "")
+                            + "; falling back to headless"
+                        )
+                        try:
+                            os.unlink(script_file.name)
+                        except OSError:
+                            pass
+                        try:
+                            os.unlink(prompt_file.name)
+                        except OSError:
+                            pass
+                        try:
+                            os.unlink(pid_file.name)
+                        except OSError:
+                            pass
+                        try:
+                            os.unlink(log_file.name)
+                        except OSError:
+                            pass
+                except Exception as exc:
+                    visible_fallback_reason = (
+                        f"Failed to launch Terminal.app: {exc}; falling back to headless"
+                    )
+
+            if visible and not launched_in_terminal and visible_fallback_reason:
+                print(
+                    f"    {RED}Visible launch failed:{RESET} {visible_fallback_reason}"
+                )
 
             if launched_in_terminal:
                 exit_code = 0
                 stdout_text = ""
                 stderr_text = ""
-                poll_interval = 5
+                poll_interval = 2
+                _terminal_poll_start = asyncio.get_event_loop().time()
+                _TERMINAL_STALE_TIMEOUT = 300  # 5 min with no task status change = stale
                 while True:
                     await asyncio.sleep(poll_interval)
+                    log_excerpt = ""
+                    usage_limit_reason = None
+                    if _terminal_log_file:
+                        try:
+                            log_text = Path(_terminal_log_file).read_text(
+                                errors="replace"
+                            )
+                            log_lines = log_text.strip().splitlines()
+                            if log_lines:
+                                log_excerpt = "\n".join(log_lines[-20:])
+                            usage_limit_reason = _usage_limit_error_from_text(log_text)
+                        except OSError:
+                            pass
+                    if usage_limit_reason:
+                        exit_code = 1
+                        failure_kind = "usage_limit"
+                        stderr_text = usage_limit_reason
+                        if log_excerpt:
+                            stderr_text = f"{stderr_text}\nRecent output:\n{log_excerpt}"
+                        print(
+                            f"    {RED}Visible session failed immediately:{RESET} {task_title} ({usage_limit_reason})"
+                        )
+                        break
                     try:
                         resp = await api_client.get(f"/v1/plans/{plan_id}")
                         if resp.status_code == 200:
@@ -3447,6 +4181,10 @@ async def _launch_single_agent(
                                     status = t.get("status", "")
                                     if status in ("completed", "done"):
                                         break
+                                    elif status in ("canceled", "cancelled"):
+                                        exit_code = 1
+                                        stderr_text = "Agent task was cancelled"
+                                        break
                                     elif status == "blocked":
                                         exit_code = 1
                                         stderr_text = t.get(
@@ -3459,7 +4197,53 @@ async def _launch_single_agent(
                             break
                     except Exception:
                         pass
+                    if _terminal_pid_file:
+                        try:
+                            pid = int(Path(_terminal_pid_file).read_text().strip())
+                        except Exception:
+                            pid = None
+                        if pid is not None:
+                            try:
+                                os.kill(pid, 0)
+                            except OSError:
+                                exit_code = 1
+                                failure_kind = "launch"
+                                stderr_text = (
+                                    "Visible agent exited before updating task status."
+                                )
+                                if log_excerpt:
+                                    stderr_text = (
+                                        f"{stderr_text}\nRecent output:\n{log_excerpt}"
+                                    )
+                                print(
+                                    f"    {RED}Visible session exited early:{RESET} {task_title}"
+                                )
+                                break
+                            except Exception:
+                                pass
+                    # Check if task was never picked up (agent failed to start)
+                    elapsed = asyncio.get_event_loop().time() - _terminal_poll_start
+                    if elapsed > _TERMINAL_STALE_TIMEOUT:
+                        exit_code = 1
+                        failure_kind = "launch"
+                        stderr_text = "Terminal agent did not update task status within 5 minutes — agent may have failed to start"
+                        print(f"    {YELLOW}!{RESET} {task_title}: terminal agent timed out")
+                        break
                     poll_interval = min(poll_interval + 2, 15)
+
+                # Clean up Terminal.app temp files
+                for _f in _terminal_temp_files:
+                    try:
+                        os.unlink(_f)
+                    except OSError:
+                        pass
+                _active_temp_files.difference_update(_terminal_temp_files)
+                _terminal_temp_files = []
+                if _terminal_title:
+                    await _close_terminal_session(_terminal_title)
+                    _active_terminal_titles.discard(_terminal_title)
+                if _terminal_pid_file:
+                    _active_terminal_pid_files.discard(_terminal_pid_file)
                 break
 
             # Standard subprocess mode — pipe stdout for agent output parsing
@@ -3469,7 +4253,9 @@ async def _launch_single_agent(
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     cwd=exec_dir,
+                    env=agent_env,
                 )
+                _active_agent_procs.add(proc)
                 if agent_name == "codex" and codex_worktree_path:
                     live_conflict_task = asyncio.create_task(
                         _watch_live_conflicts(
@@ -3491,6 +4277,7 @@ async def _launch_single_agent(
                     stdout_text = (stdout_bytes or b"").decode(errors="replace").strip()
                     stderr_text = (stderr_bytes or b"").decode(errors="replace").strip()
                     exit_code = proc.returncode or 0
+                    _active_agent_procs.discard(proc)
                 else:
                     readers = [
                         asyncio.create_task(
@@ -3507,6 +4294,7 @@ async def _launch_single_agent(
                     await proc.wait()
                     await asyncio.gather(*readers, return_exceptions=True)
                     exit_code = proc.returncode or 0
+                    _active_agent_procs.discard(proc)
                     stdout_text = "".join(stdout_chunks).strip()
                     stderr_text = "".join(stderr_chunks).strip()
                 if live_conflict_task is not None:
@@ -3543,6 +4331,18 @@ async def _launch_single_agent(
                         session_end(collab_session_id)
                     except Exception:
                         pass
+                for _f in _terminal_temp_files:
+                    try:
+                        os.unlink(_f)
+                    except OSError:
+                        pass
+                _active_temp_files.difference_update(_terminal_temp_files)
+                _terminal_temp_files = []
+                if _terminal_title:
+                    await _close_terminal_session(_terminal_title)
+                    _active_terminal_titles.discard(_terminal_title)
+                if _terminal_pid_file:
+                    _active_terminal_pid_files.discard(_terminal_pid_file)
                 return AgentResult(
                     task_id=task_id,
                     task_title=task_title,
@@ -3550,6 +4350,7 @@ async def _launch_single_agent(
                     stdout="",
                     stderr=str(exc),
                     duration_seconds=time.monotonic() - overall_start,
+                    failure_kind="launch",
                 )
             heartbeat_active = False
             if heartbeat_task is not None:
@@ -3702,6 +4503,7 @@ async def _launch_single_agent(
                 )
             except Exception as exc:
                 exit_code = 1
+                failure_kind = "execution"
                 stderr_text = str(exc)
 
         if exit_code == 0:
@@ -3745,25 +4547,47 @@ async def _launch_single_agent(
                 pass
         else:
             reason = stderr_text[:200] or result_text[:200] or "Agent exited with error"
-            await _mark_task_status_async(
-                api_client, plan_id, task_id, "blocked", blocked_reason=reason
-            )
-            try:
-                await api_client.post(
-                    f"/v1/agent/plans/{plan_id}/task-event",
-                    json={
-                        "task_id": task_id,
-                        "event": "block",
-                        "reason": reason,
-                        "agent_session_id": session_id,
-                        "current_phase": "blocked",
-                        "recent_error": reason,
-                        "touched_files": await _git_changed_files(exec_dir),
-                        "runtime_context": runtime_context,
-                    },
+            if failure_kind in {"launch", "usage_limit"}:
+                note = f"Agent launch failed transiently: {reason}"
+                await _mark_task_status_async(
+                    api_client, plan_id, task_id, "todo", notes=note
                 )
-            except Exception:
-                pass
+                try:
+                    await api_client.post(
+                        f"/v1/agent/plans/{plan_id}/task-event",
+                        json={
+                            "task_id": task_id,
+                            "event": "note",
+                            "note": note,
+                            "agent_session_id": session_id,
+                            "current_phase": "failed_to_launch",
+                            "recent_error": reason,
+                            "touched_files": await _git_changed_files(exec_dir),
+                            "runtime_context": runtime_context,
+                        },
+                    )
+                except Exception:
+                    pass
+            else:
+                await _mark_task_status_async(
+                    api_client, plan_id, task_id, "blocked", blocked_reason=reason
+                )
+                try:
+                    await api_client.post(
+                        f"/v1/agent/plans/{plan_id}/task-event",
+                        json={
+                            "task_id": task_id,
+                            "event": "block",
+                            "reason": reason,
+                            "agent_session_id": session_id,
+                            "current_phase": "blocked",
+                            "recent_error": reason,
+                            "touched_files": await _git_changed_files(exec_dir),
+                            "runtime_context": runtime_context,
+                        },
+                    )
+                except Exception:
+                    pass
 
         # End Collaborator session + notify
         if collab_active:
@@ -3772,9 +4596,24 @@ async def _launch_single_agent(
                 if exit_code == 0:
                     notify(f"✓ {task_title[:50]} completed ({duration:.0f}s)")
                 else:
-                    notify(f"✗ {task_title[:50]} blocked")
+                    if failure_kind in {"launch", "usage_limit"}:
+                        notify(f"✗ {task_title[:50]} failed to launch")
+                    else:
+                        notify(f"✗ {task_title[:50]} blocked")
             except Exception:
                 pass
+
+        for _f in _terminal_temp_files:
+            try:
+                os.unlink(_f)
+            except OSError:
+                pass
+        _active_temp_files.difference_update(_terminal_temp_files)
+        if _terminal_title:
+            await _close_terminal_session(_terminal_title)
+            _active_terminal_titles.discard(_terminal_title)
+        if _terminal_pid_file:
+            _active_terminal_pid_files.discard(_terminal_pid_file)
 
         if codex_worktree_path:
             await _cleanup_worktree(work_dir, codex_worktree_path)
@@ -3796,6 +4635,7 @@ async def _launch_single_agent(
             cost_usd=cost_usd,
             tokens_used=tokens_used,
             model=model_name,
+            failure_kind=failure_kind,
         )
 
 
@@ -3816,7 +4656,10 @@ async def _run_parallel(
     import uuid as _uuid
 
     resolved_plan_id = _require_plan_context(plan_id)
-    resolved_dir = str(Path(work_dir).resolve()) if work_dir else os.getcwd()
+    resolved_dir, use_local_repo_context = _resolve_continue_work_dir(
+        resolved_plan_id, work_dir, allow_prompt=True
+    )
+    exec_dir = resolved_dir or os.getcwd()
 
     # Verify that the resolved agent binary exists (raises SystemExit if not found)
     _resolve_prompt_agent(agent)
@@ -3918,8 +4761,10 @@ async def _run_parallel(
             print(f"\n{DIM}Dry run — no agents launched.{RESET}")
             break
 
+        agent_count = len(actionable)
+        agent_label = "agent" if agent_count == 1 else "agents"
         print(
-            f"\nLaunching {len(actionable)} agent(s) (max concurrency: {max_concurrency})...\n"
+            f"\nLaunching {agent_count} {agent_label} (max concurrency: {max_concurrency})...\n"
         )
         if wave == 1:
             print(
@@ -3943,20 +4788,25 @@ async def _run_parallel(
 
         semaphore = asyncio.Semaphore(max_concurrency)
         async with make_async_client(_state.api_url, _state.token) as api_client:
+            single_task_label = (
+                _clean(actionable[0].get("title")) if len(actionable) == 1 else ""
+            )
             agent_coros = [
                 _launch_single_agent(
                     task,
                     plan,
                     resolved_plan_id,
-                    resolved_dir,
+                    exec_dir,
+                    use_local_repo_context,
                     len(actionable),
                     semaphore,
                     api_client,
                     session_id=f"agent-{_clean(task.get('id'))[:8]}-{_uuid.uuid4().hex[:6]}",
                     agent=agent,
                     visible=visible,
+                    launch_index=i,
                 )
-                for task in actionable
+                for i, task in enumerate(actionable)
             ]
 
             # Background poller — prints new notes/status as agents work
@@ -3978,15 +4828,32 @@ async def _run_parallel(
             async def _poll_progress():
                 import time as _poll_time
 
+                def _print_poll_progress(message: str) -> None:
+                    if single_task_label and not visible and _stdout_is_tty():
+                        width = shutil.get_terminal_size(fallback=(100, 24)).columns
+                        print("\r" + (" " * max(20, width - 1)) + "\r", end="", flush=True)
+                    print(message)
+
                 _start_time = _poll_time.monotonic()
                 _last_heartbeat = 0  # seconds since last heartbeat message
                 _seen_sessions: dict[str, tuple] = {}
+                _saw_progress_update = False
+                _last_observed_activity = _start_time
+                _POLL_INTERVAL_SECONDS = 3
+                _SINGLE_TASK_HEARTBEAT_INTERVAL_SECONDS = 45
+                _MULTI_TASK_HEARTBEAT_INTERVAL_SECONDS = 10
                 try:
                     while not _poller_done:
-                        await asyncio.sleep(5)
+                        await asyncio.sleep(_POLL_INTERVAL_SECONDS)
                         if _poller_done:
                             break
                         elapsed = _poll_time.monotonic() - _start_time
+                        idle_elapsed = _poll_time.monotonic() - _last_observed_activity
+                        heartbeat_interval = (
+                            _SINGLE_TASK_HEARTBEAT_INTERVAL_SECONDS
+                            if single_task_label
+                            else _MULTI_TASK_HEARTBEAT_INTERVAL_SECONDS
+                        )
                         try:
                             async with make_async_client(
                                 _state.api_url, _state.token
@@ -3996,15 +4863,29 @@ async def _run_parallel(
                                 )
                             if not resp.is_success:
                                 # Heartbeat even if poll fails
-                                if elapsed - _last_heartbeat >= 30:
+                                if idle_elapsed >= heartbeat_interval and elapsed - _last_heartbeat >= heartbeat_interval:
                                     mins = int(elapsed // 60)
                                     secs = int(elapsed % 60)
                                     time_str = (
                                         f"{mins}m {secs}s" if mins > 0 else f"{secs}s"
                                     )
-                                    print(
-                                        f"  {DIM}⋯ agents still working ({time_str} elapsed){RESET}"
-                                    )
+                                    if single_task_label:
+                                        activity_text = (
+                                            f"reviewed {len(headless_reviewed_files)} files; no edits yet"
+                                            if headless_reviewed_files and not _saw_progress_update
+                                            else (
+                                                f"still working"
+                                                if _saw_progress_update
+                                                else "active; waiting for the first task note or file change"
+                                            )
+                                        )
+                                        _print_poll_progress(
+                                            f"  {DIM}[{single_task_label}]{RESET} {activity_text} ({time_str} elapsed)"
+                                        )
+                                    else:
+                                        _print_poll_progress(
+                                            f"  {DIM}⋯ {agent_label} still working ({time_str} elapsed){RESET}"
+                                        )
                                     _last_heartbeat = elapsed
                                 continue
                             fresh = resp.json()
@@ -4027,6 +4908,8 @@ async def _run_parallel(
                                 latest_error = _clean(
                                     recent_errors[-1] if recent_errors else ""
                                 )
+                                if _should_ignore_agent_output_line(latest_error):
+                                    latest_error = ""
                                 signature = (
                                     status,
                                     phase,
@@ -4054,13 +4937,18 @@ async def _run_parallel(
                                     details.append(
                                         f"conflicts: {', '.join(conflicting_files)}"
                                     )
-                                if latest_error:
+                                if latest_error and (
+                                    status in {"error", "failed", "blocked", "failed_to_launch"}
+                                    or phase == "error"
+                                ):
                                     details.append(f"error: {latest_error}")
                                 if not details:
                                     details.append(status or "running")
-                                print(
+                                _print_poll_progress(
                                     f"  {DIM}[{label} · {session_id}]{RESET} {' | '.join(details)}"
                                 )
+                                _saw_progress_update = True
+                                _last_observed_activity = _poll_time.monotonic()
                                 _last_heartbeat = _poll_time.monotonic() - _start_time
                             for s in fresh.get("plan_steps", []):
                                 sid = s.get("id", "")
@@ -4080,21 +4968,47 @@ async def _run_parallel(
                                     new_lines = note_lines[prev_count:]
                                     title = _clean(s.get("title")) or "?"
                                     for nl in new_lines:
-                                        print(f"  {DIM}[{title}]{RESET} {nl}")
+                                        note_text = _format_task_note_for_terminal(nl)
+                                        if not note_text:
+                                            continue
+                                        _print_poll_progress(
+                                            f"  {DIM}[{title}]{RESET} {note_text}"
+                                        )
+                                    _saw_progress_update = True
+                                    _last_observed_activity = _poll_time.monotonic()
                                     _last_heartbeat = (
                                         _poll_time.monotonic() - _start_time
                                     )
                                     _seen_notes[sid] = len(note_lines)
                             # Heartbeat after notes — only if no new notes appeared this cycle
-                            if elapsed - _last_heartbeat >= 30:
+                            _last_observed_activity = max(
+                                _last_observed_activity,
+                                last_headless_activity_at,
+                            )
+                            idle_elapsed = _poll_time.monotonic() - _last_observed_activity
+                            if idle_elapsed >= heartbeat_interval and elapsed - _last_heartbeat >= heartbeat_interval:
                                 mins = int(elapsed // 60)
                                 secs = int(elapsed % 60)
                                 time_str = (
                                     f"{mins}m {secs}s" if mins > 0 else f"{secs}s"
                                 )
-                                print(
-                                    f"  {DIM}⋯ agents still working ({time_str} elapsed){RESET}"
-                                )
+                                if single_task_label:
+                                    activity_text = (
+                                        f"reviewed {len(headless_reviewed_files)} files; no edits yet"
+                                        if headless_reviewed_files and not _saw_progress_update
+                                        else (
+                                            "still working"
+                                            if _saw_progress_update
+                                            else "active; waiting for the first task note or file change"
+                                        )
+                                    )
+                                    print(
+                                        f"  {DIM}[{single_task_label}]{RESET} {activity_text} ({time_str} elapsed)"
+                                    )
+                                else:
+                                    print(
+                                        f"  {DIM}⋯ {agent_label} still working ({time_str} elapsed){RESET}"
+                                    )
                                 _last_heartbeat = elapsed
                         except Exception:
                             pass
@@ -4105,29 +5019,96 @@ async def _run_parallel(
 
             # Stream results as each agent completes
             results: list[AgentResult | Exception] = []
+            stopped_task_ids: set[str] = set()
             completed_count = 0
-            total_agents = len(agent_coros)
-            for coro in asyncio.as_completed(agent_coros):
-                try:
-                    r = await coro
-                    results.append(r)
-                    completed_count += 1
-                    status = (
-                        f"{GREEN}done{RESET}"
-                        if r.exit_code == 0
-                        else f"{RED}blocked{RESET}"
-                    )
-                    dur = f"{r.duration_seconds:.0f}s" if r.duration_seconds else ""
-                    cost = f" ${r.cost_usd:.2f}" if r.cost_usd > 0 else ""
-                    print(
-                        f"  [{completed_count}/{total_agents}] {status}  {r.task_title}{DIM} {dur}{cost}{RESET}"
-                    )
-                except Exception as exc:
-                    results.append(exc)
-                    completed_count += 1
-                    print(
-                        f"  [{completed_count}/{total_agents}] {RED}error{RESET}  {exc}"
-                    )
+            agent_tasks = [asyncio.create_task(c) for c in agent_coros]
+            total_agents = len(agent_tasks)
+            _cancelled = False
+            _cancel_requested = False
+            _sigint_count = 0
+
+            def _handle_sigint():
+                nonlocal _sigint_count, _cancelled, _cancel_requested
+                _sigint_count += 1
+                remaining = total_agents - completed_count
+                if _sigint_count == 1 and remaining == 1:
+                    _cancel_requested = True
+                    _cancelled = True
+                    print(f"\n  {RED}Stopping 1 agent...{RESET}")
+                    for t in agent_tasks:
+                        if not t.done():
+                            t.cancel()
+                elif _sigint_count == 1:
+                    _cancel_requested = True
+                    running_label = "agent" if remaining == 1 else "agents"
+                    print(f"\n  {YELLOW}⚠ {remaining} {running_label} still running.{RESET}")
+                    print(f"  {YELLOW}Press Ctrl+C again to force stop, or wait for agents to finish.{RESET}")
+                else:
+                    _cancelled = True
+                    stopping_label = "agent" if remaining == 1 else "agents"
+                    print(f"\n  {RED}Force stopping {remaining} {stopping_label}...{RESET}")
+                    for t in agent_tasks:
+                        if not t.done():
+                            t.cancel()
+
+            loop = asyncio.get_event_loop()
+            import signal
+            loop.add_signal_handler(signal.SIGINT, _handle_sigint)
+            try:
+                for coro in asyncio.as_completed(agent_tasks):
+                    try:
+                        r = await coro
+                        results.append(r)
+                        completed_count += 1
+                        stopped_by_user = _cancel_requested and r.exit_code == 0
+                        if stopped_by_user:
+                            stopped_task_ids.add(r.task_id)
+                        if _cancelled and not stopped_by_user:
+                            break
+                        if stopped_by_user:
+                            status = f"{YELLOW}stopped{RESET}"
+                        elif r.exit_code == 0:
+                            status = f"{GREEN}done{RESET}"
+                        elif r.failure_kind in {"launch", "usage_limit"}:
+                            status = f"{RED}failed to launch{RESET}"
+                        else:
+                            status = f"{RED}blocked{RESET}"
+                        dur = f"{r.duration_seconds:.0f}s" if r.duration_seconds else ""
+                        cost = f" ${r.cost_usd:.2f}" if r.cost_usd > 0 else ""
+                        summary_line = (
+                            f"  [{completed_count}/{total_agents}] {status}  {r.task_title}{DIM} {dur}{cost}{RESET}"
+                        )
+                        if r.exit_code != 0:
+                            reason = _clean((r.stderr or r.stdout).splitlines()[0])
+                            if reason:
+                                summary_line += f"\n    {DIM}{reason}{RESET}"
+                        print(summary_line)
+                        if r.exit_code != 0 and r.failure_kind == "usage_limit":
+                            _cancelled = True
+                            remaining = total_agents - completed_count
+                            print(
+                                f"  {RED}Stopping remaining agents:{RESET} {r.task_title} failed because the selected agent hit its usage limit."
+                            )
+                            if remaining > 0:
+                                for t in agent_tasks:
+                                    if not t.done():
+                                        t.cancel()
+                                await _cleanup_active_agents()
+                            break
+                    except asyncio.CancelledError:
+                        completed_count += 1
+                        if _cancelled:
+                            break
+                    except Exception as exc:
+                        results.append(exc)
+                        completed_count += 1
+                        print(
+                            f"  [{completed_count}/{total_agents}] {RED}error{RESET}  {exc}"
+                        )
+            finally:
+                loop.remove_signal_handler(signal.SIGINT)
+                if _cancelled:
+                    await _cleanup_active_agents()
 
             _poller_done = True
             poller_task.cancel()
@@ -4136,10 +5117,25 @@ async def _run_parallel(
             except asyncio.CancelledError:
                 pass
 
+        if _cancelled:
+            print(f"\n{YELLOW}Cancelled.{RESET}")
+            return
+
         succeeded = sum(
-            1 for r in results if not isinstance(r, Exception) and r.exit_code == 0
+            1
+            for r in results
+            if not isinstance(r, Exception)
+            and r.exit_code == 0
+            and r.task_id not in stopped_task_ids
         )
-        failed = len(results) - succeeded
+        stopped = sum(
+            1
+            for r in results
+            if not isinstance(r, Exception)
+            and r.exit_code == 0
+            and r.task_id in stopped_task_ids
+        )
+        failed = len(results) - succeeded - stopped
         wave_cost = sum(r.cost_usd for r in results if not isinstance(r, Exception))
         wave_tokens = sum(
             r.tokens_used for r in results if not isinstance(r, Exception)
@@ -4150,9 +5146,11 @@ async def _run_parallel(
             if wave_cost > 0
             else ""
         )
-        print(
-            f"\n{GREEN}{succeeded} succeeded{RESET}, {RED}{failed} failed{RESET}{cost_summary}"
-        )
+        summary_bits = [f"{GREEN}{succeeded} succeeded{RESET}"]
+        if stopped > 0:
+            summary_bits.append(f"{YELLOW}{stopped} stopped{RESET}")
+        summary_bits.append(f"{RED}{failed} failed{RESET}")
+        print(f"\n{', '.join(summary_bits)}{cost_summary}")
 
         # Check for blocked tasks and tell the user exactly what to do
         with make_client(_state.api_url, _state.token) as refresh_client:
@@ -4243,15 +5241,14 @@ def _continue_with_claude(
 
     _ensure_authenticated()
     session_id = f"agent-{_uuid.uuid4().hex[:8]}"
-    if not work_dir:
-        work_dir = (load_auth().get("default_work_dir") or "").strip() or None
-    if work_dir:
-        work_dir = str(Path(work_dir).resolve())
     resolved_plan_id = _current_plan_id(plan_id)
     if not resolved_plan_id:
         raise SystemExit(
             "Execution context or migration ID required. Pass --plan-id <id> or save one with `keshro config set --plan-id <id>`."
         )
+    work_dir, use_local_repo_context = _resolve_continue_work_dir(
+        resolved_plan_id, work_dir, allow_prompt=False
+    )
     plan = _get_plan_or_exit(resolved_plan_id)
 
     # Draft plan warning
@@ -4523,6 +5520,61 @@ def _append_replan_summary(existing_summary: str | None, note: str) -> str:
     if not base:
         return addition
     return f"{base}\n\n{addition}"
+
+
+def _should_use_local_repo_context(
+    plan_id: str | None, work_dir: str | None = None
+) -> bool:
+    if _clean(work_dir):
+        return True
+    cwd = str(Path.cwd().resolve())
+    linked_plan_id, _ = _resolve_repo_linked_plan(cwd)
+    return bool(_clean(linked_plan_id) and _clean(linked_plan_id) == _clean(plan_id))
+
+
+def _resolve_continue_work_dir(
+    plan_id: str | None, work_dir: str | None = None, *, allow_prompt: bool = False
+) -> tuple[str | None, bool]:
+    explicit_work_dir = _clean(work_dir)
+    if explicit_work_dir:
+        resolved = str(Path(explicit_work_dir).resolve())
+        return resolved, True
+
+    saved_work_dir = _clean(load_auth().get("default_work_dir"))
+    if saved_work_dir:
+        resolved = str(Path(saved_work_dir).resolve())
+        saved_repo_root = _discover_repo_root(resolved)
+        if saved_repo_root is not None:
+            linked_plan_id, _ = _resolve_repo_linked_plan(str(saved_repo_root.resolve()))
+            if _clean(linked_plan_id) and _clean(linked_plan_id) == _clean(plan_id):
+                return str(saved_repo_root.resolve()), True
+
+    cwd = str(Path.cwd().resolve())
+    repo_root = _discover_repo_root(cwd)
+    if repo_root is None:
+        return None, False
+
+    resolved_repo_root = str(repo_root.resolve())
+    linked_plan_id, _ = _resolve_repo_linked_plan(resolved_repo_root)
+    if _clean(linked_plan_id) and _clean(linked_plan_id) == _clean(plan_id):
+        return resolved_repo_root, True
+
+    if not allow_prompt or _state.json or not _stdout_is_tty():
+        return None, False
+
+    try:
+        use_current_repo = typer.confirm(
+            "Use the current working directory as execution context for this plan?\n"
+            f"{DIM}Current directory:{RESET} {resolved_repo_root}",
+            default=False,
+        )
+    except click.Abort:
+        print()
+        raise SystemExit(0)
+
+    if use_current_repo:
+        return resolved_repo_root, True
+    return None, False
 
 
 def _delete_task(
@@ -6182,7 +7234,7 @@ def _config_show():
             print(f"{DIM}Current repo project:{RESET} {YELLOW}{repo_plan}{RESET}")
             if repo_plan_url:
                 print(f"{DIM}Project URL:{RESET} {CYAN}{repo_plan_url}{RESET}")
-    if default_plan and plan_id != repo_plan_id and not repo_plan:
+    if default_plan and plan_id != repo_plan_id:
         app_url = _app_url_from_api_url(payload["api_url"])
         default_migration_id = payload.get("default_context_migration_id") or ""
         if default_migration_id:
@@ -6245,6 +7297,9 @@ def _config_set(
     """Set default workspace context."""
     updates: dict = {}
     linked_repo = False
+    context_changed = False
+    resolved_plan_id: str | None = None
+    resolved_plan_title: str | None = None
     if work_dir is not None:
         updates["default_work_dir"] = (
             str(Path(work_dir).resolve()) if work_dir else None
@@ -6261,10 +7316,12 @@ def _config_set(
     if personal:
         updates["default_org_id"] = None
         updates["default_org_name"] = None
+        context_changed = True
     elif org_id is not None or org is not None:
         resolved_id, resolved_name = _resolve_org_context(org_id, org)
         updates["default_org_id"] = resolved_id
         updates["default_org_name"] = resolved_name
+        context_changed = True
     if clear_plan:
         updates["default_plan_id"] = None
         updates["default_plan_title"] = None
@@ -6275,13 +7332,22 @@ def _config_set(
         )
         updates["default_plan_id"] = resolved_plan_id
         updates["default_plan_title"] = resolved_plan_title
-    auth = update_auth(updates)
-    if not clear_plan and plan_id is not None:
-        linked_repo = _link_current_repo_to_plan(
-            auth.get("default_plan_id") or "",
-            plan_title=auth.get("default_plan_title"),
-            work_dir=auth.get("default_work_dir"),
+        effective_work_dir = (
+            str(Path(work_dir).resolve())
+            if work_dir
+            else str(Path.cwd())
         )
+        if _discover_repo_root(effective_work_dir) is not None:
+            linked_repo = _link_current_repo_to_plan(
+            resolved_plan_id or "",
+            plan_title=resolved_plan_title,
+            work_dir=effective_work_dir,
+        )
+            if not linked_repo:
+                raise SystemExit(
+                    "Failed to update the current repo link to the requested execution context. No mismatch was saved."
+                )
+    auth = update_auth(updates)
     payload = {
         "api_url": auth.get("api_url") or DEFAULT_API_URL,
         "default_agent": _clean(auth.get("default_agent")).lower() or "auto",
@@ -6293,8 +7359,9 @@ def _config_set(
     if _state.json:
         print_output(payload, True)
         return
-    org_label = auth.get("default_org_name") or auth.get("default_org_id") or "personal"
-    print(f"Saved default context: {org_label}")
+    if context_changed:
+        org_label = auth.get("default_org_name") or auth.get("default_org_id") or "personal"
+        print(f"Saved default context: {org_label}")
     if api_url is not None:
         print(f"Saved API URL: {auth.get('api_url') or DEFAULT_API_URL}")
     if agent is not None:
@@ -6484,16 +7551,20 @@ def _continue_command(
         bool,
         typer.Option(
             "--visible",
-            help="Open agent sessions in visible Conductor terminal tiles.",
+            help="Run agents in dedicated terminal sessions instead of headless. Intended for direct use from a normal user terminal, not from inside another agent session. Uses Collaborator tiles if installed (recommended: https://github.com/collaborator-ai/collab-public), otherwise opens native Terminal.app windows on macOS.",
         ),
     ] = False,
 ):
-    """Resume execution of a plan. Parallel execution is the default; use --no-parallel for one task at a time."""
+    """Resume execution of a plan."""
 
     if _clean(plan_id) and _clean(migration_id):
         raise SystemExit("Pass either --plan-id or --migration-id, not both.")
 
-    resolved_plan_id = migration_id or plan_id
+    resolved_plan_id = None
+    if _clean(migration_id):
+        resolved_plan_id, _ = _resolve_plan_or_migration_context(migration_id)
+    elif _clean(plan_id):
+        resolved_plan_id, _ = _resolve_plan_or_migration_context(plan_id)
     if not _clean(resolved_plan_id):
         resolved_plan_id = _current_plan_id(None, work_dir=work_dir)
         if resolved_plan_id:
@@ -6504,11 +7575,23 @@ def _continue_command(
     # Parallel is the default everywhere. Use --no-parallel only when you explicitly
     # want a single-task prompt flow.
     use_parallel = not no_parallel
-    resolved_agent = _clean(agent).lower() or _default_agent_preference() or "auto"
+    requested_agent = _clean(agent).lower()
+    resolved_agent = requested_agent or _default_agent_preference() or "auto"
+    if resolved_agent == "auto":
+        inherited_agent = _current_coding_agent_preference()
+        if inherited_agent:
+            resolved_agent = inherited_agent
     if resolved_agent not in {"auto", "claude", "codex"}:
         raise SystemExit(
             "Unsupported agent. Use --agent auto, --agent claude, or --agent codex."
         )
+    if visible and _inside_coding_agent():
+        visible = False
+        if not _state.json:
+            agent_name = _coding_agent_name() or "coding agent"
+            print(
+                f"{YELLOW}--visible is only supported from a direct user terminal; ignoring it inside {agent_name} and continuing headless.{RESET}"
+            )
     if not use_parallel:
         _continue_with_claude(
             resolved_plan_id,
@@ -6557,9 +7640,7 @@ def _install_claude_integration() -> Path:
     skill_dir.mkdir(parents=True, exist_ok=True)
     target = skill_dir / "SKILL.md"
     was_regular_file = target.exists() and not target.is_symlink()
-    was_stale_symlink = (
-        target.is_symlink() and target.resolve() != _SKILL_FILE.resolve()
-    )
+    was_stale_symlink = target.is_symlink() and not _paths_match(target, _SKILL_FILE)
     if target.is_symlink() or target.exists():
         target.unlink()
     try:
@@ -6573,14 +7654,18 @@ def _install_claude_integration() -> Path:
     if legacy.is_symlink() or legacy.exists():
         legacy.unlink()
     if was_regular_file or was_stale_symlink:
-        print(
-            f"  Updated agent skill to v{__version__} (future updates are automatic)",
-            file=sys.stderr,
-        )
+        print(f"  Updated agent skill to v{__version__}", file=sys.stderr)
     return target
 
 
 _CODEX_MARKER_BASE = "<!-- keshro-agent-instructions"
+
+
+def _paths_match(left: Path, right: Path) -> bool:
+    try:
+        return left.samefile(right)
+    except OSError:
+        return False
 
 
 def _codex_versioned_marker() -> str:
@@ -6611,6 +7696,8 @@ def _install_codex_integration() -> Path:
 
 def _maybe_refresh_codex() -> None:
     """Refresh Codex AGENTS.md if the embedded keshro version is stale."""
+    if _clean(os.environ.get("KESHRO_SUPPRESS_AGENT_SKILL_BANNER")):
+        return
     target = CODEX_HOME_DIR / "AGENTS.md"
     if not target.exists():
         return
@@ -6627,6 +7714,8 @@ def _maybe_refresh_codex() -> None:
 
 def _maybe_refresh_claude() -> None:
     """Upgrade Claude Code skill if stale, wrong location, or wrong symlink."""
+    if _clean(os.environ.get("KESHRO_SUPPRESS_AGENT_SKILL_BANNER")):
+        return
     try:
         skill_target = CLAUDE_SKILLS_DIR / "keshro" / "SKILL.md"
         legacy_target = CLAUDE_COMMANDS_DIR / "keshro.md"
@@ -6638,7 +7727,7 @@ def _maybe_refresh_claude() -> None:
             return
         elif (
             skill_target.is_symlink()
-            and skill_target.resolve() != _SKILL_FILE.resolve()
+            and not _paths_match(skill_target, _SKILL_FILE)
         ):
             needs_update = True
         elif not skill_target.is_symlink():
@@ -6946,6 +8035,7 @@ def _print_plan_status(plan: dict) -> None:
     path_label = f"{source} → {target}" if source and target else ""
     steps = sorted(plan.get("plan_steps") or [], key=lambda s: s.get("order", 0))
     events = plan.get("task_feedback_events") or []
+    agent_sessions = plan.get("agent_sessions") or []
 
     done = [s for s in steps if _clean(s.get("status")).lower() == "completed"]
     in_progress = [s for s in steps if _clean(s.get("status")).lower() == "in_progress"]
@@ -6985,19 +8075,78 @@ def _print_plan_status(plan: dict) -> None:
         ):
             task_latest_event[tid] = event
 
+    task_latest_session: dict[str, dict] = {}
+    for session in agent_sessions:
+        tid = _clean(session.get("task_id"))
+        if not tid:
+            continue
+        existing = task_latest_session.get(tid)
+        session_time = (
+            _clean(session.get("last_heartbeat_at"))
+            or _clean(session.get("updated_at"))
+            or _clean(session.get("created_at"))
+        )
+        existing_time = (
+            _clean((existing or {}).get("last_heartbeat_at"))
+            or _clean((existing or {}).get("updated_at"))
+            or _clean((existing or {}).get("created_at"))
+        )
+        if not existing or session_time > existing_time:
+            task_latest_session[tid] = session
+
     now = datetime.now(timezone.utc)
+    detail_width = max(
+        40, shutil.get_terminal_size(fallback=(100, 24)).columns - 8
+    )
 
     for step in steps:
+        step_id = _clean(step.get("id"))
+        latest = task_latest_event.get(step_id)
+        latest_session = task_latest_session.get(step_id)
+        session_status = _clean((latest_session or {}).get("status")).lower()
         status = _clean(step.get("status") or "todo").lower()
+        if session_status in {
+            "running",
+            "starting",
+            "in_progress",
+            "active",
+        }:
+            status = "in_progress"
         icon = STATUS_ICON.get(status, "?")
         order = step.get("order", 0)
         step_title = _clean(step.get("title")) or "Untitled"
-        step_id = step.get("id") or ""
 
         # Build right-side info
         info_parts: list[str] = []
-        latest = task_latest_event.get(step_id)
-        if latest:
+        if latest_session:
+            source_label = _clean(latest_session.get("source")) or "agent"
+            if source_label:
+                info_parts.append(source_label)
+            session_time = (
+                _clean(latest_session.get("last_heartbeat_at"))
+                or _clean(latest_session.get("updated_at"))
+                or _clean(latest_session.get("created_at"))
+            )
+            if session_time:
+                try:
+                    event_time = datetime.fromisoformat(
+                        session_time.replace("Z", "+00:00")
+                    )
+                    delta = now - event_time
+                    if delta.days > 0:
+                        info_parts.append(f"{delta.days}d ago")
+                    elif delta.seconds > 3600:
+                        info_parts.append(f"{delta.seconds // 3600}h ago")
+                    elif delta.seconds > 60:
+                        info_parts.append(f"{delta.seconds // 60}m ago")
+                    else:
+                        info_parts.append("just now")
+                except Exception:
+                    pass
+            phase = _clean(latest_session.get("current_phase"))
+            if phase and phase not in {"running", "starting"}:
+                info_parts.append(phase)
+        elif latest:
             source_label = latest.get("source") or ""
             if source_label:
                 info_parts.append(source_label)
@@ -7017,11 +8166,18 @@ def _print_plan_status(plan: dict) -> None:
                 except Exception:
                     pass
 
-        if status == "in_progress" and latest:
-            created = latest.get("created_at") or ""
-            if created:
+        if status == "in_progress":
+            active_time = (
+                _clean((latest_session or {}).get("last_heartbeat_at"))
+                or _clean((latest_session or {}).get("updated_at"))
+                or _clean((latest_session or {}).get("created_at"))
+                or _clean((latest or {}).get("created_at"))
+            )
+            if active_time:
                 try:
-                    event_time = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                    event_time = datetime.fromisoformat(
+                        active_time.replace("Z", "+00:00")
+                    )
                     elapsed = now - event_time
                     if elapsed.seconds > 60:
                         info_parts.append(f"({elapsed.seconds // 60}m)")
@@ -7031,10 +8187,24 @@ def _print_plan_status(plan: dict) -> None:
         if status == "blocked":
             reason = _clean(step.get("blocked_reason"))
             if reason:
-                info_parts.append(reason[:50])
+                info_parts.append(reason)
 
-        info = f" {DIM}· {' · '.join(info_parts)}{RESET}" if info_parts else ""
-        print(f"  {icon} {order}. {step_title}{info}")
+        task_id_label = (
+            f" {DIM}(task-id: {step_id}){RESET}" if step_id else ""
+        )
+        print(f"  {icon} {order}. {step_title}{task_id_label}")
+        if info_parts:
+            details = " · ".join(part for part in info_parts if part)
+            for line in _format_full_value_lines(details, width=detail_width):
+                print(f"    {DIM}{line}{RESET}")
+        if status == "in_progress":
+            notes = _clean(step.get("notes"))
+            if notes:
+                note_lines = [line.strip() for line in notes.splitlines() if line.strip()]
+                if note_lines:
+                    latest_note = note_lines[-1]
+                    for line in _format_full_value_lines(latest_note, width=detail_width):
+                        print(f"    {DIM}{line}{RESET}")
 
     # Footer
     print()
@@ -8020,6 +9190,23 @@ def _do_task_unblock(
     )
 
 
+def _do_task_reopen(
+    plan_id: str | None,
+    task_id: str,
+    notes: str | None = None,
+    feedback_reason: str | None = None,
+    status: str = "todo",
+):
+    _do_task_update(
+        plan_id,
+        task_id,
+        status=status,
+        notes=_build_appended_task_notes(plan_id, task_id, notes),
+        blocked_reason="",
+        feedback_reason=feedback_reason,
+    )
+
+
 # Shared option definitions for task commands
 _task_add_options = dict(
     title=typer.Option(..., "--title", "-t", help="Task title."),
@@ -8526,6 +9713,56 @@ def _task_unblock(
         resolved_plan_id = plan_id_or_task_id
         resolved_task_id = task_id
     _do_task_unblock(
+        resolved_plan_id,
+        resolved_task_id,
+        notes=notes,
+        feedback_reason=feedback_reason,
+        status=status,
+    )
+
+
+@task_app.command("reopen")
+def _task_reopen(
+    plan_id_or_task_id: Annotated[
+        str, typer.Argument(help="Plan ID, or Task ID if a default plan is saved.")
+    ],
+    task_id: Annotated[
+        Optional[str],
+        typer.Argument(help="Task ID. Optional when a default plan is saved."),
+    ] = None,
+    plan_id_option: Annotated[
+        Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
+    ] = None,
+    notes: Annotated[
+        Optional[str],
+        typer.Option(
+            "--notes", "-n", help="Short note about why the task is being reopened."
+        ),
+    ] = None,
+    status: Annotated[
+        str,
+        typer.Option(
+            "--status", "-s", help="Status to use after reopening (defaults to todo)."
+        ),
+    ] = "todo",
+    feedback_reason: Annotated[
+        Optional[str],
+        typer.Option("--reason", help="Why the task is being reopened now."),
+    ] = None,
+):
+    """Move a task out of completed state so it can be worked again."""
+    resolved_plan_id: str | None
+    resolved_task_id: str
+    if plan_id_option:
+        resolved_plan_id = plan_id_option
+        resolved_task_id = task_id or plan_id_or_task_id
+    elif task_id is None:
+        resolved_plan_id = _require_plan_context(None)
+        resolved_task_id = plan_id_or_task_id
+    else:
+        resolved_plan_id = plan_id_or_task_id
+        resolved_task_id = task_id
+    _do_task_reopen(
         resolved_plan_id,
         resolved_task_id,
         notes=notes,
@@ -9469,6 +10706,9 @@ def main(argv: list[str] | None = None):
         try:
             app(argv, standalone_mode=False)
             return 0
+        except click.ClickException as exc:
+            exc.show(file=sys.stderr)
+            return exc.exit_code
         except SystemExit as exc:
             if isinstance(exc.code, str):
                 print(f"{RED}{exc.code}{RESET}", file=sys.stderr)
