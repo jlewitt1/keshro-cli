@@ -178,6 +178,15 @@ def _default_agent_preference() -> str:
     return value if value in {"auto", "claude", "codex"} else "auto"
 
 
+def _current_coding_agent_preference() -> str | None:
+    agent_name = (_coding_agent_name() or "").lower()
+    if "claude" in agent_name:
+        return "claude"
+    if "codex" in agent_name:
+        return "codex"
+    return None
+
+
 def _parse_timestamp(value: str | None) -> datetime | None:
     raw = _clean(value)
     if not raw:
@@ -2897,21 +2906,92 @@ async def _git_stdout(*args: str, cwd: str) -> str:
 
 
 async def _git_changed_files(cwd: str, max_files: int = 25) -> list[str]:
-    try:
-        status = await _git_stdout(
-            "git",
-            "status",
-            "--porcelain",
-            "--untracked-files=all",
-            cwd=cwd,
-        )
-    except Exception:
-        return []
-    return _parse_git_status_changed_files(status)[:max_files]
+    files: list[str] = []
+    seen: set[str] = set()
+
+    async def _collect(*args: str) -> None:
+        try:
+            output = await _git_stdout(*args, cwd=cwd)
+        except Exception:
+            return
+        for raw_line in output.splitlines():
+            candidate = raw_line.strip().strip('"')
+            if not candidate or candidate in seen:
+                continue
+            files.append(candidate)
+            seen.add(candidate)
+
+    await _collect("git", "diff", "--name-only", "HEAD", "--")
+    await _collect("git", "ls-files", "--others", "--exclude-standard")
+    return files[:max_files]
 
 
 async def _collect_git_changed_files(cwd: str) -> list[str]:
     return await _git_changed_files(cwd)
+
+
+def _classify_file_edit_from_diff(cwd: str, path: str) -> str:
+    try:
+        proc = subprocess.run(
+            ["git", "diff", "--unified=0", "--", path],
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+            check=False,
+        )
+        diff_text = proc.stdout or ""
+    except Exception:
+        return f"editing {path}"
+    added_lines = [
+        line[1:].strip()
+        for line in diff_text.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    ]
+    changed_lines = [
+        line[1:].strip()
+        for line in diff_text.splitlines()
+        if (line.startswith("+") or line.startswith("-"))
+        and not line.startswith("+++")
+        and not line.startswith("---")
+    ]
+    lowered = "\n".join(added_lines).lower()
+    if not changed_lines:
+        return f"editing {path}"
+
+    nonempty_changed = [line for line in changed_lines if line]
+    if nonempty_changed and all(
+        line.startswith(("import ", "from ")) for line in nonempty_changed
+    ):
+        return f"updating imports in {path}"
+
+    config_tokens = (
+        "=",
+        ":",
+        "config",
+        "setting",
+        "option",
+        "param",
+        "env",
+        "variable",
+        "timeout",
+        "path",
+    )
+    if any(token in lowered for token in config_tokens):
+        return f"updating configuration in {path}"
+    return f"editing {path}"
+
+
+async def _summarize_file_edits(cwd: str, changed_files: list[str], max_files: int = 2) -> str:
+    if not changed_files:
+        return ""
+    summaries: list[str] = []
+    for path in changed_files[:max_files]:
+        summaries.append(await asyncio.to_thread(_classify_file_edit_from_diff, cwd, path))
+    if not summaries:
+        return ""
+    if len(changed_files) > max_files:
+        summaries.append(f"and {len(changed_files) - max_files} more file(s)")
+    return "; ".join(summaries)
 
 
 async def _post_agent_heartbeat_async(
@@ -3212,6 +3292,77 @@ def _usage_limit_error_from_text(text: str) -> str | None:
     return None
 
 
+def _should_ignore_agent_output_line(text: str) -> bool:
+    lowered = _clean(text).lower()
+    if not lowered:
+        return True
+    ignored_prefixes = (
+        "openai codex v",
+        "anthropic claude",
+        "workdir:",
+        "model:",
+        "provider:",
+        "approval:",
+        "sandbox:",
+        "reasoning effort:",
+        "reasoning summaries:",
+        "session id:",
+    )
+    if lowered in {"--------", "user", "mcp startup: no servers"}:
+        return True
+    return lowered.startswith(ignored_prefixes)
+
+
+def _summarize_agent_command_activity(text: str) -> str | None:
+    cleaned = _clean(text)
+    if not cleaned:
+        return None
+    lowered = cleaned.lower()
+    if (
+        " in " not in cleaned
+        or (" succeeded in " not in lowered and " exited " not in lowered)
+    ):
+        return None
+
+    command_text = cleaned
+    if " -lc " in cleaned:
+        command_text = cleaned.split(" -lc ", 1)[1].strip()
+    elif cleaned.startswith("exec "):
+        command_text = cleaned[5:].strip()
+
+    if len(command_text) >= 2 and command_text[0] == command_text[-1] and command_text[0] in {"'", '"'}:
+        command_text = command_text[1:-1]
+
+    file_matches = []
+    seen_paths: set[str] = set()
+    for match in re.findall(
+        r"([A-Za-z0-9_./-]+\.(?:py|tf|tfvars|json|ya?ml|md|txt|sh))",
+        command_text,
+    ):
+        if match not in seen_paths:
+            file_matches.append(match)
+            seen_paths.add(match)
+
+    def _format_paths(prefix: str) -> str:
+        if not file_matches:
+            return ""
+        shown = file_matches[:3]
+        suffix = ", ..." if len(file_matches) > 3 else ""
+        return f"{prefix} {', '.join(shown)}{suffix}"
+
+    if "sed -n" in command_text or "cat " in command_text:
+        return _format_paths("reading") or None
+    if "ls -l" in command_text or command_text.startswith("ls "):
+        return _format_paths("checking") or None
+    if "rg -n" in command_text and file_matches:
+        return _format_paths("searching") or None
+    if "python -m py_compile" in command_text or "python3 -m py_compile" in command_text:
+        return _format_paths("validating") or None
+    if "pytest" in command_text:
+        return _format_paths("testing") or None
+    return None
+
+
 # Registry of active agent subprocesses and terminal windows for Ctrl+C cleanup
 _active_agent_procs: set[asyncio.subprocess.Process] = set()
 _active_terminal_titles: set[str] = set()
@@ -3445,7 +3596,7 @@ async def _launch_single_agent(
     visible: bool = False,
     launch_index: int = 0,
 ) -> AgentResult:
-    global _active_terminal_titles, _active_temp_files, _active_terminal_pid_files
+    global _active_agent_procs, _active_terminal_titles, _active_temp_files, _active_terminal_pid_files
     task_id = _clean(task.get("id")) or "unknown"
     task_title = _clean(task.get("title")) or "Untitled"
     task_order = task.get("order")
@@ -3581,6 +3732,45 @@ async def _launch_single_agent(
         model_name = ""
         live_retry_note = ""
         live_retry_count = 0
+        last_headless_progress = ""
+        last_headless_command_summary = ""
+        last_headless_changed_files: tuple[str, ...] = ()
+        last_headless_activity_at = time.monotonic()
+        headless_reviewed_files: set[str] = set()
+        headless_spinner_enabled = (
+            not visible and total_agents == 1 and not _state.json and _stdout_is_tty()
+        )
+        headless_spinner_active = False
+        headless_spinner_task: asyncio.Task | None = None
+
+        def _clear_headless_spinner_line() -> None:
+            if not headless_spinner_enabled:
+                return
+            width = shutil.get_terminal_size(fallback=(100, 24)).columns
+            print("\r" + (" " * max(20, width - 1)) + "\r", end="", flush=True)
+
+        async def _headless_spinner_loop() -> None:
+            frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+            index = 0
+            try:
+                while headless_spinner_active:
+                    elapsed = int(time.monotonic() - overall_start)
+                    width = shutil.get_terminal_size(fallback=(100, 24)).columns
+                    label = f"  {DIM}[{task_title}]{RESET} {CYAN}{frames[index % len(frames)]}{RESET} working ({elapsed}s)"
+                    clipped = label
+                    if len(clipped) >= width:
+                        clipped = clipped[: max(1, width - 1)]
+                    print("\r" + clipped, end="", flush=True)
+                    index += 1
+                    await asyncio.sleep(0.12)
+            except asyncio.CancelledError:
+                pass
+            finally:
+                _clear_headless_spinner_line()
+
+        def _print_headless_progress(message: str) -> None:
+            _clear_headless_spinner_line()
+            print(f"  {DIM}[{task_title}]{RESET} {message}")
 
         # Report start with session ID via agent API (also sets status to in_progress)
         try:
@@ -3597,34 +3787,51 @@ async def _launch_single_agent(
             )
         except Exception:
             await _mark_task_status_async(api_client, plan_id, task_id, "in_progress")
+        if not visible and headless_spinner_enabled:
+            headless_spinner_active = True
+            headless_spinner_task = asyncio.create_task(_headless_spinner_loop())
 
         async def _heartbeat_loop() -> None:
+            nonlocal last_headless_progress, last_headless_changed_files, last_headless_activity_at
             try:
                 while heartbeat_active:
                     try:
-                        latest_error = _clean(
-                            latest_stderr_lines[-1] if latest_stderr_lines else ""
-                        )
-                        latest_output = _clean(
-                            latest_stdout_lines[-1] if latest_stdout_lines else ""
-                        )
                         changed_files = await _git_changed_files(exec_dir)
-                        if latest_error:
-                            current_phase = "error"
-                            progress_message = latest_error
-                        elif changed_files:
+                        if changed_files:
                             current_phase = "editing"
-                            progress_message = (
+                            changed_signature = tuple(changed_files[:3])
+                            if changed_signature != last_headless_changed_files:
+                                edit_summary = await _summarize_file_edits(
+                                    exec_dir, changed_files
+                                )
+                            else:
+                                edit_summary = ""
+                            progress_message = edit_summary or (
                                 f"Editing {', '.join(changed_files[:3])}"
-                                if changed_files
-                                else "Editing files"
                             )
+                            headless_progress = progress_message
                         elif launched_in_terminal:
                             current_phase = "visible_terminal"
                             progress_message = "Running in a visible Collaborator terminal"
+                            headless_progress = ""
+                            changed_signature = ()
                         else:
                             current_phase = "running"
-                            progress_message = latest_output or "Agent running"
+                            progress_message = "Agent running"
+                            headless_progress = ""
+                            changed_signature = ()
+                        if (
+                            not visible
+                            and headless_progress
+                            and (
+                                headless_progress != last_headless_progress
+                                or changed_signature != last_headless_changed_files
+                            )
+                        ):
+                            _print_headless_progress(headless_progress)
+                            last_headless_progress = headless_progress
+                            last_headless_changed_files = changed_signature
+                            last_headless_activity_at = time.monotonic()
                         await _post_agent_heartbeat_async(
                             api_client,
                             plan_id,
@@ -3649,6 +3856,7 @@ async def _launch_single_agent(
             latest_lines: list[str],
             chunks: list[str],
         ) -> None:
+            nonlocal last_headless_command_summary, last_headless_progress, last_headless_activity_at
             if stream is None:
                 return
             while True:
@@ -3661,6 +3869,24 @@ async def _launch_single_agent(
                 if cleaned:
                     latest_lines.append(cleaned)
                     del latest_lines[:-20]
+                    if visible or _should_ignore_agent_output_line(cleaned):
+                        continue
+                    for match in re.findall(
+                        r"([A-Za-z0-9_./-]+\.(?:py|tf|tfvars|json|ya?ml|md|txt|sh))",
+                        cleaned,
+                    ):
+                        headless_reviewed_files.add(match)
+                    summary = _summarize_agent_command_activity(cleaned)
+                    if summary in {
+                        "switching git branch",
+                        "creating checkpoint commit",
+                    }:
+                        continue
+                    if summary and summary != last_headless_command_summary:
+                        _print_headless_progress(summary)
+                        last_headless_command_summary = summary
+                        last_headless_progress = summary
+                        last_headless_activity_at = time.monotonic()
 
         while True:
             prompt = (
@@ -4482,8 +4708,10 @@ async def _run_parallel(
             print(f"\n{DIM}Dry run — no agents launched.{RESET}")
             break
 
+        agent_count = len(actionable)
+        agent_label = "agent" if agent_count == 1 else "agents"
         print(
-            f"\nLaunching {len(actionable)} agent(s) (max concurrency: {max_concurrency})...\n"
+            f"\nLaunching {agent_count} {agent_label} (max concurrency: {max_concurrency})...\n"
         )
         if wave == 1:
             print(
@@ -4507,6 +4735,9 @@ async def _run_parallel(
 
         semaphore = asyncio.Semaphore(max_concurrency)
         async with make_async_client(_state.api_url, _state.token) as api_client:
+            single_task_label = (
+                _clean(actionable[0].get("title")) if len(actionable) == 1 else ""
+            )
             agent_coros = [
                 _launch_single_agent(
                     task,
@@ -4546,14 +4777,23 @@ async def _run_parallel(
                 _start_time = _poll_time.monotonic()
                 _last_heartbeat = 0  # seconds since last heartbeat message
                 _seen_sessions: dict[str, tuple] = {}
+                _saw_progress_update = False
+                _last_observed_activity = _start_time
                 _POLL_INTERVAL_SECONDS = 3
-                _HEARTBEAT_INTERVAL_SECONDS = 10
+                _SINGLE_TASK_HEARTBEAT_INTERVAL_SECONDS = 45
+                _MULTI_TASK_HEARTBEAT_INTERVAL_SECONDS = 10
                 try:
                     while not _poller_done:
                         await asyncio.sleep(_POLL_INTERVAL_SECONDS)
                         if _poller_done:
                             break
                         elapsed = _poll_time.monotonic() - _start_time
+                        idle_elapsed = _poll_time.monotonic() - _last_observed_activity
+                        heartbeat_interval = (
+                            _SINGLE_TASK_HEARTBEAT_INTERVAL_SECONDS
+                            if single_task_label
+                            else _MULTI_TASK_HEARTBEAT_INTERVAL_SECONDS
+                        )
                         try:
                             async with make_async_client(
                                 _state.api_url, _state.token
@@ -4563,15 +4803,29 @@ async def _run_parallel(
                                 )
                             if not resp.is_success:
                                 # Heartbeat even if poll fails
-                                if elapsed - _last_heartbeat >= _HEARTBEAT_INTERVAL_SECONDS:
+                                if idle_elapsed >= heartbeat_interval and elapsed - _last_heartbeat >= heartbeat_interval:
                                     mins = int(elapsed // 60)
                                     secs = int(elapsed % 60)
                                     time_str = (
                                         f"{mins}m {secs}s" if mins > 0 else f"{secs}s"
                                     )
-                                    print(
-                                        f"  {DIM}⋯ agents still working ({time_str} elapsed){RESET}"
-                                    )
+                                    if single_task_label:
+                                        activity_text = (
+                                            f"reviewed {len(headless_reviewed_files)} files; no edits yet"
+                                            if headless_reviewed_files and not _saw_progress_update
+                                            else (
+                                                f"still working"
+                                                if _saw_progress_update
+                                                else "active; waiting for the first task note or file change"
+                                            )
+                                        )
+                                        print(
+                                            f"  {DIM}[{single_task_label}]{RESET} {activity_text} ({time_str} elapsed)"
+                                        )
+                                    else:
+                                        print(
+                                            f"  {DIM}⋯ {agent_label} still working ({time_str} elapsed){RESET}"
+                                        )
                                     _last_heartbeat = elapsed
                                 continue
                             fresh = resp.json()
@@ -4594,6 +4848,8 @@ async def _run_parallel(
                                 latest_error = _clean(
                                     recent_errors[-1] if recent_errors else ""
                                 )
+                                if _should_ignore_agent_output_line(latest_error):
+                                    latest_error = ""
                                 signature = (
                                     status,
                                     phase,
@@ -4621,13 +4877,18 @@ async def _run_parallel(
                                     details.append(
                                         f"conflicts: {', '.join(conflicting_files)}"
                                     )
-                                if latest_error:
+                                if latest_error and (
+                                    status in {"error", "failed", "blocked", "failed_to_launch"}
+                                    or phase == "error"
+                                ):
                                     details.append(f"error: {latest_error}")
                                 if not details:
                                     details.append(status or "running")
                                 print(
                                     f"  {DIM}[{label} · {session_id}]{RESET} {' | '.join(details)}"
                                 )
+                                _saw_progress_update = True
+                                _last_observed_activity = _poll_time.monotonic()
                                 _last_heartbeat = _poll_time.monotonic() - _start_time
                             for s in fresh.get("plan_steps", []):
                                 sid = s.get("id", "")
@@ -4648,20 +4909,41 @@ async def _run_parallel(
                                     title = _clean(s.get("title")) or "?"
                                     for nl in new_lines:
                                         print(f"  {DIM}[{title}]{RESET} {nl}")
+                                    _saw_progress_update = True
+                                    _last_observed_activity = _poll_time.monotonic()
                                     _last_heartbeat = (
                                         _poll_time.monotonic() - _start_time
                                     )
                                     _seen_notes[sid] = len(note_lines)
                             # Heartbeat after notes — only if no new notes appeared this cycle
-                            if elapsed - _last_heartbeat >= _HEARTBEAT_INTERVAL_SECONDS:
+                            _last_observed_activity = max(
+                                _last_observed_activity,
+                                last_headless_activity_at,
+                            )
+                            idle_elapsed = _poll_time.monotonic() - _last_observed_activity
+                            if idle_elapsed >= heartbeat_interval and elapsed - _last_heartbeat >= heartbeat_interval:
                                 mins = int(elapsed // 60)
                                 secs = int(elapsed % 60)
                                 time_str = (
                                     f"{mins}m {secs}s" if mins > 0 else f"{secs}s"
                                 )
-                                print(
-                                    f"  {DIM}⋯ agents still working ({time_str} elapsed){RESET}"
-                                )
+                                if single_task_label:
+                                    activity_text = (
+                                        f"reviewed {len(headless_reviewed_files)} files; no edits yet"
+                                        if headless_reviewed_files and not _saw_progress_update
+                                        else (
+                                            "still working"
+                                            if _saw_progress_update
+                                            else "active; waiting for the first task note or file change"
+                                        )
+                                    )
+                                    print(
+                                        f"  {DIM}[{single_task_label}]{RESET} {activity_text} ({time_str} elapsed)"
+                                    )
+                                else:
+                                    print(
+                                        f"  {DIM}⋯ {agent_label} still working ({time_str} elapsed){RESET}"
+                                    )
                                 _last_heartbeat = elapsed
                         except Exception:
                             pass
@@ -4683,11 +4965,13 @@ async def _run_parallel(
                 _sigint_count += 1
                 remaining = total_agents - completed_count
                 if _sigint_count == 1:
-                    print(f"\n  {YELLOW}⚠ {remaining} agent(s) still running.{RESET}")
+                    running_label = "agent" if remaining == 1 else "agents"
+                    print(f"\n  {YELLOW}⚠ {remaining} {running_label} still running.{RESET}")
                     print(f"  {YELLOW}Press Ctrl+C again to force stop, or wait for agents to finish.{RESET}")
                 else:
                     _cancelled = True
-                    print(f"\n  {RED}Force stopping {remaining} agent(s)...{RESET}")
+                    stopping_label = "agent" if remaining == 1 else "agents"
+                    print(f"\n  {RED}Force stopping {remaining} {stopping_label}...{RESET}")
                     for t in agent_tasks:
                         if not t.done():
                             t.cancel()
@@ -7129,7 +7413,11 @@ def _continue_command(
     if _clean(plan_id) and _clean(migration_id):
         raise SystemExit("Pass either --plan-id or --migration-id, not both.")
 
-    resolved_plan_id = migration_id or plan_id
+    resolved_plan_id = None
+    if _clean(migration_id):
+        resolved_plan_id, _ = _resolve_plan_or_migration_context(migration_id)
+    elif _clean(plan_id):
+        resolved_plan_id, _ = _resolve_plan_or_migration_context(plan_id)
     if not _clean(resolved_plan_id):
         resolved_plan_id = _current_plan_id(None, work_dir=work_dir)
         if resolved_plan_id:
@@ -7140,7 +7428,12 @@ def _continue_command(
     # Parallel is the default everywhere. Use --no-parallel only when you explicitly
     # want a single-task prompt flow.
     use_parallel = not no_parallel
-    resolved_agent = _clean(agent).lower() or _default_agent_preference() or "auto"
+    requested_agent = _clean(agent).lower()
+    resolved_agent = requested_agent or _default_agent_preference() or "auto"
+    if resolved_agent == "auto":
+        inherited_agent = _current_coding_agent_preference()
+        if inherited_agent:
+            resolved_agent = inherited_agent
     if resolved_agent not in {"auto", "claude", "codex"}:
         raise SystemExit(
             "Unsupported agent. Use --agent auto, --agent claude, or --agent codex."
