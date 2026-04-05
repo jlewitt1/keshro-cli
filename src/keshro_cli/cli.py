@@ -884,6 +884,15 @@ def _truncate_text(value: str, limit: int = 110) -> str:
     return text[: limit - 1].rstrip() + "…"
 
 
+_TASK_NOTE_TIMESTAMP_PREFIX_RE = re.compile(
+    r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\]\s*"
+)
+
+
+def _format_task_note_for_terminal(value: str) -> str:
+    return _TASK_NOTE_TIMESTAMP_PREFIX_RE.sub("", _clean(value))
+
+
 def _extract_source_titles(source: dict, limit: int = 3) -> list[str]:
     titles: list[str] = []
     for item in source.get("sources") or []:
@@ -2413,6 +2422,7 @@ def _build_continue_prompt(
     plan: dict,
     task: dict,
     work_dir: str | None = None,
+    use_local_repo_context: bool = True,
     auto_continue: bool = False,
     session_id: str = "",
 ) -> str:
@@ -2503,7 +2513,7 @@ def _build_continue_prompt(
         history_lines.append("")
 
     # Git state since last checkpoint
-    git_state = _get_git_state_summary(work_dir)
+    git_state = _get_git_state_summary(work_dir) if use_local_repo_context else ""
     git_lines: list[str] = []
     if git_state:
         git_lines.append(git_state)
@@ -2525,7 +2535,7 @@ def _build_continue_prompt(
         task_block.append(f"Notes: {notes}")
     if artifacts:
         task_block.append(f"Artifacts: {', '.join(artifacts)}")
-    if work_dir:
+    if use_local_repo_context and work_dir:
         task_block.append(f"Project directory: {work_dir}")
     depends_on = task.get("depends_on") or []
     if depends_on:
@@ -2599,7 +2609,11 @@ def _build_continue_prompt(
         "- This task is already marked in progress by the launcher. Do not run `keshro task start` again.",
         f'- Before starting work, create a git checkpoint so changes can be rolled back if needed: `git add -A && git commit -m "keshro: checkpoint before {task_title}" --allow-empty`',
         "- Before writing code, briefly say what this task involves and which files you expect to touch.",
-        "- Read existing files relevant to this task to understand the current state before making changes.",
+        (
+            "- Read existing files relevant to this task to understand the current state before making changes."
+            if use_local_repo_context
+            else "- Start from the plan and task context first. Do not inspect the local working directory unless the task clearly requires repo-specific changes."
+        ),
         "- If this task is blocked, do not automatically move to the next task unless the plan clearly supports parallel or out-of-order work.",
         "- If you continue execution, keep Keshro updated as you work.",
         "- Before marking a task done, verify your changes: run linters, check syntax, or run relevant tests if they exist. Record the validation result in your completion note under `Verification:`.",
@@ -2652,11 +2666,19 @@ def _task_title_slug(title: str) -> str:
 
 
 def _build_parallel_prompt(
-    plan: dict, task: dict, total_agents: int, work_dir: str | None = None
+    plan: dict,
+    task: dict,
+    total_agents: int,
+    work_dir: str | None = None,
+    use_local_repo_context: bool = True,
 ) -> str:
     """Build a prompt for an unattended parallel agent working on a single task."""
     base_prompt = _build_continue_prompt(
-        plan, task, work_dir=work_dir, auto_continue=False
+        plan,
+        task,
+        work_dir=work_dir,
+        use_local_repo_context=use_local_repo_context,
+        auto_continue=False,
     )
     resolved_plan_id = _clean(plan.get("id")) or "<plan-id>"
     task_id = _clean(task.get("id")) or "<task-id>"
@@ -2713,7 +2735,11 @@ def _build_parallel_prompt(
 
 
 def _build_visible_parallel_prompt(
-    plan: dict, task: dict, total_agents: int, work_dir: str | None = None
+    plan: dict,
+    task: dict,
+    total_agents: int,
+    work_dir: str | None = None,
+    use_local_repo_context: bool = True,
 ) -> str:
     """Build a compact prompt for visible terminal sessions."""
     task_id = _clean(task.get("id")) or "<task-id>"
@@ -2731,7 +2757,7 @@ def _build_visible_parallel_prompt(
         f"Status: {task_status}",
         f"Description: {task_description}",
     ]
-    if work_dir:
+    if use_local_repo_context and work_dir:
         parts.append(f"Project directory: {work_dir}")
     if related_files:
         parts.append(f"Related files: {', '.join(related_files[:8])}")
@@ -2754,6 +2780,11 @@ def _build_visible_parallel_prompt(
             f"- Use branch `{branch_name}`.",
             "- The launcher already marked this task in progress. Do not run `keshro task start`.",
             "- Create a checkpoint commit before editing.",
+            (
+                "- Start from the plan and task context first. Do not inspect the local working directory unless the task clearly requires repo-specific changes."
+                if not use_local_repo_context
+                else "- Read local files when they are relevant to the task before making changes."
+            ),
             "- Keep terminal output minimal. Do not print command output, file listings, diffs, or long explanations unless needed for a blocker or verification.",
             "- Use the active Keshro context already selected in this repo.",
             f'- Record progress with `keshro task note {task_id} -n "..."`.',
@@ -3587,6 +3618,7 @@ async def _launch_single_agent(
     plan: dict,
     plan_id: str,
     work_dir: str,
+    use_local_repo_context: bool,
     total_agents: int,
     semaphore: asyncio.Semaphore,
     api_client: httpx.AsyncClient,
@@ -3905,10 +3937,20 @@ async def _launch_single_agent(
         while True:
             prompt = (
                 _build_visible_parallel_prompt(
-                    plan, task, total_agents, work_dir=work_dir
+                    plan,
+                    task,
+                    total_agents,
+                    work_dir=work_dir if use_local_repo_context else None,
+                    use_local_repo_context=use_local_repo_context,
                 )
                 if visible
-                else _build_parallel_prompt(plan, task, total_agents, work_dir=work_dir)
+                else _build_parallel_prompt(
+                    plan,
+                    task,
+                    total_agents,
+                    work_dir=work_dir if use_local_repo_context else None,
+                    use_local_repo_context=use_local_repo_context,
+                )
             )
             if live_retry_note:
                 prompt = (
@@ -4620,7 +4662,10 @@ async def _run_parallel(
     import uuid as _uuid
 
     resolved_plan_id = _require_plan_context(plan_id)
-    resolved_dir = str(Path(work_dir).resolve()) if work_dir else os.getcwd()
+    resolved_dir, use_local_repo_context = _resolve_continue_work_dir(
+        resolved_plan_id, work_dir
+    )
+    exec_dir = resolved_dir or os.getcwd()
 
     # Verify that the resolved agent binary exists (raises SystemExit if not found)
     _resolve_prompt_agent(agent)
@@ -4757,7 +4802,8 @@ async def _run_parallel(
                     task,
                     plan,
                     resolved_plan_id,
-                    resolved_dir,
+                    exec_dir,
+                    use_local_repo_context,
                     len(actionable),
                     semaphore,
                     api_client,
@@ -4787,6 +4833,12 @@ async def _run_parallel(
 
             async def _poll_progress():
                 import time as _poll_time
+
+                def _print_poll_progress(message: str) -> None:
+                    if single_task_label and not visible and _stdout_is_tty():
+                        width = shutil.get_terminal_size(fallback=(100, 24)).columns
+                        print("\r" + (" " * max(20, width - 1)) + "\r", end="", flush=True)
+                    print(message)
 
                 _start_time = _poll_time.monotonic()
                 _last_heartbeat = 0  # seconds since last heartbeat message
@@ -4833,11 +4885,11 @@ async def _run_parallel(
                                                 else "active; waiting for the first task note or file change"
                                             )
                                         )
-                                        print(
+                                        _print_poll_progress(
                                             f"  {DIM}[{single_task_label}]{RESET} {activity_text} ({time_str} elapsed)"
                                         )
                                     else:
-                                        print(
+                                        _print_poll_progress(
                                             f"  {DIM}⋯ {agent_label} still working ({time_str} elapsed){RESET}"
                                         )
                                     _last_heartbeat = elapsed
@@ -4898,7 +4950,7 @@ async def _run_parallel(
                                     details.append(f"error: {latest_error}")
                                 if not details:
                                     details.append(status or "running")
-                                print(
+                                _print_poll_progress(
                                     f"  {DIM}[{label} · {session_id}]{RESET} {' | '.join(details)}"
                                 )
                                 _saw_progress_update = True
@@ -4922,7 +4974,12 @@ async def _run_parallel(
                                     new_lines = note_lines[prev_count:]
                                     title = _clean(s.get("title")) or "?"
                                     for nl in new_lines:
-                                        print(f"  {DIM}[{title}]{RESET} {nl}")
+                                        note_text = _format_task_note_for_terminal(nl)
+                                        if not note_text:
+                                            continue
+                                        _print_poll_progress(
+                                            f"  {DIM}[{title}]{RESET} {note_text}"
+                                        )
                                     _saw_progress_update = True
                                     _last_observed_activity = _poll_time.monotonic()
                                     _last_heartbeat = (
@@ -5190,15 +5247,14 @@ def _continue_with_claude(
 
     _ensure_authenticated()
     session_id = f"agent-{_uuid.uuid4().hex[:8]}"
-    if not work_dir:
-        work_dir = (load_auth().get("default_work_dir") or "").strip() or None
-    if work_dir:
-        work_dir = str(Path(work_dir).resolve())
     resolved_plan_id = _current_plan_id(plan_id)
     if not resolved_plan_id:
         raise SystemExit(
             "Execution context or migration ID required. Pass --plan-id <id> or save one with `keshro config set --plan-id <id>`."
         )
+    work_dir, use_local_repo_context = _resolve_continue_work_dir(
+        resolved_plan_id, work_dir
+    )
     plan = _get_plan_or_exit(resolved_plan_id)
 
     # Draft plan warning
@@ -5250,6 +5306,7 @@ def _continue_with_claude(
         plan,
         task,
         work_dir=work_dir,
+        use_local_repo_context=use_local_repo_context,
         auto_continue=auto_continue,
         session_id=session_id,
     )
@@ -5286,6 +5343,7 @@ def _continue_with_claude(
                 plan,
                 task,
                 work_dir=work_dir,
+                use_local_repo_context=use_local_repo_context,
                 session_id=session_id,
             )
         )
@@ -5470,6 +5528,57 @@ def _append_replan_summary(existing_summary: str | None, note: str) -> str:
     if not base:
         return addition
     return f"{base}\n\n{addition}"
+
+
+def _should_use_local_repo_context(
+    plan_id: str | None, work_dir: str | None = None
+) -> bool:
+    if _clean(work_dir):
+        return True
+    cwd = str(Path.cwd().resolve())
+    linked_plan_id, _ = _resolve_repo_linked_plan(cwd)
+    return bool(_clean(linked_plan_id) and _clean(linked_plan_id) == _clean(plan_id))
+
+
+def _resolve_continue_work_dir(
+    plan_id: str | None, work_dir: str | None = None
+) -> tuple[str | None, bool]:
+    explicit_work_dir = _clean(work_dir)
+    if explicit_work_dir:
+        resolved = str(Path(explicit_work_dir).resolve())
+        return resolved, True
+
+    saved_work_dir = _clean(load_auth().get("default_work_dir"))
+    if saved_work_dir:
+        resolved = str(Path(saved_work_dir).resolve())
+        return resolved, True
+
+    cwd = str(Path.cwd().resolve())
+    repo_root = _discover_repo_root(cwd)
+    if repo_root is None:
+        return None, False
+
+    resolved_repo_root = str(repo_root.resolve())
+    linked_plan_id, _ = _resolve_repo_linked_plan(resolved_repo_root)
+    if _clean(linked_plan_id) and _clean(linked_plan_id) == _clean(plan_id):
+        return resolved_repo_root, True
+
+    if _state.json or not _stdout_is_tty():
+        return None, False
+
+    try:
+        use_current_repo = typer.confirm(
+            "Use the current working directory as execution context for this plan?\n"
+            f"{DIM}Current directory:{RESET} {resolved_repo_root}",
+            default=False,
+        )
+    except click.Abort:
+        print()
+        raise SystemExit(0)
+
+    if use_current_repo:
+        return resolved_repo_root, True
+    return None, False
 
 
 def _delete_task(
@@ -8084,7 +8193,10 @@ def _print_plan_status(plan: dict) -> None:
             if reason:
                 info_parts.append(reason)
 
-        print(f"  {icon} {order}. {step_title}")
+        task_id_label = (
+            f" {DIM}(task-id: {step_id}){RESET}" if step_id else ""
+        )
+        print(f"  {icon} {order}. {step_title}{task_id_label}")
         if info_parts:
             details = " · ".join(part for part in info_parts if part)
             for line in _format_full_value_lines(details, width=detail_width):

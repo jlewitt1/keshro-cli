@@ -5176,3 +5176,57 @@ def test_status_surfaces_enrichment_analysis_and_ui_review_link(
     assert "Review in UI: http://localhost:3000/plans/plan-123" in out
     assert "Best practices for Helm charts" not in out
     assert "├──" not in out
+
+
+def test_status_shows_task_ids_inline(fake_client, capsys, monkeypatch):
+    _auth = {
+        **_auth_with_plan(),
+        "token": "ksh_pat_test",
+        "api_url": "http://localhost:8000",
+    }
+    monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: _auth)
+    monkeypatch.setattr("keshro_cli.client.load_auth", lambda: _auth)
+    original_get = fake_client.get
+
+    def _get_status(path, params=None, headers=None, timeout=None):
+        if path == "/v1/plans/plan-123":
+            return _FakeResponse(
+                {
+                    "id": "plan-123",
+                    "title": "Execution plan",
+                    "status": "ready",
+                    "source_type": "AWS Batch",
+                    "target_type": "Airflow",
+                    "updated_at": "2026-03-11T15:30:00Z",
+                    "plan_steps": [
+                        {
+                            "id": "task-1",
+                            "order": 1,
+                            "title": "Pilot DAG",
+                            "status": "todo",
+                        }
+                    ],
+                    "task_feedback_events": [],
+                    "enrichment_sources": [],
+                    "decisions": {},
+                }
+            )
+        return original_get(path, params=params, headers=headers, timeout=timeout)
+
+    fake_client.get = _get_status
+    code = cli.main(["status", "-p", "plan-123"])
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+    assert code == 0
+    assert "1. Pilot DAG (task-id: task-1)" in out
+
+
+def test_format_task_note_for_terminal_strips_embedded_timestamp():
+    assert (
+        cli._format_task_note_for_terminal(
+            "[2026-04-05 15:10 UTC] Read all source files. Starting implementation."
+        )
+        == "Read all source files. Starting implementation."
+    )
+    assert cli._format_task_note_for_terminal("reading airflow/dags/example.py") == (
+        "reading airflow/dags/example.py"
+    )
