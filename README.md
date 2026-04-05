@@ -48,8 +48,6 @@ keshro continue
 
 By default, `keshro continue` runs the next ready wave in parallel when the environment supports it. Each launched agent gets its own session ID and heartbeats live status back to Keshro, including touched files, progress messages, recent errors, and mid-task conflict detection. Use `--no-parallel` only when you explicitly want one task at a time.
 
-`keshro continue --visible` is intended for direct use from a normal user terminal. If you invoke it from inside another coding agent session, Keshro ignores `--visible` and continues headless instead of trying to nest visible terminal orchestration.
-
 ## Monitor
 
 ```bash
