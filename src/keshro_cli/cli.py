@@ -510,16 +510,6 @@ def _resolve_plan_or_migration_context(
     explicit_id = _clean(value)
     if not explicit_id:
         return None, None
-    env_plan_id = _clean(os.environ.get("KESHRO_ACTIVE_PLAN_ID"))
-    if env_plan_id and explicit_id != env_plan_id:
-        try:
-            with make_client(_state.api_url, _state.token) as client:
-                res = client.get(f"/v1/plans/{env_plan_id}")
-                res.raise_for_status()
-                plan = res.json()
-                return env_plan_id, _clean(plan.get("title")) or env_plan_id
-        except Exception:
-            pass
     with make_client(_state.api_url, _state.token) as client:
         try:
             res = client.get(f"/v1/plans/{explicit_id}")
@@ -3644,6 +3634,8 @@ async def _launch_single_agent(
             stream: asyncio.StreamReader | None,
             latest_lines: list[str],
             chunks: list[str],
+            *,
+            emit_live: bool = False,
         ) -> None:
             if stream is None:
                 return
@@ -3657,6 +3649,8 @@ async def _launch_single_agent(
                 if cleaned:
                     latest_lines.append(cleaned)
                     del latest_lines[:-20]
+                    if emit_live:
+                        print(f"  [{task_title}] {cleaned}")
 
         while True:
             prompt = (
@@ -4002,12 +3996,18 @@ async def _launch_single_agent(
                     readers = [
                         asyncio.create_task(
                             _consume_stream(
-                                proc.stdout, latest_stdout_lines, stdout_chunks
+                                proc.stdout,
+                                latest_stdout_lines,
+                                stdout_chunks,
+                                emit_live=not visible,
                             )
                         ),
                         asyncio.create_task(
                             _consume_stream(
-                                proc.stderr, latest_stderr_lines, stderr_chunks
+                                proc.stderr,
+                                latest_stderr_lines,
+                                stderr_chunks,
+                                emit_live=not visible,
                             )
                         ),
                     ]
@@ -5009,16 +5009,6 @@ def _resolve_continue_override_context(
     explicit_id = _clean(value)
     if not explicit_id:
         return None, None
-    env_plan_id = _clean(os.environ.get("KESHRO_ACTIVE_PLAN_ID"))
-    if env_plan_id and explicit_id != env_plan_id:
-        try:
-            with make_client(_state.api_url, _state.token) as client:
-                res = client.get(f"/v1/plans/{env_plan_id}")
-                res.raise_for_status()
-                plan = res.json()
-                return env_plan_id, _clean(plan.get("title")) or env_plan_id
-        except Exception:
-            pass
     with make_client(_state.api_url, _state.token) as client:
         plan_res = client.get(f"/v1/plans/{explicit_id}")
         if plan_res.status_code < 400:

@@ -1725,6 +1725,32 @@ def test_continue_can_override_implicit_plan_with_migration_id(
     assert ("GET", "/v1/migrations/migration-123/plan", None) in fake_client.calls
 
 
+def test_resolve_plan_or_migration_context_prefers_explicit_id_over_env(
+    fake_client, monkeypatch
+):
+    monkeypatch.setenv("KESHRO_ACTIVE_PLAN_ID", "plan-env")
+
+    plan_id, title = cli._resolve_plan_or_migration_context("plan-123")
+
+    assert plan_id == "plan-123"
+    assert title == "AWS Batch to Airflow pilot"
+    assert ("GET", "/v1/plans/plan-123", None) in fake_client.calls
+    assert ("GET", "/v1/plans/plan-env", None) not in fake_client.calls
+
+
+def test_resolve_continue_override_context_prefers_explicit_id_over_env(
+    fake_client, monkeypatch
+):
+    monkeypatch.setenv("KESHRO_ACTIVE_PLAN_ID", "plan-env")
+
+    plan_id, title = cli._resolve_continue_override_context("plan-123")
+
+    assert plan_id == "plan-123"
+    assert title == "AWS Batch to Airflow pilot"
+    assert ("GET", "/v1/plans/plan-123", None) in fake_client.calls
+    assert ("GET", "/v1/plans/plan-env", None) not in fake_client.calls
+
+
 def test_continue_prompt_does_not_tell_claude_to_refetch(
     fake_client, monkeypatch, capsys
 ):
