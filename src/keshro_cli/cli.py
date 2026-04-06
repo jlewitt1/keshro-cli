@@ -167,7 +167,12 @@ def _read_context_file(path: str | None) -> str | None:
 def _coding_agent_name() -> str | None:
     if os.environ.get("CLAUDECODE") or os.environ.get("CLAUDE_CODE_ENTRYPOINT"):
         return "Claude Code"
-    if os.environ.get("CODEX_SANDBOX") or os.environ.get("CODEX_HOME"):
+    if (
+        os.environ.get("CODEX_SANDBOX")
+        or os.environ.get("CODEX_HOME")
+        or os.environ.get("CODEX_THREAD_ID")
+        or os.environ.get("CODEX_CI")
+    ):
         return "Codex"
     if os.environ.get("CURSOR_TRACE_ID") or os.environ.get("CURSOR_SESSION_ID"):
         return "Cursor"
@@ -218,6 +223,86 @@ def _format_duration_compact(seconds: float | int) -> str:
     if mins > 0:
         return f"{mins}m {secs}s"
     return f"{secs}s"
+
+
+def _format_agent_phase_label(value: str | None) -> str:
+    key = _clean(value).lower().replace("-", "_").replace(" ", "_")
+    if not key:
+        return ""
+    labels = {
+        "starting": "starting",
+        "running": "running",
+        "editing": "editing files",
+        "visible_terminal": "visible terminal",
+        "validating": "validating",
+        "testing": "running tests",
+        "linting": "running lint",
+        "blocked": "blocked",
+        "needs_rebase": "needs rebase",
+        "completed": "completed",
+    }
+    return labels.get(key, key.replace("_", " "))
+
+
+def _summarize_agent_session_line(session: dict) -> str:
+    status = _clean(session.get("status")).lower() or "running"
+    phase = _format_agent_phase_label(session.get("current_phase"))
+    progress = _clean(session.get("progress_message"))
+    touched_files = tuple((session.get("touched_files") or [])[:3])
+    conflicting_files = tuple((session.get("conflicting_files") or [])[:3])
+    recent_errors = session.get("recent_errors") or []
+    latest_error = _clean(recent_errors[-1] if recent_errors else "")
+    if _should_ignore_agent_output_line(latest_error):
+        latest_error = ""
+
+    details: list[str] = []
+    if conflicting_files:
+        details.append(f"waiting on conflict: {', '.join(conflicting_files)}")
+    elif latest_error and status in {"error", "failed", "blocked", "failed_to_launch"}:
+        details.append(f"error: {latest_error}")
+    else:
+        if phase:
+            details.append(phase)
+        if progress:
+            details.append(progress)
+        if touched_files:
+            details.append(f"files: {', '.join(touched_files)}")
+
+    if not details:
+        details.append(status or "running")
+    return " | ".join(details)
+
+
+def _plan_execution_snapshot(plan: dict) -> str:
+    steps = plan.get("plan_steps") or []
+    total = len(steps)
+    done = len([s for s in steps if _clean(s.get("status")).lower() == "completed"])
+    active = [s for s in steps if _clean(s.get("status")).lower() == "in_progress"]
+    blocked = [s for s in steps if _clean(s.get("status")).lower() == "blocked"]
+    ready = _all_actionable_tasks(plan)
+
+    parts = [f"{done}/{total} done" if total > 0 else "0 tasks"]
+    if active:
+        parts.append(f"{len(active)} active")
+    if blocked:
+        parts.append(f"{len(blocked)} blocked")
+    if ready:
+        parts.append(f"{len(ready)} ready")
+
+    active_titles = [
+        _clean(step.get("title")) or _clean(step.get("id")) or "task"
+        for step in active[:3]
+    ]
+    if active_titles:
+        parts.append(f"running: {', '.join(active_titles)}")
+    elif ready:
+        ready_titles = [
+            _clean(step.get("title")) or _clean(step.get("id")) or "task"
+            for step in ready[:3]
+        ]
+        parts.append(f"next: {', '.join(ready_titles)}")
+
+    return " | ".join(parts)
 
 
 def _event_status(event: dict) -> str:
@@ -3040,6 +3125,7 @@ async def _post_agent_heartbeat_async(
     commit_sha: str = "",
     changed_files: list[str] | None = None,
     status: str = "running",
+    agent_client: str | None = None,
     current_phase: str | None = None,
     progress_message: str | None = None,
     recent_error: str | None = None,
@@ -3062,6 +3148,8 @@ async def _post_agent_heartbeat_async(
         "changed_files": changed_files or [],
         "status": status,
     }
+    if agent_client:
+        payload["agent_client"] = agent_client
     if session_id:
         payload["agent_session_id"] = session_id
     if current_phase:
@@ -3754,6 +3842,7 @@ async def _launch_single_agent(
         exec_dir = codex_worktree_path if agent_name == "codex" else work_dir
         agent_env = os.environ.copy()
         agent_env["KESHRO_ACTIVE_PLAN_ID"] = plan_id
+        agent_env["KESHRO_AGENT_CLIENT"] = "Codex" if agent_name == "codex" else "Claude Code"
         agent_env["KESHRO_SUPPRESS_AGENT_SKILL_BANNER"] = "1"
         runtime_context = _collect_task_runtime_context_for(exec_dir)
         latest_stdout_lines: list[str] = []
@@ -3824,6 +3913,7 @@ async def _launch_single_agent(
                     "task_id": task_id,
                     "event": "start",
                     "agent_session_id": session_id,
+                    "agent_client": agent_name,
                     "current_phase": "starting",
                     "progress_message": "Launching isolated agent worktree",
                     "runtime_context": runtime_context,
@@ -3891,6 +3981,7 @@ async def _launch_single_agent(
                             exec_dir=exec_dir,
                             changed_files=changed_files,
                             status="running",
+                            agent_client=agent_name,
                             current_phase=current_phase,
                             progress_message=progress_message,
                             recent_error=latest_error or None,
@@ -4665,6 +4756,7 @@ async def _run_parallel(
     import uuid as _uuid
 
     resolved_plan_id = _require_plan_context(plan_id)
+    inside_agent_session = _inside_coding_agent()
     resolved_dir, use_local_repo_context = _resolve_continue_work_dir(
         resolved_plan_id, work_dir, allow_prompt=True
     )
@@ -4779,6 +4871,10 @@ async def _run_parallel(
             print(
                 f"{DIM}💡 Monitor all agents: keshro status --tui -p {resolved_plan_id}{RESET}\n"
             )
+            if inside_agent_session:
+                print(
+                    f"{DIM}Agent-session mode: execution stays headless, and Keshro will summarize live progress here as tasks start, edit files, validate, complete, or block.{RESET}\n"
+                )
 
         # Notify Collaborator about wave start
         try:
@@ -4848,9 +4944,15 @@ async def _run_parallel(
                 _seen_sessions: dict[str, tuple] = {}
                 _saw_progress_update = False
                 _last_observed_activity = _start_time
+                _last_snapshot_signature = ""
+                _last_snapshot_at = 0.0
                 _POLL_INTERVAL_SECONDS = 3
-                _SINGLE_TASK_HEARTBEAT_INTERVAL_SECONDS = 45
-                _MULTI_TASK_HEARTBEAT_INTERVAL_SECONDS = 10
+                _SINGLE_TASK_HEARTBEAT_INTERVAL_SECONDS = (
+                    12 if inside_agent_session else 45
+                )
+                _MULTI_TASK_HEARTBEAT_INTERVAL_SECONDS = (
+                    8 if inside_agent_session else 10
+                )
                 try:
                     while not _poller_done:
                         await asyncio.sleep(_POLL_INTERVAL_SECONDS)
@@ -4898,25 +5000,44 @@ async def _run_parallel(
                                     _last_heartbeat = elapsed
                                 continue
                             fresh = resp.json()
+                            snapshot = _plan_execution_snapshot(fresh)
+                            if inside_agent_session:
+                                snapshot_signature = "|".join(
+                                    [
+                                        snapshot,
+                                        ",".join(
+                                            sorted(
+                                                _clean(session.get("session_id"))
+                                                for session in fresh.get(
+                                                    "agent_sessions", []
+                                                )
+                                                if _clean(session.get("status")).lower()
+                                                in {"starting", "running", "in_progress"}
+                                            )
+                                        ),
+                                    ]
+                                )
+                                if (
+                                    snapshot_signature != _last_snapshot_signature
+                                    or elapsed - _last_snapshot_at >= heartbeat_interval
+                                ):
+                                    _print_poll_progress(
+                                        f"  {DIM}status:{RESET} {snapshot}"
+                                    )
+                                    _last_snapshot_signature = snapshot_signature
+                                    _last_snapshot_at = elapsed
+                                    _last_heartbeat = elapsed
                             for session in fresh.get("agent_sessions", []):
                                 session_id = _clean(session.get("session_id"))
                                 if not session_id:
                                     continue
                                 status = _clean(session.get("status")).lower()
                                 phase = _clean(session.get("current_phase"))
-                                progress_message = _clean(
-                                    session.get("progress_message")
-                                )
-                                touched_files = tuple(
-                                    (session.get("touched_files") or [])[:3]
-                                )
-                                conflicting_files = tuple(
-                                    (session.get("conflicting_files") or [])[:3]
-                                )
+                                progress_message = _clean(session.get("progress_message"))
+                                touched_files = tuple((session.get("touched_files") or [])[:3])
+                                conflicting_files = tuple((session.get("conflicting_files") or [])[:3])
                                 recent_errors = session.get("recent_errors") or []
-                                latest_error = _clean(
-                                    recent_errors[-1] if recent_errors else ""
-                                )
+                                latest_error = _clean(recent_errors[-1] if recent_errors else "")
                                 if _should_ignore_agent_output_line(latest_error):
                                     latest_error = ""
                                 signature = (
@@ -4935,26 +5056,8 @@ async def _run_parallel(
                                     or _clean(session.get("task_id"))
                                     or session_id
                                 )
-                                details = []
-                                if phase:
-                                    details.append(phase)
-                                if progress_message:
-                                    details.append(progress_message)
-                                if touched_files:
-                                    details.append(f"files: {', '.join(touched_files)}")
-                                if conflicting_files:
-                                    details.append(
-                                        f"conflicts: {', '.join(conflicting_files)}"
-                                    )
-                                if latest_error and (
-                                    status in {"error", "failed", "blocked", "failed_to_launch"}
-                                    or phase == "error"
-                                ):
-                                    details.append(f"error: {latest_error}")
-                                if not details:
-                                    details.append(status or "running")
                                 _print_poll_progress(
-                                    f"  {DIM}[{label} · {session_id}]{RESET} {' | '.join(details)}"
+                                    f"  {DIM}[{label} · {session_id}]{RESET} {_summarize_agent_session_line(session)}"
                                 )
                                 _saw_progress_update = True
                                 _last_observed_activity = _poll_time.monotonic()
@@ -5016,7 +5119,7 @@ async def _run_parallel(
                                     )
                                 else:
                                     print(
-                                        f"  {DIM}⋯ {agent_label} still working ({time_str} elapsed){RESET}"
+                                        f"  {DIM}⋯ {snapshot} ({time_str} elapsed){RESET}"
                                     )
                                 _last_heartbeat = elapsed
                         except Exception:
@@ -7566,7 +7669,7 @@ def _continue_command(
         typer.Option(
             "--agent",
             "-a",
-            help="Coding agent to use for prompt-based resume flows: auto, claude, or codex.",
+            help="Coding agent to use for execution: auto, claude, or codex.",
         ),
     ] = "auto",
     visible: Annotated[

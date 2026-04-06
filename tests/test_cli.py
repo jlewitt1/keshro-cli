@@ -3,6 +3,7 @@ import os
 import re
 import subprocess
 import tempfile
+import asyncio
 from pathlib import Path
 
 import click
@@ -1649,6 +1650,7 @@ def test_continue_skips_confirmation_when_plan_id_is_explicit(
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
+    monkeypatch.setattr("keshro_cli.cli.typer.confirm", lambda *a, **kw: True)
     monkeypatch.setattr("keshro_cli.cli._stdout_is_tty", lambda: True)
 
     def _fail_confirm(*args, **kwargs):
@@ -1669,6 +1671,10 @@ def test_continue_skips_confirmation_when_migration_id_is_explicit(
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
+    monkeypatch.setattr(
+        "keshro_cli.cli._confirm_implicit_continue_plan",
+        lambda resolved_plan_id, work_dir=None: resolved_plan_id,
+    )
     monkeypatch.setattr("keshro_cli.cli._stdout_is_tty", lambda: True)
 
     def _fail_confirm(*args, **kwargs):
@@ -1827,6 +1833,48 @@ def test_continue_uses_parallel_mode_inside_coding_agent_by_default(
 
     assert exit_code == 0
     assert parallel_called.get("yes")
+
+
+def test_continue_auto_prefers_codex_inside_codex_session(
+    fake_client, monkeypatch, capsys
+):
+    monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
+    monkeypatch.setattr(
+        "keshro_cli.cli._confirm_implicit_continue_plan",
+        lambda resolved_plan_id, work_dir=None: resolved_plan_id,
+    )
+    monkeypatch.setattr("keshro_cli.cli._stdout_is_tty", lambda: True)
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.delenv("CODEX_SANDBOX", raising=False)
+    monkeypatch.setenv("CODEX_CI", "1")
+    monkeypatch.setenv("CODEX_THREAD_ID", "thread-123")
+
+    parallel_called = {}
+
+    async def _fake_run_parallel(*args, **kwargs):
+        parallel_called["agent"] = kwargs.get("agent")
+
+    monkeypatch.setattr("keshro_cli.cli._run_parallel", _fake_run_parallel)
+
+    def _run_coro(coro):
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    monkeypatch.setattr("keshro_cli.cli.asyncio.run", _run_coro)
+
+    exit_code = cli.main(["continue"])
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert cli._coding_agent_name() == "Codex"
+    assert parallel_called["agent"] == "codex"
+    assert "Using Codex" in out
 
 
 def test_continue_no_parallel_stays_single_task_inside_coding_agent(

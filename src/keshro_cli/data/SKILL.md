@@ -163,12 +163,14 @@ Keshro remembers your active execution context. No need to pass `-p` every time.
 2. If Keshro stops for migration confirmation or follow-up questions, surface them to the user conversationally and wait.
 3. If Keshro gave you an `--answers-file` resume path, update that file with the user's answers and rerun the exact resume command.
 4. Run `keshro status`
-5. Run `keshro continue --confirm --all` — parallel agents work through all waves automatically
-6. Only intervene if a task is blocked or an error occurs
+5. In an agent session, launch `keshro continue --confirm --all` in the background rather than waiting on one blocking shell call
+6. While it runs, poll `keshro status` and relay compact progress updates: active wave, running tasks, completed tasks, blocked tasks, and what is next
+7. Only intervene if a task is blocked or an error occurs
 
 **User says "continue" or "keep going":**
 1. Run `keshro status` — show where things stand
-2. Run `keshro continue --all` — auto-continue through remaining waves
+2. In an agent session, launch `keshro continue --all` in the background
+3. Poll `keshro status` while it runs and relay concise progress updates until execution finishes or blocks
 
 **User says "status" or "what's happening":**
 1. Run `keshro status`
@@ -187,6 +189,7 @@ If the user says "stop", "pause", "hold on", or "wait":
 - Do NOT dump giant inline `--answer ...` commands back to the user. If Keshro provides an `--answers-file` resume path, use that.
 - Never auto-execute a plan without user confirmation. Always show the plan and ask first.
 - Once the user says to execute, continue through tasks automatically — don't ask between each task
+- When executing from inside another coding agent session, do not sit on a single blocking `keshro continue` call with no commentary; background it and use `keshro status` to keep the user informed
 - If the user says to stop, stop immediately after the current task
 - If the user already gave a description, create the plan immediately — don't ask them to restate it
 - Write progress notes frequently with `keshro task note`
