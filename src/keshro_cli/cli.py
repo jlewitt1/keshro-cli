@@ -9876,7 +9876,7 @@ def _task_edit(
         Optional[str],
         typer.Option(
             "--scheduling-notes",
-            help="Why these dependencies or parallel settings were chosen.",
+            help="Why these dependency or parallelization changes were chosen. Requires --depends-on, --clear-dependencies, --parallel, or --serial.",
         ),
     ] = None,
     feedback_reason: Annotated[
@@ -9898,6 +9898,13 @@ def _task_edit(
     else:
         resolved_plan_id = plan_id_or_task_id
         resolved_task_id = task_id
+    if scheduling_notes is not None and not (
+        depends_on is not None or clear_dependencies or parallelizable is not None
+    ):
+        raise SystemExit(
+            "--scheduling-notes requires a scheduling change: use it with "
+            "--depends-on, --clear-dependencies, --parallel, or --serial."
+        )
     _do_task_update(
         resolved_plan_id,
         resolved_task_id,
