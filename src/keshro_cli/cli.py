@@ -76,7 +76,7 @@ plan_task_app = typer.Typer(help="Plan task management")
 
 app.add_typer(plan_app, name="plan", hidden=True)
 app.add_typer(task_app, name="task")
-app.add_typer(migration_app, name="migration")
+app.add_typer(migration_app, name="migration", hidden=True)
 app.add_typer(config_app, name="config")
 plan_app.add_typer(plan_task_app, name="task")
 
@@ -303,6 +303,33 @@ def _plan_execution_snapshot(plan: dict) -> str:
         parts.append(f"next: {', '.join(ready_titles)}")
 
     return " | ".join(parts)
+
+
+async def _mark_agent_session_stopped_async(
+    client: httpx.AsyncClient,
+    plan_id: str,
+    task_id: str,
+    *,
+    session_id: str = "",
+    exec_dir: str | None = None,
+    reason: str = "Execution stopped by user before task completion.",
+    runtime_context: dict | None = None,
+) -> None:
+    try:
+        await _post_agent_heartbeat_async(
+            client,
+            plan_id,
+            task_id,
+            session_id=session_id,
+            exec_dir=exec_dir,
+            status="stopped",
+            current_phase="stopped",
+            progress_message=reason,
+            recent_error=reason,
+            runtime_context=runtime_context,
+        )
+    except Exception:
+        pass
 
 
 def _event_status(event: dict) -> str:
@@ -4896,22 +4923,30 @@ async def _run_parallel(
             single_task_label = (
                 _clean(actionable[0].get("title")) if len(actionable) == 1 else ""
             )
+            launch_specs = [
+                {
+                    "task": task,
+                    "session_id": f"agent-{_clean(task.get('id'))[:8]}-{_uuid.uuid4().hex[:6]}",
+                    "runtime_context": _collect_task_runtime_context_for(exec_dir),
+                }
+                for task in actionable
+            ]
             agent_coros = [
                 _launch_single_agent(
-                    task,
+                    spec["task"],
                     plan,
                     resolved_plan_id,
                     exec_dir,
                     len(actionable),
                     semaphore,
                     api_client,
-                    session_id=f"agent-{_clean(task.get('id'))[:8]}-{_uuid.uuid4().hex[:6]}",
+                    session_id=str(spec["session_id"]),
                     agent=agent,
                     visible=visible,
                     launch_index=i,
                     use_local_repo_context=use_local_repo_context,
                 )
-                for i, task in enumerate(actionable)
+                for i, spec in enumerate(launch_specs)
             ]
 
             # Background poller — prints new notes/status as agents work
@@ -5220,6 +5255,26 @@ async def _run_parallel(
             finally:
                 loop.remove_signal_handler(signal.SIGINT)
                 if _cancelled:
+                    reason = "Execution stopped by user before task completion."
+                    await asyncio.gather(
+                        *(
+                            _mark_agent_session_stopped_async(
+                                api_client,
+                                resolved_plan_id,
+                                _clean(spec["task"].get("id")),
+                                session_id=str(spec["session_id"]),
+                                exec_dir=exec_dir,
+                                reason=reason,
+                                runtime_context=spec["runtime_context"]
+                                if isinstance(spec["runtime_context"], dict)
+                                else None,
+                            )
+                            for task_future, spec in zip(agent_tasks, launch_specs)
+                            if not task_future.done()
+                            and _clean(spec["task"].get("id"))
+                        ),
+                        return_exceptions=True,
+                    )
                     await _cleanup_active_agents()
 
             _poller_done = True
@@ -5292,15 +5347,26 @@ async def _run_parallel(
             )
             print(f"{RED}{'─' * 50}{RESET}")
 
+        refreshed_done = len(
+            [
+                s
+                for s in refreshed_steps
+                if _clean(s.get("status") or "").lower() == "completed"
+            ]
+        )
+        refreshed_total = len(refreshed_steps)
+
         if not run_all:
             if failed == 0 and succeeded > 0:
-                remaining = total_count - done_count - succeeded
+                remaining = max(0, refreshed_total - refreshed_done)
                 if remaining > 0:
                     print(
                         f"\n{DIM}{remaining} task(s) remaining.{RESET}\n"
                         f"{DIM}  keshro continue        — run the next task{RESET}\n"
                         f"{DIM}  keshro continue --all  — auto-continue through all remaining waves{RESET}"
                     )
+                elif refreshed_total > 0:
+                    print(f"\n{GREEN}All {refreshed_total} tasks completed.{RESET}")
             break
 
         # Re-fetch plan for next wave
@@ -8186,6 +8252,7 @@ def _print_plan_status(plan: dict) -> None:
     STATUS_ICON = {
         "completed": f"{GREEN}✓{RESET}",
         "in_progress": f"{YELLOW}●{RESET}",
+        "stopped": f"{YELLOW}■{RESET}",
         "blocked": f"{RED}✗{RESET}",
         "todo": f"{DIM}○{RESET}",
     }
@@ -8230,7 +8297,10 @@ def _print_plan_status(plan: dict) -> None:
         latest_session = task_latest_session.get(step_id)
         session_status = _clean((latest_session or {}).get("status")).lower()
         status = _clean(step.get("status") or "todo").lower()
-        if session_status in {
+        runtime_status = _clean(step.get("runtime_status")).lower()
+        if session_status == "stopped" or runtime_status == "stopped":
+            status = "stopped"
+        elif session_status in {
             "running",
             "starting",
             "in_progress",
@@ -8309,6 +8379,14 @@ def _print_plan_status(plan: dict) -> None:
                 except Exception:
                     pass
 
+        if status == "stopped":
+            stop_reason = (
+                _clean(step.get("runtime_status_reason"))
+                or _clean((latest_session or {}).get("progress_message"))
+                or "Execution stopped before task completion."
+            )
+            info_parts.append(stop_reason)
+
         if status == "blocked":
             reason = _clean(step.get("blocked_reason"))
             if reason:
@@ -8334,8 +8412,21 @@ def _print_plan_status(plan: dict) -> None:
     # Footer
     print()
     summary_parts = []
-    if in_progress:
-        summary_parts.append(f"{len(in_progress)} active")
+    stopped_tasks = [
+        s
+        for s in steps
+        if _clean(s.get("status")).lower() == "in_progress"
+        and _clean(s.get("runtime_status")).lower() == "stopped"
+    ]
+    active_running = [
+        s
+        for s in in_progress
+        if _clean(s.get("runtime_status")).lower() != "stopped"
+    ]
+    if active_running:
+        summary_parts.append(f"{len(active_running)} active")
+    if stopped_tasks:
+        summary_parts.append(f"{YELLOW}{len(stopped_tasks)} stopped{RESET}")
     if blocked:
         summary_parts.append(f"{RED}{len(blocked)} blocked{RESET}")
     if todo:
