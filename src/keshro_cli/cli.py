@@ -8485,20 +8485,38 @@ def _print_plan_status(plan: dict) -> None:
                 info_parts.append(reason)
 
         if status == "completed":
-            metrics = step.get("metrics") if isinstance(step.get("metrics"), dict) else {}
-            event_metrics = latest if isinstance(latest, dict) else {}
+            step_metrics = step.get("metrics") if isinstance(step.get("metrics"), dict) else {}
+            latest_metrics_raw = (latest or {}).get("metrics")
+            latest_metrics_dict = (
+                latest_metrics_raw if isinstance(latest_metrics_raw, dict) else {}
+            )
+            latest_metrics = {
+                "duration_seconds": latest_metrics_dict.get(
+                    "duration_seconds", (latest or {}).get("duration_seconds")
+                ),
+                "tokens_used": latest_metrics_dict.get(
+                    "tokens_used", (latest or {}).get("tokens_used")
+                ),
+                "model": _clean(
+                    latest_metrics_dict.get("model", (latest or {}).get("model"))
+                ),
+                "cost_usd": latest_metrics_dict.get(
+                    "cost_usd", (latest or {}).get("cost_usd")
+                ),
+            }
+            metrics = {
+                "duration_seconds": step_metrics.get("duration_seconds"),
+                "tokens_used": step_metrics.get("tokens_used"),
+                "model": _clean(step_metrics.get("model")),
+                "cost_usd": step_metrics.get("cost_usd"),
+            }
+            for key, value in latest_metrics.items():
+                if metrics.get(key) in (None, ""):
+                    metrics[key] = value
             duration_seconds = metrics.get("duration_seconds")
-            if duration_seconds is None:
-                duration_seconds = event_metrics.get("duration_seconds")
             tokens_used = metrics.get("tokens_used")
-            if tokens_used is None:
-                tokens_used = event_metrics.get("tokens_used")
             model_name = _clean(metrics.get("model"))
-            if not model_name:
-                model_name = _clean(event_metrics.get("model"))
             cost_usd = metrics.get("cost_usd")
-            if cost_usd is None:
-                cost_usd = event_metrics.get("cost_usd")
 
             if isinstance(duration_seconds, (int, float)) and duration_seconds > 0:
                 info_parts.append(f"{int(round(float(duration_seconds)))}s")
