@@ -137,8 +137,8 @@ keshro plan sync-pull
 
 ## Review and rollback
 ```bash
-keshro explain <task-id>
-keshro rollback <task-id>
+keshro task explain <task-id>
+keshro task rollback <task-id>
 ```
 
 ## Execution context
