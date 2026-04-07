@@ -8484,10 +8484,34 @@ def _print_plan_status(plan: dict) -> None:
             if reason:
                 info_parts.append(reason)
 
-        task_id_label = (
-            f" {DIM}(task-id: {step_id}){RESET}" if step_id else ""
-        )
-        print(f"  {icon} {order}. {step_title}{task_id_label}")
+        if status == "completed":
+            metrics = step.get("metrics") if isinstance(step.get("metrics"), dict) else {}
+            event_metrics = latest if isinstance(latest, dict) else {}
+            duration_seconds = metrics.get("duration_seconds")
+            if duration_seconds is None:
+                duration_seconds = event_metrics.get("duration_seconds")
+            tokens_used = metrics.get("tokens_used")
+            if tokens_used is None:
+                tokens_used = event_metrics.get("tokens_used")
+            model_name = _clean(metrics.get("model"))
+            if not model_name:
+                model_name = _clean(event_metrics.get("model"))
+            cost_usd = metrics.get("cost_usd")
+            if cost_usd is None:
+                cost_usd = event_metrics.get("cost_usd")
+
+            if isinstance(duration_seconds, (int, float)) and duration_seconds > 0:
+                info_parts.append(f"{int(round(float(duration_seconds)))}s")
+            if isinstance(tokens_used, (int, float)) and tokens_used > 0:
+                info_parts.append(f"{int(tokens_used):,} tokens")
+            if model_name:
+                info_parts.append(model_name)
+            if isinstance(cost_usd, (int, float)) and cost_usd > 0:
+                info_parts.append(f"${float(cost_usd):.2f}")
+
+        print(f"  {icon} {order}. {step_title}")
+        if step_id:
+            print(f"    {DIM}task-id: {step_id}{RESET}")
         if info_parts:
             details = " · ".join(part for part in info_parts if part)
             for line in _format_full_value_lines(details, width=detail_width):
