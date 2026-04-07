@@ -1130,6 +1130,16 @@ def _print_task_detail(
         print(f"{DIM}Task ID:{RESET} {task_id_value}")
     print(f"{DIM}Status:{RESET} {_clean(task.get('status') or 'todo') or 'todo'}")
     print(f"{DIM}Owner:{RESET} {_clean(task.get('owner')) or 'Unassigned'}")
+    depends_on = [_clean(dep_id) for dep_id in (task.get("depends_on") or []) if _clean(dep_id)]
+    if depends_on:
+        print(f"{DIM}Depends on:{RESET} {', '.join(depends_on)}")
+    print(
+        f"{DIM}Execution mode:{RESET} "
+        f"{'parallelizable' if task.get('parallelizable') else 'serial'}"
+    )
+    scheduling_notes = _clean(task.get("scheduling_notes"))
+    if scheduling_notes:
+        print(f"{DIM}Scheduling notes:{RESET} {scheduling_notes}")
     if task.get("blocked_reason"):
         print(f"{DIM}Blocked:{RESET} {task['blocked_reason']}")
     if task.get("notes"):
@@ -2717,6 +2727,9 @@ def _build_continue_prompt(
     is_parallelizable = task.get("parallelizable", False)
     if is_parallelizable:
         task_block.append("Parallelizable: yes")
+    scheduling_notes = _clean(task.get("scheduling_notes"))
+    if scheduling_notes:
+        task_block.append(f"Scheduling notes: {scheduling_notes}")
 
     # Acceptance criteria
     acceptance = task.get("acceptance_criteria") or []
@@ -5684,7 +5697,9 @@ def _dependencies_met(step: dict, steps: list[dict]) -> bool:
     step_statuses = {
         _clean(s.get("id")): _clean(s.get("status") or "todo").lower() for s in steps
     }
-    return all(step_statuses.get(dep_id) == "completed" for dep_id in depends_on)
+    return all(
+        step_statuses.get(dep_id) in {"completed", "done"} for dep_id in depends_on
+    )
 
 
 def _next_actionable_task(plan: dict, parallel: bool = False) -> dict | None:
@@ -5721,7 +5736,7 @@ def _all_actionable_tasks(plan: dict) -> list[dict]:
     completed_ids = {
         _clean(s.get("id"))
         for s in steps
-        if _clean(s.get("status") or "todo").lower() == "completed"
+        if _clean(s.get("status") or "todo").lower() in {"completed", "done"}
     }
     actionable = []
     for step in steps:
@@ -9260,6 +9275,9 @@ def _do_task_update(
     blocked_reason: str | None = None,
     feedback_reason: str | None = None,
     link: list[str] | None = None,
+    depends_on: list[str] | None = None,
+    parallelizable: bool | None = None,
+    scheduling_notes: str | None = None,
 ):
     plan_id = _require_plan_context(plan_id)
     payload: dict = {}
@@ -9272,11 +9290,18 @@ def _do_task_update(
         ("linear_issue_id", linear_issue_id),
         ("blocked_reason", blocked_reason),
         ("feedback_reason", feedback_reason),
+        ("scheduling_notes", scheduling_notes),
     ]:
         if value is not None:
             payload[key] = value
     if link is not None:
         payload["artifact_links"] = link
+    if depends_on is not None:
+        payload["depends_on"] = depends_on
+        payload["scheduling_source"] = "manual"
+    if parallelizable is not None:
+        payload["parallelizable"] = parallelizable
+        payload["scheduling_source"] = "manual"
     payload["runtime_context"] = _collect_task_runtime_context()
     with make_client(_state.api_url, _state.token) as client:
         res = client.patch(
@@ -9289,6 +9314,19 @@ def _do_task_update(
             print_output(plan, True)
             return
         _print_task_update_summary(plan, task_id=task_id, payload=payload)
+
+
+def _parse_dependency_ids(raw_values: list[str] | None) -> list[str]:
+    dependency_ids: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_values or []:
+        for candidate in re.split(r"[\n,]+", str(raw or "")):
+            cleaned = _clean(candidate)
+            if not cleaned or cleaned in seen:
+                continue
+            dependency_ids.append(cleaned)
+            seen.add(cleaned)
+    return dependency_ids
 
 
 def _build_appended_task_notes(
@@ -9816,6 +9854,31 @@ def _task_edit(
         Optional[str],
         typer.Option("--blocked-reason", "-b", "-r", help="Blocked reason."),
     ] = None,
+    depends_on: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            "--depends-on",
+            help="Task IDs this task depends on. Repeat or pass a comma-separated list.",
+        ),
+    ] = None,
+    clear_dependencies: Annotated[
+        bool,
+        typer.Option("--clear-dependencies", help="Remove all task dependencies."),
+    ] = False,
+    parallelizable: Annotated[
+        Optional[bool],
+        typer.Option(
+            "--parallel/--serial",
+            help="Mark the task as parallelizable or explicitly serial.",
+        ),
+    ] = None,
+    scheduling_notes: Annotated[
+        Optional[str],
+        typer.Option(
+            "--scheduling-notes",
+            help="Why these dependencies or parallel settings were chosen.",
+        ),
+    ] = None,
     feedback_reason: Annotated[
         Optional[str], typer.Option("--reason", help="Why this task changed.")
     ] = None,
@@ -9847,6 +9910,9 @@ def _task_edit(
         blocked_reason,
         feedback_reason,
         link,
+        [] if clear_dependencies else _parse_dependency_ids(depends_on) if depends_on is not None else None,
+        parallelizable,
+        scheduling_notes,
     )
 
 
