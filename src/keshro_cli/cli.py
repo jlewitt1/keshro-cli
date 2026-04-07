@@ -12,6 +12,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Annotated, Optional
 
@@ -36,6 +37,20 @@ _codex_merge_lock = asyncio.Lock()
 _LIVE_CONFLICT_POLL_SECONDS = 3
 _LIVE_CONFLICT_WAIT_TIMEOUT_SECONDS = 15 * 60
 _LIVE_CONFLICT_MAX_RETRIES = 3
+
+
+class TaskStatus(str, Enum):
+    TODO = "todo"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    BLOCKED = "blocked"
+
+
+def _resolve_task_target(
+    task_id: str,
+    plan_id_option: str | None,
+) -> tuple[str | None, str]:
+    return _require_plan_context(plan_id_option), task_id
 
 
 # ---------------------------------------------------------------------------
@@ -1137,9 +1152,6 @@ def _print_task_detail(
         f"{DIM}Execution mode:{RESET} "
         f"{'parallelizable' if task.get('parallelizable') else 'serial'}"
     )
-    scheduling_notes = _clean(task.get("scheduling_notes"))
-    if scheduling_notes:
-        print(f"{DIM}Scheduling notes:{RESET} {scheduling_notes}")
     if task.get("blocked_reason"):
         print(f"{DIM}Blocked:{RESET} {task['blocked_reason']}")
     if task.get("notes"):
@@ -2727,9 +2739,6 @@ def _build_continue_prompt(
     is_parallelizable = task.get("parallelizable", False)
     if is_parallelizable:
         task_block.append("Parallelizable: yes")
-    scheduling_notes = _clean(task.get("scheduling_notes"))
-    if scheduling_notes:
-        task_block.append(f"Scheduling notes: {scheduling_notes}")
 
     # Acceptance criteria
     acceptance = task.get("acceptance_criteria") or []
@@ -5690,7 +5699,7 @@ def _find_task(plan: dict, task_id: str) -> dict | None:
 
 
 def _dependencies_met(step: dict, steps: list[dict]) -> bool:
-    """Check if all dependencies for a task are completed."""
+    """Check if all dependencies for a task are terminally complete."""
     depends_on = step.get("depends_on") or []
     if not depends_on:
         return True
@@ -5698,7 +5707,8 @@ def _dependencies_met(step: dict, steps: list[dict]) -> bool:
         _clean(s.get("id")): _clean(s.get("status") or "todo").lower() for s in steps
     }
     return all(
-        step_statuses.get(dep_id) in {"completed", "done"} for dep_id in depends_on
+        step_statuses.get(_clean(dep_id)) in {"completed", "done"}
+        for dep_id in depends_on
     )
 
 
@@ -5707,7 +5717,7 @@ def _next_actionable_task(plan: dict, parallel: bool = False) -> dict | None:
     if parallel:
         # In parallel mode: skip in_progress tasks (another agent owns them),
         # only pick up todo tasks whose dependencies are met.
-        # _dependencies_met already rejects tasks with blocked deps (requires "completed").
+        # _dependencies_met already rejects tasks with unmet or blocked dependencies.
         for step in steps:
             if _clean(step.get("status") or "todo").lower() != "todo":
                 continue
@@ -5715,13 +5725,15 @@ def _next_actionable_task(plan: dict, parallel: bool = False) -> dict | None:
                 continue
             return step
         return None
-    # Default: pick up in_progress first (resume), then first todo
+    # Default: resume in_progress work if its dependencies are still satisfied,
+    # otherwise pick the first todo task whose dependencies are satisfied.
     for desired_status in ("in_progress", "todo"):
         match = next(
             (
                 step
                 for step in steps
                 if _clean(step.get("status") or "todo").lower() == desired_status
+                and _dependencies_met(step, steps)
             ),
             None,
         )
@@ -8948,7 +8960,7 @@ def _do_task_add(
     status: str = "todo",
     owner: str | None = None,
     notes: str | None = None,
-    linear_issue_id: str | None = None,
+    issue_id: str | None = None,
     blocked_reason: str | None = None,
     link: list[str] | None = None,
 ):
@@ -8959,7 +8971,7 @@ def _do_task_add(
         "status": status,
         "owner": owner,
         "notes": notes,
-        "linear_issue_id": linear_issue_id,
+        "external_issue_id": issue_id,
         "blocked_reason": blocked_reason,
         "artifact_links": link or [],
     }
@@ -9271,13 +9283,12 @@ def _do_task_update(
     status: str | None = None,
     owner: str | None = None,
     notes: str | None = None,
-    linear_issue_id: str | None = None,
+    issue_id: str | None = None,
     blocked_reason: str | None = None,
     feedback_reason: str | None = None,
     link: list[str] | None = None,
     depends_on: list[str] | None = None,
     parallelizable: bool | None = None,
-    scheduling_notes: str | None = None,
 ):
     plan_id = _require_plan_context(plan_id)
     payload: dict = {}
@@ -9287,10 +9298,9 @@ def _do_task_update(
         ("status", status),
         ("owner", owner),
         ("notes", notes),
-        ("linear_issue_id", linear_issue_id),
+        ("external_issue_id", issue_id),
         ("blocked_reason", blocked_reason),
         ("feedback_reason", feedback_reason),
-        ("scheduling_notes", scheduling_notes),
     ]:
         if value is not None:
             payload[key] = value
@@ -9599,16 +9609,21 @@ def _do_task_reopen(
 _task_add_options = dict(
     title=typer.Option(..., "--title", "-t", help="Task title."),
     description=typer.Option(..., "--description", "-d", help="Task description."),
-    status=typer.Option("todo", "--status", "-s", help="Task status."),
+    status=typer.Option(TaskStatus.TODO, "--status", "-s", help="Task status."),
     owner=typer.Option(None, "--owner", "-o", help="Task owner."),
     notes=typer.Option(None, "--notes", "-n", help="Task notes."),
-    linear_issue_id=typer.Option(
-        None, "--linear-issue-id", "-i", help="Linear issue ID."
+    issue_id=typer.Option(
+        None, "--issue-id", "-i", help="Linked issue ID."
     ),
     blocked_reason=typer.Option(
         None, "--blocked-reason", "-b", "-r", help="Blocked reason."
     ),
-    link=typer.Option(None, "--link", "-l", help="Artifact link."),
+    link=typer.Option(
+        None,
+        "--link",
+        "-l",
+        help="Attach a URL to this task (PR, doc, issue, dashboard, CI run, etc.).",
+    ),
 )
 
 
@@ -9626,23 +9641,23 @@ def _task_plan(
         str, typer.Option("--description", "-d", help="Task description.")
     ] = ...,
     status: Annotated[
-        str, typer.Option("--status", "-s", help="Task status.")
-    ] = "todo",
+        TaskStatus, typer.Option("--status", "-s", help="Task status.")
+    ] = TaskStatus.TODO,
     owner: Annotated[
         Optional[str], typer.Option("--owner", "-o", help="Task owner.")
     ] = None,
     notes: Annotated[
         Optional[str], typer.Option("--notes", "-n", help="Task notes.")
     ] = None,
-    linear_issue_id: Annotated[
-        Optional[str], typer.Option("--linear-issue-id", "-i", help="Linear issue ID.")
+    issue_id: Annotated[
+        Optional[str], typer.Option("--issue-id", "-i", help="Linked issue ID.")
     ] = None,
     blocked_reason: Annotated[
         Optional[str],
         typer.Option("--blocked-reason", "-b", "-r", help="Blocked reason."),
     ] = None,
     link: Annotated[
-        Optional[list[str]], typer.Option("--link", "-l", help="Artifact link.")
+        Optional[list[str]], typer.Option("--link", "-l", help="Attach a URL to this task (PR, doc, issue, dashboard, CI run, etc.).")
     ] = None,
 ):
     """Add a new task to a plan."""
@@ -9650,10 +9665,10 @@ def _task_plan(
         plan_id_option or plan_id,
         title,
         description,
-        status,
+        status.value,
         owner,
         notes,
-        linear_issue_id,
+        issue_id,
         blocked_reason,
         link,
     )
@@ -9673,23 +9688,23 @@ def _plan_task_add(
         str, typer.Option("--description", "-d", help="Task description.")
     ] = ...,
     status: Annotated[
-        str, typer.Option("--status", "-s", help="Task status.")
-    ] = "todo",
+        TaskStatus, typer.Option("--status", "-s", help="Task status.")
+    ] = TaskStatus.TODO,
     owner: Annotated[
         Optional[str], typer.Option("--owner", "-o", help="Task owner.")
     ] = None,
     notes: Annotated[
         Optional[str], typer.Option("--notes", "-n", help="Task notes.")
     ] = None,
-    linear_issue_id: Annotated[
-        Optional[str], typer.Option("--linear-issue-id", "-i", help="Linear issue ID.")
+    issue_id: Annotated[
+        Optional[str], typer.Option("--issue-id", "-i", help="Linked issue ID.")
     ] = None,
     blocked_reason: Annotated[
         Optional[str],
         typer.Option("--blocked-reason", "-b", "-r", help="Blocked reason."),
     ] = None,
     link: Annotated[
-        Optional[list[str]], typer.Option("--link", "-l", help="Artifact link.")
+        Optional[list[str]], typer.Option("--link", "-l", help="Attach a URL to this task (PR, doc, issue, dashboard, CI run, etc.).")
     ] = None,
 ):
     """Add a new task to a plan."""
@@ -9697,10 +9712,10 @@ def _plan_task_add(
         plan_id_option or plan_id,
         title,
         description,
-        status,
+        status.value,
         owner,
         notes,
-        linear_issue_id,
+        issue_id,
         blocked_reason,
         link,
     )
@@ -9708,25 +9723,14 @@ def _plan_task_add(
 
 @task_app.command("view")
 def _task_view(
-    plan_id_or_task_id: Annotated[
-        str, typer.Argument(help="Plan ID, or Task ID if a default plan is saved.")
-    ],
-    task_id: Annotated[
-        Optional[str],
-        typer.Argument(help="Task ID. Optional when a default plan is saved."),
-    ] = None,
+    task_id: Annotated[str, typer.Argument(help="Task ID.")],
     plan_id_option: Annotated[
         Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
     ] = None,
 ):
     """Show task details for a plan task."""
-    if plan_id_option:
-        _view_task(plan_id_option, task_id or plan_id_or_task_id)
-        return
-    if task_id is None:
-        _view_task(None, plan_id_or_task_id)
-        return
-    _view_task(plan_id_or_task_id, task_id)
+    resolved_plan_id, resolved_task_id = _resolve_task_target(task_id, plan_id_option)
+    _view_task(resolved_plan_id, resolved_task_id)
 
 
 @plan_task_app.command("view")
@@ -9754,13 +9758,7 @@ def _plan_task_view(
 
 @task_app.command("delete")
 def _task_delete(
-    plan_id_or_task_id: Annotated[
-        str, typer.Argument(help="Plan ID, or Task ID if a default plan is saved.")
-    ],
-    task_id: Annotated[
-        Optional[str],
-        typer.Argument(help="Task ID. Optional when a default plan is saved."),
-    ] = None,
+    task_id: Annotated[str, typer.Argument(help="Task ID.")],
     plan_id_option: Annotated[
         Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
     ] = None,
@@ -9772,18 +9770,8 @@ def _task_delete(
     ] = False,
 ):
     """Delete a task from a plan."""
-    if plan_id_option:
-        _delete_task(
-            plan_id_option,
-            task_id or plan_id_or_task_id,
-            feedback_reason,
-            assume_yes,
-        )
-        return
-    if task_id is None:
-        _delete_task(None, plan_id_or_task_id, feedback_reason, assume_yes)
-        return
-    _delete_task(plan_id_or_task_id, task_id, feedback_reason, assume_yes)
+    resolved_plan_id, resolved_task_id = _resolve_task_target(task_id, plan_id_option)
+    _delete_task(resolved_plan_id, resolved_task_id, feedback_reason, assume_yes)
 
 
 @plan_task_app.command("delete")
@@ -9822,13 +9810,10 @@ def _plan_task_delete(
 
 @task_app.command("edit")
 def _task_edit(
-    plan_id_or_task_id: Annotated[
-        str, typer.Argument(help="Plan ID, or Task ID if a default plan is saved.")
-    ],
     task_id: Annotated[
-        Optional[str],
-        typer.Argument(help="Task ID. Optional when a default plan is saved."),
-    ] = None,
+        str,
+        typer.Argument(help="Task ID."),
+    ],
     plan_id_option: Annotated[
         Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
     ] = None,
@@ -9839,7 +9824,7 @@ def _task_edit(
         Optional[str], typer.Option("--description", "-d", help="Task description.")
     ] = None,
     status: Annotated[
-        Optional[str], typer.Option("--status", "-s", help="Task status.")
+        Optional[TaskStatus], typer.Option("--status", "-s", help="Task status.")
     ] = None,
     owner: Annotated[
         Optional[str], typer.Option("--owner", "-o", help="Task owner.")
@@ -9847,8 +9832,8 @@ def _task_edit(
     notes: Annotated[
         Optional[str], typer.Option("--notes", "-n", help="Task notes.")
     ] = None,
-    linear_issue_id: Annotated[
-        Optional[str], typer.Option("--linear-issue-id", "-i", help="Linear issue ID.")
+    issue_id: Annotated[
+        Optional[str], typer.Option("--issue-id", "-i", help="Linked issue ID.")
     ] = None,
     blocked_reason: Annotated[
         Optional[str],
@@ -9872,66 +9857,40 @@ def _task_edit(
             help="Mark the task as parallelizable or explicitly serial.",
         ),
     ] = None,
-    scheduling_notes: Annotated[
-        Optional[str],
-        typer.Option(
-            "--scheduling-notes",
-            help="Why these dependency or parallelization changes were chosen. Requires --depends-on, --clear-dependencies, --parallel, or --serial.",
-        ),
-    ] = None,
     feedback_reason: Annotated[
         Optional[str], typer.Option("--reason", help="Why this task changed.")
     ] = None,
     link: Annotated[
-        Optional[list[str]], typer.Option("--link", "-l", help="Artifact link.")
+        Optional[list[str]], typer.Option("--link", "-l", help="Attach a URL to this task (PR, doc, issue, dashboard, CI run, etc.).")
     ] = None,
 ):
     """Update an existing task's status, owner, or details."""
-    resolved_plan_id: str | None
-    resolved_task_id: str
-    if plan_id_option:
-        resolved_plan_id = plan_id_option
-        resolved_task_id = task_id or plan_id_or_task_id
-    elif task_id is None:
-        resolved_plan_id = _require_plan_context(None)
-        resolved_task_id = plan_id_or_task_id
-    else:
-        resolved_plan_id = plan_id_or_task_id
-        resolved_task_id = task_id
-    if scheduling_notes is not None and not (
-        depends_on is not None or clear_dependencies or parallelizable is not None
-    ):
-        raise SystemExit(
-            "--scheduling-notes requires a scheduling change: use it with "
-            "--depends-on, --clear-dependencies, --parallel, or --serial."
+    if clear_dependencies and depends_on:
+        raise typer.BadParameter(
+            "Cannot combine --clear-dependencies with --depends-on. "
+            "Use one or the other."
         )
+    resolved_plan_id, resolved_task_id = _resolve_task_target(task_id, plan_id_option)
     _do_task_update(
         resolved_plan_id,
         resolved_task_id,
         title,
         description,
-        status,
+        status.value if status is not None else None,
         owner,
         notes,
-        linear_issue_id,
+        issue_id,
         blocked_reason,
         feedback_reason,
         link,
         [] if clear_dependencies else _parse_dependency_ids(depends_on) if depends_on is not None else None,
         parallelizable,
-        scheduling_notes,
     )
 
 
 @task_app.command("start")
 def _task_start(
-    plan_id_or_task_id: Annotated[
-        str, typer.Argument(help="Plan ID, or Task ID if a default plan is saved.")
-    ],
-    task_id: Annotated[
-        Optional[str],
-        typer.Argument(help="Task ID. Optional when a default plan is saved."),
-    ] = None,
+    task_id: Annotated[str, typer.Argument(help="Task ID.")],
     plan_id_option: Annotated[
         Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
     ] = None,
@@ -9949,17 +9908,7 @@ def _task_start(
     ] = None,
 ):
     """Mark a task as in progress."""
-    resolved_plan_id: str | None
-    resolved_task_id: str
-    if plan_id_option:
-        resolved_plan_id = plan_id_option
-        resolved_task_id = task_id or plan_id_or_task_id
-    elif task_id is None:
-        resolved_plan_id = _require_plan_context(None)
-        resolved_task_id = plan_id_or_task_id
-    else:
-        resolved_plan_id = plan_id_or_task_id
-        resolved_task_id = task_id
+    resolved_plan_id, resolved_task_id = _resolve_task_target(task_id, plan_id_option)
     _do_task_start(
         resolved_plan_id,
         resolved_task_id,
@@ -9972,13 +9921,7 @@ def _task_start(
 
 @task_app.command("done")
 def _task_done(
-    plan_id_or_task_id: Annotated[
-        str, typer.Argument(help="Plan ID, or Task ID if a default plan is saved.")
-    ],
-    task_id: Annotated[
-        Optional[str],
-        typer.Argument(help="Task ID. Optional when a default plan is saved."),
-    ] = None,
+    task_id: Annotated[str, typer.Argument(help="Task ID.")],
     plan_id_option: Annotated[
         Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
     ] = None,
@@ -10007,17 +9950,7 @@ def _task_done(
     ] = None,
 ):
     """Mark a task as completed. Use --cost/--tokens to report agent session cost."""
-    resolved_plan_id: str | None
-    resolved_task_id: str
-    if plan_id_option:
-        resolved_plan_id = plan_id_option
-        resolved_task_id = task_id or plan_id_or_task_id
-    elif task_id is None:
-        resolved_plan_id = _require_plan_context(None)
-        resolved_task_id = plan_id_or_task_id
-    else:
-        resolved_plan_id = plan_id_or_task_id
-        resolved_task_id = task_id
+    resolved_plan_id, resolved_task_id = _resolve_task_target(task_id, plan_id_option)
     _do_task_done(
         resolved_plan_id,
         resolved_task_id,
@@ -10059,13 +9992,7 @@ def _task_done(
 
 @task_app.command("block")
 def _task_block(
-    plan_id_or_task_id: Annotated[
-        str, typer.Argument(help="Plan ID, or Task ID if a default plan is saved.")
-    ],
-    task_id: Annotated[
-        Optional[str],
-        typer.Argument(help="Task ID. Optional when a default plan is saved."),
-    ] = None,
+    task_id: Annotated[str, typer.Argument(help="Task ID.")],
     plan_id_option: Annotated[
         Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
     ] = None,
@@ -10078,17 +10005,7 @@ def _task_block(
     ] = None,
 ):
     """Mark a task as blocked."""
-    resolved_plan_id: str | None
-    resolved_task_id: str
-    if plan_id_option:
-        resolved_plan_id = plan_id_option
-        resolved_task_id = task_id or plan_id_or_task_id
-    elif task_id is None:
-        resolved_plan_id = _require_plan_context(None)
-        resolved_task_id = plan_id_or_task_id
-    else:
-        resolved_plan_id = plan_id_or_task_id
-        resolved_task_id = task_id
+    resolved_plan_id, resolved_task_id = _resolve_task_target(task_id, plan_id_option)
     _do_task_block(
         resolved_plan_id,
         resolved_task_id,
@@ -10099,13 +10016,7 @@ def _task_block(
 
 @task_app.command("unblock")
 def _task_unblock(
-    plan_id_or_task_id: Annotated[
-        str, typer.Argument(help="Plan ID, or Task ID if a default plan is saved.")
-    ],
-    task_id: Annotated[
-        Optional[str],
-        typer.Argument(help="Task ID. Optional when a default plan is saved."),
-    ] = None,
+    task_id: Annotated[str, typer.Argument(help="Task ID.")],
     plan_id_option: Annotated[
         Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
     ] = None,
@@ -10116,43 +10027,27 @@ def _task_unblock(
         ),
     ] = None,
     status: Annotated[
-        str, typer.Option("--status", "-s", help="Status to use after unblocking.")
-    ] = "in_progress",
+        TaskStatus, typer.Option("--status", "-s", help="Status to use after unblocking.")
+    ] = TaskStatus.IN_PROGRESS,
     feedback_reason: Annotated[
         Optional[str],
         typer.Option("--reason", help="Why the task is being unblocked now."),
     ] = None,
 ):
     """Clear a task blocker and resume work."""
-    resolved_plan_id: str | None
-    resolved_task_id: str
-    if plan_id_option:
-        resolved_plan_id = plan_id_option
-        resolved_task_id = task_id or plan_id_or_task_id
-    elif task_id is None:
-        resolved_plan_id = _require_plan_context(None)
-        resolved_task_id = plan_id_or_task_id
-    else:
-        resolved_plan_id = plan_id_or_task_id
-        resolved_task_id = task_id
+    resolved_plan_id, resolved_task_id = _resolve_task_target(task_id, plan_id_option)
     _do_task_unblock(
         resolved_plan_id,
         resolved_task_id,
         notes=notes,
         feedback_reason=feedback_reason,
-        status=status,
+        status=status.value,
     )
 
 
 @task_app.command("reopen")
 def _task_reopen(
-    plan_id_or_task_id: Annotated[
-        str, typer.Argument(help="Plan ID, or Task ID if a default plan is saved.")
-    ],
-    task_id: Annotated[
-        Optional[str],
-        typer.Argument(help="Task ID. Optional when a default plan is saved."),
-    ] = None,
+    task_id: Annotated[str, typer.Argument(help="Task ID.")],
     plan_id_option: Annotated[
         Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
     ] = None,
@@ -10163,46 +10058,30 @@ def _task_reopen(
         ),
     ] = None,
     status: Annotated[
-        str,
+        TaskStatus,
         typer.Option(
             "--status", "-s", help="Status to use after reopening (defaults to todo)."
         ),
-    ] = "todo",
+    ] = TaskStatus.TODO,
     feedback_reason: Annotated[
         Optional[str],
         typer.Option("--reason", help="Why the task is being reopened now."),
     ] = None,
 ):
     """Move a task out of completed state so it can be worked again."""
-    resolved_plan_id: str | None
-    resolved_task_id: str
-    if plan_id_option:
-        resolved_plan_id = plan_id_option
-        resolved_task_id = task_id or plan_id_or_task_id
-    elif task_id is None:
-        resolved_plan_id = _require_plan_context(None)
-        resolved_task_id = plan_id_or_task_id
-    else:
-        resolved_plan_id = plan_id_or_task_id
-        resolved_task_id = task_id
+    resolved_plan_id, resolved_task_id = _resolve_task_target(task_id, plan_id_option)
     _do_task_reopen(
         resolved_plan_id,
         resolved_task_id,
         notes=notes,
         feedback_reason=feedback_reason,
-        status=status,
+        status=status.value,
     )
 
 
 @task_app.command("note")
 def _task_note(
-    plan_id_or_task_id: Annotated[
-        str, typer.Argument(help="Plan ID, or Task ID if a default plan is saved.")
-    ],
-    task_id: Annotated[
-        Optional[str],
-        typer.Argument(help="Task ID. Optional when a default plan is saved."),
-    ] = None,
+    task_id: Annotated[str, typer.Argument(help="Task ID.")],
     plan_id_option: Annotated[
         Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
     ] = None,
@@ -10214,17 +10093,7 @@ def _task_note(
     ] = None,
 ):
     """Append a timestamped note to a task."""
-    resolved_plan_id: str | None
-    resolved_task_id: str
-    if plan_id_option:
-        resolved_plan_id = plan_id_option
-        resolved_task_id = task_id or plan_id_or_task_id
-    elif task_id is None:
-        resolved_plan_id = _require_plan_context(None)
-        resolved_task_id = plan_id_or_task_id
-    else:
-        resolved_plan_id = plan_id_or_task_id
-        resolved_task_id = task_id
+    resolved_plan_id, resolved_task_id = _resolve_task_target(task_id, plan_id_option)
     _append_task_note(
         resolved_plan_id,
         resolved_task_id,
@@ -10235,35 +10104,19 @@ def _task_note(
 
 @task_app.command("artifact")
 def _task_artifact(
-    plan_id_or_task_id: Annotated[
-        str, typer.Argument(help="Plan ID, or Task ID if a default plan is saved.")
-    ],
-    task_id: Annotated[
-        Optional[str],
-        typer.Argument(help="Task ID. Optional when a default plan is saved."),
-    ] = None,
+    task_id: Annotated[str, typer.Argument(help="Task ID.")],
     plan_id_option: Annotated[
         Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
     ] = None,
     link: Annotated[
-        str, typer.Option("--link", "-l", help="Artifact URL to attach to the task.")
+        str, typer.Option("--link", "-l", help="Attach a URL to this task (PR, doc, issue, dashboard, CI run, etc.).")
     ] = ...,
     feedback_reason: Annotated[
         Optional[str], typer.Option("--reason", help="Why this artifact matters.")
     ] = None,
 ):
     """Attach an artifact link to a task without overwriting existing links."""
-    resolved_plan_id: str | None
-    resolved_task_id: str
-    if plan_id_option:
-        resolved_plan_id = plan_id_option
-        resolved_task_id = task_id or plan_id_or_task_id
-    elif task_id is None:
-        resolved_plan_id = _require_plan_context(None)
-        resolved_task_id = plan_id_or_task_id
-    else:
-        resolved_plan_id = plan_id_or_task_id
-        resolved_task_id = task_id
+    resolved_plan_id, resolved_task_id = _resolve_task_target(task_id, plan_id_option)
     _add_task_artifact(
         resolved_plan_id,
         resolved_task_id,
@@ -10993,13 +10846,7 @@ def _plan_sync_pull(
 
 @task_app.command("decide")
 def _task_decide(
-    plan_id_or_task_id: Annotated[
-        str, typer.Argument(help="Plan ID, or Task ID if a default plan is saved.")
-    ],
-    task_id: Annotated[
-        Optional[str],
-        typer.Argument(help="Task ID. Optional when a default plan is saved."),
-    ] = None,
+    task_id: Annotated[str, typer.Argument(help="Task ID.")],
     plan_id_option: Annotated[
         Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
     ] = None,
@@ -11016,17 +10863,7 @@ def _task_decide(
     ] = None,
 ):
     """Record a structured decision for a task."""
-    resolved_plan_id: str | None
-    resolved_task_id: str
-    if plan_id_option:
-        resolved_plan_id = plan_id_option
-        resolved_task_id = task_id or plan_id_or_task_id
-    elif task_id is None:
-        resolved_plan_id = _require_plan_context(None)
-        resolved_task_id = plan_id_or_task_id
-    else:
-        resolved_plan_id = plan_id_or_task_id
-        resolved_task_id = task_id
+    resolved_plan_id, resolved_task_id = _resolve_task_target(task_id, plan_id_option)
 
     if not context or not choice or not reasoning:
         print(
