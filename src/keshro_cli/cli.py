@@ -1132,11 +1132,57 @@ def _print_task_detail(
     print(f"{DIM}Owner:{RESET} {_clean(task.get('owner')) or 'Unassigned'}")
     if task.get("blocked_reason"):
         print(f"{DIM}Blocked:{RESET} {task['blocked_reason']}")
+    if task.get("notes"):
+        print(f"{DIM}Notes:{RESET}")
+        for line in str(task["notes"]).splitlines()[-4:]:
+            cleaned = _clean(line)
+            if cleaned:
+                print(f"  - {cleaned}")
     links = task.get("artifact_links") or []
     if links:
         print(f"{DIM}Artifacts:{RESET}")
         for link in links:
             print(f"  - {link}")
+    execution_log = [
+        entry for entry in (task.get("execution_log") or []) if isinstance(entry, dict)
+    ]
+    if execution_log:
+        print(f"{DIM}Recent activity:{RESET}")
+        for entry in execution_log[-8:]:
+            timestamp = _clean(entry.get("timestamp"))
+            label_parts = [
+                _clean(entry.get("event_type")) or "activity",
+                _clean(entry.get("status")),
+                _clean(entry.get("phase")),
+            ]
+            label = " · ".join(part for part in label_parts if part)
+            details: list[str] = []
+            message = _clean(entry.get("message"))
+            error = _clean(entry.get("error"))
+            files = [_clean(path) for path in (entry.get("files") or []) if _clean(path)]
+            if message:
+                details.append(message)
+            if error and error != message:
+                details.append(f"error: {error}")
+            if files:
+                details.append(f"files: {', '.join(files[:5])}")
+            metric_bits: list[str] = []
+            metrics = entry.get("metrics") or {}
+            if isinstance(metrics, dict):
+                if metrics.get("duration_seconds") is not None:
+                    metric_bits.append(
+                        f"{_format_duration(float(metrics['duration_seconds']))}"
+                    )
+                if metrics.get("tokens_used") is not None:
+                    metric_bits.append(f"{int(metrics['tokens_used']):,} tokens")
+                if metrics.get("cost_usd") is not None:
+                    metric_bits.append(f"${float(metrics['cost_usd']):.4f}")
+            if metric_bits:
+                details.append(", ".join(metric_bits))
+            prefix = f"  - [{timestamp}] " if timestamp else "  - "
+            print(prefix + (label or "activity"))
+            for detail in details[:3]:
+                print(f"      {detail}")
 
 
 def _print_task_update_summary(plan: dict, task_id: str, payload: dict) -> None:
@@ -7992,6 +8038,40 @@ def _install_agent_integrations(silent: bool = False) -> tuple[list[str], list[s
     return installed, already_present
 
 
+_AGENT_REFRESH_COMMANDS = {
+    "create",
+    "continue",
+    "status",
+    "task",
+    "plan",
+    "explain",
+    "rollback",
+    "migration",
+}
+
+
+def _first_cli_command(argv: list[str]) -> str | None:
+    skip_next = False
+    options_with_values = {"--api-url", "--token"}
+    for arg in argv[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in options_with_values:
+            skip_next = True
+            continue
+        if not arg.startswith("-"):
+            return arg.strip()
+    return None
+
+
+def _should_refresh_agent_integrations(argv: list[str]) -> bool:
+    command = _first_cli_command(argv)
+    if not command:
+        return False
+    return command in _AGENT_REFRESH_COMMANDS
+
+
 @app.command("setup-claude", hidden=True)
 def _setup_claude():
     """Install a global Claude Code slash command for Keshro"""
@@ -8232,11 +8312,16 @@ def _print_plan_status(plan: dict) -> None:
     in_progress = [s for s in steps if _clean(s.get("status")).lower() == "in_progress"]
     blocked = [s for s in steps if _clean(s.get("status")).lower() == "blocked"]
     todo = [s for s in steps if _clean(s.get("status")).lower() == "todo"]
+    plan_status = _clean(plan.get("status")).lower()
 
     # Header
-    print(
-        f"\n{CYAN}{title}{RESET} {DIM}{path_label}{RESET} [{len(done)}/{len(steps)} done]"
-    )
+    if steps:
+        progress_label = f"[{len(done)}/{len(steps)} done]"
+    elif plan_status == "analyzing":
+        progress_label = "[analyzing]"
+    else:
+        progress_label = "[no tasks]"
+    print(f"\n{CYAN}{title}{RESET} {DIM}{path_label}{RESET} {progress_label}")
     print()
 
     _print_plan_enrichment(plan)
@@ -8246,6 +8331,13 @@ def _print_plan_status(plan: dict) -> None:
         if plan_id:
             dashboard_url = _execution_dashboard_url(plan, plan_id)
             print(f"  {DIM}Review in UI: {dashboard_url}{RESET}")
+        print()
+
+    if not steps:
+        if plan_status == "analyzing":
+            print(f"  {DIM}Plan is still being created from analysis. Tasks will appear when analysis completes.{RESET}")
+        else:
+            print(f"  {DIM}This execution context does not have any tasks yet.{RESET}")
         print()
 
     # Status symbols
@@ -10931,8 +11023,9 @@ def main(argv: list[str] | None = None):
                 print(f"{RED}{exc.code}{RESET}", file=sys.stderr)
                 return 1
             return exc.code if isinstance(exc.code, int) and exc.code != 0 else 0
-    _maybe_refresh_claude()
-    _maybe_refresh_codex()
+    if _should_refresh_agent_integrations([sys.argv[0], *argv]):
+        _maybe_refresh_claude()
+        _maybe_refresh_codex()
     # Allow --json anywhere in the command line by hoisting it to the front
     if "--json" in argv[1:]:
         argv = [arg for arg in argv if arg != "--json"]
