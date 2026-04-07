@@ -5388,7 +5388,8 @@ def test_status_shows_task_ids_inline(fake_client, capsys, monkeypatch):
     code = cli.main(["status", "-p", "plan-123"])
     out = ANSI_RE.sub("", capsys.readouterr().out)
     assert code == 0
-    assert "1. Pilot DAG (task-id: task-1)" in out
+    assert "1. Pilot DAG" in out
+    assert "task-id: task-1" in out
 
 
 def test_format_task_note_for_terminal_strips_embedded_timestamp():
