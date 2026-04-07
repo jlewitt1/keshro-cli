@@ -3640,7 +3640,7 @@ def test_plan_view_is_human_readable_by_default(fake_client, capsys, monkeypatch
 
 
 def test_task_view_shows_plan_association(fake_client, capsys):
-    cli.main(["task", "view", "plan-123", "review-schedules"])
+    cli.main(["task", "view", "review-schedules", "-p", "plan-123"])
     out = capsys.readouterr().out
     assert "AWS Batch to Airflow pilot" in out
     assert "plan-123" in out
@@ -4200,8 +4200,9 @@ def test_task_edit_patches_existing_task(fake_client, capsys):
             "--json",
             "task",
             "edit",
-            "plan-123",
             "task-456",
+            "-p",
+            "plan-123",
             "-s",
             "in_progress",
             "-o",
@@ -4224,8 +4225,9 @@ def test_task_edit_accepts_blocked_reason_short_alias_r(fake_client, capsys):
             "--json",
             "task",
             "edit",
-            "plan-123",
             "task-456",
+            "-p",
+            "plan-123",
             "-s",
             "blocked",
             "-r",
@@ -4244,8 +4246,9 @@ def test_task_edit_accepts_feedback_reason(fake_client, capsys):
             "--json",
             "task",
             "edit",
-            "plan-123",
             "task-456",
+            "-p",
+            "plan-123",
             "--reason",
             "Needed a more implementation-specific task",
         ]
@@ -4305,8 +4308,9 @@ def test_task_start_marks_task_in_progress(fake_client, capsys):
             "--json",
             "task",
             "start",
-            "plan-123",
             "task-456",
+            "-p",
+            "plan-123",
             "--notes",
             "Starting the pilot implementation",
             "--reason",
@@ -4342,8 +4346,9 @@ def test_task_done_marks_task_completed(fake_client, capsys):
             "--json",
             "task",
             "done",
-            "plan-123",
             "task-456",
+            "-p",
+            "plan-123",
             "--notes",
             "Pilot DAG merged and validated",
             "--link",
@@ -4398,8 +4403,9 @@ def test_task_done_requires_completion_evidence_when_acceptance_criteria_exist(
             "--json",
             "task",
             "done",
-            "plan-123",
             "task-456",
+            "-p",
+            "plan-123",
             "--notes",
             "Pilot DAG merged and validated",
         ]
@@ -4447,8 +4453,9 @@ def test_task_done_accepts_completion_evidence_when_acceptance_criteria_exist(
             "--json",
             "task",
             "done",
-            "plan-123",
             "task-456",
+            "-p",
+            "plan-123",
             "--notes",
             "Files created: dags/daily_sales_pipeline.py | Acceptance criteria met: DAG syntax validates without errors; retry logic implemented | Verification: airflow dags check dags/ passed; python -m py_compile dags/*.py passed",
         ]
@@ -4465,8 +4472,9 @@ def test_task_block_marks_task_blocked(fake_client, capsys):
             "--json",
             "task",
             "block",
-            "plan-123",
             "task-456",
+            "-p",
+            "plan-123",
             "--reason",
             "Waiting on Terraform IAM role changes",
             "--feedback-reason",
@@ -4489,8 +4497,9 @@ def test_task_unblock_clears_blocked_reason(fake_client, capsys):
             "--json",
             "task",
             "unblock",
-            "plan-123",
             "task-456",
+            "-p",
+            "plan-123",
             "--notes",
             "Terraform role applied; resuming pilot",
         ]
@@ -4520,8 +4529,9 @@ def test_task_done_appends_to_existing_notes(fake_client, monkeypatch, capsys):
             "--json",
             "task",
             "done",
-            "plan-123",
             "task-456",
+            "-p",
+            "plan-123",
             "--notes",
             "Pilot DAG merged and validated",
         ]
@@ -4536,8 +4546,9 @@ def test_task_start_human_output_is_compact(fake_client, capsys):
         [
             "task",
             "start",
-            "plan-123",
             "task-456",
+            "-p",
+            "plan-123",
             "--notes",
             "Starting the pilot implementation",
         ]
@@ -4556,8 +4567,9 @@ def test_task_reopen_sets_todo_and_clears_blocker(fake_client, capsys):
             "--json",
             "task",
             "reopen",
-            "plan-123",
             "task-456",
+            "-p",
+            "plan-123",
             "--notes",
             "Validation failed; reopening for follow-up",
         ]
@@ -4570,7 +4582,7 @@ def test_task_reopen_sets_todo_and_clears_blocker(fake_client, capsys):
 
 
 def test_task_reopen_human_output_is_compact(fake_client, capsys):
-    cli.main(["task", "reopen", "plan-123", "task-456"])
+    cli.main(["task", "reopen", "task-456", "-p", "plan-123"])
     out = ANSI_RE.sub("", capsys.readouterr().out)
     assert "Updated task" in out
     assert "[todo]." in out
@@ -4585,8 +4597,9 @@ def test_task_note_appends_timestamped_note(fake_client, capsys):
             "--json",
             "task",
             "note",
-            "plan-123",
             "task-456",
+            "-p",
+            "plan-123",
             "--note",
             "Airflow will orchestrate Batch during the pilot",
         ]
@@ -4603,8 +4616,9 @@ def test_task_artifact_appends_link_without_overwriting(fake_client, capsys):
             "--json",
             "task",
             "artifact",
-            "plan-123",
             "task-456",
+            "-p",
+            "plan-123",
             "--link",
             "https://github.com/acme/migrations/pull/99",
         ]
@@ -4642,8 +4656,9 @@ def test_task_delete_accepts_feedback_reason(fake_client, capsys):
             "--json",
             "task",
             "delete",
-            "plan-123",
             "task-456",
+            "-p",
+            "plan-123",
             "--reason",
             "not_relevant",
         ]
@@ -4663,7 +4678,7 @@ def test_task_delete_prompts_before_removing_linked_issue(
         return True
 
     monkeypatch.setattr("typer.confirm", fake_confirm)
-    cli.main(["task", "delete", "plan-123", "task-456"])
+    cli.main(["task", "delete", "task-456", "-p", "plan-123"])
     out = capsys.readouterr().out
     assert "Deleted task task-456 from plan plan-123." in out
     assert "linked Linear issue KES-42" in seen["message"]
@@ -4675,7 +4690,7 @@ def test_task_delete_yes_skips_confirmation(fake_client, capsys, monkeypatch):
         raise AssertionError("confirm should not be called")
 
     monkeypatch.setattr("typer.confirm", fail_confirm)
-    cli.main(["task", "delete", "plan-123", "task-456", "--yes"])
+    cli.main(["task", "delete", "task-456", "-p", "plan-123", "--yes"])
     out = capsys.readouterr().out
     assert "Deleted task task-456 from plan plan-123." in out
 

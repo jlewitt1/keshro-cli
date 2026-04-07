@@ -8785,10 +8785,6 @@ def _plan_status(
 
 @app.command("status")
 def _status_alias(
-    plan_id_arg: Annotated[
-        Optional[str],
-        typer.Argument(help="Execution context ID. Uses saved context if omitted."),
-    ] = None,
     plan_id: Annotated[
         Optional[str],
         typer.Option(
@@ -8807,7 +8803,7 @@ def _status_alias(
     ] = False,
 ):
     """Live status dashboard for the current execution context."""
-    _run_status(plan_id_arg or plan_id, watch=watch, tui=tui)
+    _run_status(plan_id, watch=watch, tui=tui)
 
 
 @plan_app.command("next")
@@ -10243,8 +10239,7 @@ def _edit_task_alias(
 # ---------------------------------------------------------------------------
 
 
-@app.command("rollback")
-def _rollback(
+def _rollback_task(
     task_id: Annotated[
         str,
         typer.Argument(
@@ -10370,13 +10365,45 @@ def _rollback(
         )
 
 
-# ---------------------------------------------------------------------------
-# Explain command
-# ---------------------------------------------------------------------------
+@task_app.command("rollback")
+def _task_rollback(
+    task_id: Annotated[
+        str,
+        typer.Argument(
+            help="Task ID to rollback to (reverts to the checkpoint before this task)."
+        ),
+    ],
+    plan_id_option: Annotated[
+        Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
+    ] = None,
+    force: Annotated[
+        bool, typer.Option("--force", "-f", help="Skip confirmation.")
+    ] = False,
+):
+    """Rollback to the git checkpoint before a task was started."""
+    _rollback_task(task_id, plan_id_option, force)
 
 
-@app.command("explain")
-def _explain(
+@app.command("rollback", hidden=True)
+def _rollback_alias(
+    task_id: Annotated[
+        str,
+        typer.Argument(
+            help="Task ID to rollback to (reverts to the checkpoint before this task)."
+        ),
+    ],
+    plan_id_option: Annotated[
+        Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
+    ] = None,
+    force: Annotated[
+        bool, typer.Option("--force", "-f", help="Skip confirmation.")
+    ] = False,
+):
+    """Rollback to the git checkpoint before a task was started."""
+    _rollback_task(task_id, plan_id_option, force)
+
+
+def _explain_task(
     task_id: Annotated[str, typer.Argument(help="Task ID to explain decisions for.")],
     plan_id_option: Annotated[
         Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
@@ -10434,6 +10461,28 @@ def _explain(
         print(f"  {GREEN}Choice:{RESET}  {decision.get('choice', 'N/A')}")
         print(f"  {CYAN}Reasoning:{RESET}  {decision.get('reasoning', 'N/A')}")
         print()
+
+
+@task_app.command("explain")
+def _task_explain(
+    task_id: Annotated[str, typer.Argument(help="Task ID to explain decisions for.")],
+    plan_id_option: Annotated[
+        Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
+    ] = None,
+):
+    """Show the decision audit trail for a task."""
+    _explain_task(task_id, plan_id_option)
+
+
+@app.command("explain", hidden=True)
+def _explain_alias(
+    task_id: Annotated[str, typer.Argument(help="Task ID to explain decisions for.")],
+    plan_id_option: Annotated[
+        Optional[str], typer.Option("--plan-id", "-p", help="Plan ID.")
+    ] = None,
+):
+    """Show the decision audit trail for a task."""
+    _explain_task(task_id, plan_id_option)
 
 
 # ---------------------------------------------------------------------------
