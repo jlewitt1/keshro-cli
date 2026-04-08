@@ -6961,7 +6961,7 @@ def _collect_graphify_context(work_dir: str) -> str | None:
     return "\n".join(
         [
             "Graphify repo graph context added.",
-            f"Artifact: {report_path}",
+            f"Artifact: {_GRAPHIFY_REPORT_RELATIVE_PATH}",
             "Selected planning-relevant sections:",
             snippet,
         ]
