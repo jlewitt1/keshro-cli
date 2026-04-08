@@ -2202,6 +2202,137 @@ def test_should_scan_default_work_dir_skips_parent_directory_with_multiple_repos
     assert cli._should_scan_default_work_dir(str(tmp_path)) is False
 
 
+def test_collect_generic_discovery_includes_graphify_report(tmp_path):
+    (tmp_path / "package.json").write_text('{"name":"demo"}\n')
+    graphify_dir = tmp_path / "graphify-out"
+    graphify_dir.mkdir()
+    (graphify_dir / "GRAPH_REPORT.md").write_text(
+        "# Graph Report\n\n## God Nodes\n- app/services/planner.py\n",
+        encoding="utf-8",
+    )
+
+    out = cli._collect_generic_discovery(str(tmp_path))
+
+    assert out is not None
+    assert "Detected: Node.js project (package.json)" in out
+    assert "Graphify repo graph context added." in out
+    assert "graphify-out/GRAPH_REPORT.md" in out
+    assert "## God Nodes" in out
+
+
+def test_select_graphify_sections_prefers_planning_relevant_sections():
+    report = "\n".join(
+        [
+            "# Graph Report",
+            "",
+            "General overview text",
+            "",
+            "## File Inventory",
+            "- package.json",
+            "- src/",
+            "",
+            "## God Nodes",
+            "- app/services/planner.py",
+            "",
+            "## Surprising Connections",
+            "- planner.py touches rollout checks",
+        ]
+    )
+
+    out = cli._select_graphify_sections(report)
+
+    assert "## God Nodes" in out
+    assert "## Surprising Connections" in out
+    assert "## File Inventory" not in out
+
+
+def test_collect_graphify_context_runs_graphify_and_extracts_summary(
+    tmp_path, monkeypatch
+):
+    graphify_dir = tmp_path / "graphify-out"
+    graphify_dir.mkdir()
+    report_path = graphify_dir / "GRAPH_REPORT.md"
+    report_path.write_text(
+        "# Graph Report\n\n## Summary\nService boundaries and central modules.\n",
+        encoding="utf-8",
+    )
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        "keshro_cli.cli._run_graphify",
+        lambda work_dir: calls.append(work_dir) or report_path,
+    )
+
+    out = cli._collect_graphify_context(str(tmp_path))
+
+    assert calls == [str(tmp_path)]
+    assert out is not None
+    assert "Graphify repo graph context added." in out
+    assert "## Summary" in out
+
+
+def test_create_forwards_graphify_context_into_plan_generation(
+    fake_client, monkeypatch, tmp_path
+):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / "package.json").write_text('{"name":"demo"}\n')
+    graphify_dir = repo_root / "graphify-out"
+    graphify_dir.mkdir()
+    (graphify_dir / "GRAPH_REPORT.md").write_text(
+        "\n".join(
+            [
+                "# Graph Report",
+                "",
+                "## Summary",
+                "Payment and auth services share a common gateway.",
+                "",
+                "## God Nodes",
+                "- src/gateway.ts",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
+    monkeypatch.setattr("keshro_cli.cli.update_auth", lambda payload: payload)
+    monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
+    monkeypatch.setattr(
+        "keshro_cli.cli._prompt_agent_display_name", lambda _agent: "Claude Code"
+    )
+    monkeypatch.chdir(repo_root)
+
+    captured: dict[str, object] = {}
+    original_post = fake_client.post
+
+    def _post(path, json=None, timeout=None):
+        if path == "/v1/plans/describe/preview":
+            captured["preview_discovered_context"] = json["discovered_context"]
+            return _FakeResponse({"questions": [], "enrichment_context": ""})
+        if path == "/v1/plans/generate":
+            captured["generate_discovered_context"] = json["discovered_context"]
+            return _FakeResponse(
+                {
+                    "id": "plan-general-graphify",
+                    "title": "General project plan",
+                    "status": "draft",
+                    "plan_steps": [],
+                }
+            )
+        return original_post(path, json=json, timeout=timeout)
+
+    fake_client.post = _post
+
+    code = cli.main(["create", "--context", "refactor auth"])
+
+    assert code == 0
+    assert "Graphify repo graph context added." in str(
+        captured["preview_discovered_context"]
+    )
+    assert "## Summary" in str(captured["preview_discovered_context"])
+    assert "src/gateway.ts" in str(captured["generate_discovered_context"])
+
+
 def test_should_scan_default_work_dir_honors_explicit_target(tmp_path):
     repo_one = tmp_path / "repo-one"
     repo_two = tmp_path / "repo-two"

@@ -27,6 +27,7 @@ dependencies = [
     "typer>=0.9",
     "rich>=13.0",
     "textual>=0.80",
+    "graphifyy>=3.0.0",
 ]
 
 [project.urls]

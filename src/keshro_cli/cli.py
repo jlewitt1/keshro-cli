@@ -6847,6 +6847,128 @@ def _create_migration(
             _shutil.rmtree(clone_dir, ignore_errors=True)
 
 
+_GRAPHIFY_PREFERRED_SECTION_KEYS = (
+    "summary",
+    "god nodes",
+    "community",
+    "communities",
+    "surprising",
+    "connections",
+)
+_GRAPHIFY_MAX_SECTION_CHARS = 1500
+_GRAPHIFY_MAX_TOTAL_CHARS = 4500
+_GRAPHIFY_REPORT_RELATIVE_PATH = Path("graphify-out") / "GRAPH_REPORT.md"
+_GRAPHIFY_TIMEOUT_SECONDS = 90
+
+
+
+def _run_graphify(work_dir: str) -> Path | None:
+    report_path = Path(work_dir) / _GRAPHIFY_REPORT_RELATIVE_PATH
+    if report_path.is_file():
+        return report_path
+
+    commands: list[list[str]] = []
+    graphify_exe = shutil.which("graphify")
+    if graphify_exe:
+        commands.append([graphify_exe, work_dir])
+    commands.append([sys.executable, "-m", "graphify", work_dir])
+
+    for command in commands:
+        try:
+            subprocess.run(
+                command,
+                cwd=work_dir,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=_GRAPHIFY_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            continue
+        if report_path.is_file():
+            return report_path
+    return report_path if report_path.is_file() else None
+
+
+def _read_graphify_report(report_path: Path) -> str | None:
+    try:
+        report = report_path.read_text(encoding="utf-8", errors="replace").strip()
+    except Exception:
+        return None
+    return report or None
+
+
+def _select_graphify_sections(report: str) -> str:
+    lines = report.splitlines()
+    sections: list[tuple[str, str]] = []
+    current_heading = "Overview"
+    current_lines: list[str] = []
+
+    for line in lines:
+        if line.startswith("#"):
+            body = "\n".join(current_lines).strip()
+            if body:
+                sections.append((current_heading, body))
+            current_heading = line.lstrip("#").strip() or "Overview"
+            current_lines = []
+            continue
+        current_lines.append(line)
+
+    body = "\n".join(current_lines).strip()
+    if body:
+        sections.append((current_heading, body))
+
+    if not sections:
+        return report[:_GRAPHIFY_MAX_TOTAL_CHARS].strip()
+
+    preferred: list[tuple[str, str]] = []
+    fallback: list[tuple[str, str]] = []
+    for heading, body in sections:
+        normalized = heading.lower()
+        if any(key in normalized for key in _GRAPHIFY_PREFERRED_SECTION_KEYS):
+            preferred.append((heading, body))
+        else:
+            fallback.append((heading, body))
+
+    chosen = preferred or fallback
+    selected_chunks: list[str] = []
+    total = 0
+    for heading, body in chosen:
+        chunk = f"## {heading}\n{body[:_GRAPHIFY_MAX_SECTION_CHARS].strip()}".strip()
+        if not chunk:
+            continue
+        chunk_len = len(chunk)
+        if selected_chunks and total + chunk_len > _GRAPHIFY_MAX_TOTAL_CHARS:
+            break
+        if not selected_chunks and chunk_len > _GRAPHIFY_MAX_TOTAL_CHARS:
+            return chunk[:_GRAPHIFY_MAX_TOTAL_CHARS].strip()
+        selected_chunks.append(chunk)
+        total += chunk_len
+    return "\n\n".join(selected_chunks).strip()
+
+
+
+def _collect_graphify_context(work_dir: str) -> str | None:
+    report_path = _run_graphify(work_dir)
+    if not report_path or not report_path.is_file():
+        return None
+    report = _read_graphify_report(report_path)
+    if not report:
+        return None
+    snippet = _select_graphify_sections(report)
+    if not snippet:
+        return None
+    return "\n".join(
+        [
+            "Graphify repo graph context added.",
+            f"Artifact: {report_path}",
+            "Selected planning-relevant sections:",
+            snippet,
+        ]
+    )
+
+
+
 def _collect_generic_discovery(work_dir: str) -> str | None:
     """Collect basic project facts from a directory for plan enrichment."""
     facts = []
@@ -6883,6 +7005,10 @@ def _collect_generic_discovery(work_dir: str) -> str | None:
             facts.append(f"Top-level files/dirs: {', '.join(top_entries)}")
     except Exception:
         pass
+
+    graphify_context = _collect_graphify_context(work_dir)
+    if graphify_context:
+        facts.append(graphify_context)
 
     return "\n\n".join(facts) if facts else None
 
