@@ -6922,15 +6922,12 @@ def _select_graphify_sections(report: str) -> str:
         return report[:_GRAPHIFY_MAX_TOTAL_CHARS].strip()
 
     preferred: list[tuple[str, str]] = []
-    fallback: list[tuple[str, str]] = []
     for heading, body in sections:
         normalized = heading.lower()
         if any(key in normalized for key in _GRAPHIFY_PREFERRED_SECTION_KEYS):
             preferred.append((heading, body))
-        else:
-            fallback.append((heading, body))
 
-    chosen = preferred or fallback
+    chosen = preferred or sections
     selected_chunks: list[str] = []
     total = 0
     for heading, body in chosen:
