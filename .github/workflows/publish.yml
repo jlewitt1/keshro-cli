@@ -79,12 +79,11 @@ jobs:
             exit 0
           fi
           # Install the wheel we just built (faster + deterministic
-          # vs. waiting for PyPI propagation). Also pull keshro-mcp from
-          # PyPI so the upload payload reports its version too — keshro
-          # and keshro-mcp release in lockstep, so the latest published
-          # mcp version is what users will be installing alongside this
-          # CLI.
-          pip install --quiet --upgrade dist/*.whl keshro-mcp
+          # than waiting for PyPI propagation). The MCP version is now
+          # owned by the keshro-mcp publish workflow, which uploads it
+          # to its own backend endpoint, so we no longer need to install
+          # keshro-mcp here just to learn its version.
+          pip install --quiet --upgrade dist/*.whl
           python - > cli-options.json <<'PY'
           import json
           from datetime import datetime, timezone
@@ -149,16 +148,11 @@ jobs:
 
           payload = {
               "version": None,
-              "mcp_version": None,
               "generated_at": datetime.now(timezone.utc).isoformat(),
               "commands": {},
           }
           try:
               payload["version"] = pkg_version("keshro")
-          except PackageNotFoundError:
-              pass
-          try:
-              payload["mcp_version"] = pkg_version("keshro-mcp")
           except PackageNotFoundError:
               pass
 
