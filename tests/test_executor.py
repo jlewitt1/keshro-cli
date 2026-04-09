@@ -3,7 +3,7 @@
 PR 3 of the executor-abstraction stack. These tests verify:
 - normalize_executor accepts known values and rejects garbage
 - resolve_task_executor honors the precedence:
-    cli_override > task.executor > fallback
+    cli_override > task.executor > plan_default > fallback
 - LocalClaudeCodeExecutor delegates to the injected launch callable
 - ManagedAgentExecutor refuses cleanly until PR 4 wires it
 - build_executor picks the right concrete implementation
