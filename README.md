@@ -53,7 +53,11 @@ By default, `keshro continue` runs the next ready wave in parallel when the envi
 Each task in a plan runs on an *executor* — the runtime that actually executes it. Two executors ship today:
 
 - **`local_claude_code`** (default) — a local Claude Code subprocess running inside an isolated git worktree on your machine.
-- **`managed_agent`** — Anthropic's hosted Claude Managed Agents (the `managed-agents-2026-04-01` beta). Runs the task in a hosted cloud container instead of a local subprocess. Requires Managed Agents config (Agent ID + Environment ID) in your Keshro Account or Org settings; sessions run against your own Anthropic account.
+- **`managed_agent`** — Anthropic's hosted Claude Managed Agents (the `managed-agents-2026-04-01` beta). Runs the task in a hosted cloud container instead of a local subprocess.
+
+  **Setup:** create an Agent and Environment in the Anthropic console, then paste the IDs into **Account → Managed Agents** (personal) or **Workspace settings** (shared). Personal config overrides workspace. Sessions run against your own Anthropic account.
+
+  **Responsibility split:** Keshro routes the task and mounts your repo with your GitHub token. Your Anthropic Environment owns everything else — tools, dependencies, secrets, network access. Tasks that depend on local-only files, private VPN reachability, or custom local toolchains are not portable to the managed executor; keep those on `local_claude_code`.
 
 The executor is resolved per task in this order: `--executor` flag → `task.executor` (set per-task in the plan view) → personal default → workspace default → `local_claude_code` as the safe fallback.
 
