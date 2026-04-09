@@ -5031,6 +5031,24 @@ async def _run_parallel(
                 for task_obj, name in non_default:
                     title = _clean(task_obj.get("title")) or "Untitled"
                     print(f"  {DIM}→ {title}: {name}{RESET}")
+            # Warn when a task will run on Managed Agents (Claude) while the
+            # user asked for Codex — the --agent choice is ignored for those
+            # tasks since Managed Agents only runs Claude.
+            if agent not in ("auto", "claude"):
+                managed_mismatch = [
+                    spec["task"]
+                    for spec, name in zip(launch_specs, resolved_executors)
+                    if name == MANAGED_AGENT
+                ]
+                if managed_mismatch:
+                    titles = ", ".join(
+                        _clean(t.get("title")) or "Untitled" for t in managed_mismatch
+                    )
+                    print(
+                        f"{DIM}Warning: --agent {agent} is ignored for "
+                        f"{len(managed_mismatch)} task(s) routed to managed_agent "
+                        f"(Managed Agents only runs Claude): {titles}{RESET}"
+                    )
             # Reuse a single executor instance per resolved name so that
             # executors which may hold connections or shared state (e.g. the
             # managed-agent path) aren't re-allocated per task in the wave.
@@ -8067,6 +8085,17 @@ def _continue_command(
                 f"'managed_agent' (or 'managed')."
             )
         executor_override = normalized
+
+    # --executor managed_agent always runs Anthropic Claude on Anthropic's
+    # infrastructure; pairing it with --agent codex would silently ignore the
+    # user's agent choice. Fail fast so the mismatch is obvious.
+    if executor_override == MANAGED_AGENT and resolved_agent not in ("auto", "claude"):
+        raise SystemExit(
+            f"--executor managed_agent only supports Claude; got --agent {resolved_agent}. "
+            f"Managed Agents runs Anthropic Claude on Anthropic's infrastructure. "
+            f"Drop --agent (or use --agent claude) to proceed, or switch to "
+            f"--executor local_claude_code to run {resolved_agent} locally."
+        )
 
     if not use_parallel:
         if executor_override == MANAGED_AGENT:
