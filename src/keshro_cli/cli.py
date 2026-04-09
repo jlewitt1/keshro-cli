@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, Any, Optional
 
 import click
 import httpx
@@ -4847,8 +4847,16 @@ async def _run_parallel(
     dry_run: bool,
     agent: str = "auto",
     visible: bool = False,
+    executor_override: str | None = None,
 ) -> None:
     import uuid as _uuid
+
+    from .executor import (
+        DEFAULT_EXECUTOR,
+        MANAGED_AGENT,
+        build_executor,
+        resolve_task_executor,
+    )
 
     resolved_plan_id = _require_plan_context(plan_id)
     inside_agent_session = _inside_coding_agent()
@@ -4999,8 +5007,62 @@ async def _run_parallel(
                 }
                 for task in actionable
             ]
+            # Resolve each task's executor: --executor flag > task.executor >
+            # DEFAULT_EXECUTOR. ``build_executor`` returns the right concrete
+            # implementation for the resolved name; ``LocalClaudeCodeExecutor``
+            # delegates back to ``_launch_single_agent`` (today's behavior),
+            # while ``ManagedAgentExecutor`` will hit the backend session proxy
+            # once that lands. We log per-task selection if any task is set to
+            # something non-default so users can see what's being routed where.
+            resolved_executors = [
+                resolve_task_executor(spec["task"], cli_override=executor_override)
+                for spec in launch_specs
+            ]
+            non_default = [
+                (spec["task"], name)
+                for spec, name in zip(launch_specs, resolved_executors)
+                if name != DEFAULT_EXECUTOR
+            ]
+            if non_default:
+                print(
+                    f"\n{DIM}Executor routing: "
+                    f"{len(non_default)}/{len(launch_specs)} task(s) on non-default runtime{RESET}"
+                )
+                for task_obj, name in non_default:
+                    title = _clean(task_obj.get("title")) or "Untitled"
+                    print(f"  {DIM}→ {title}: {name}{RESET}")
+            # Warn when a task will run on Managed Agents (Claude) while the
+            # user asked for Codex — the --agent choice is ignored for those
+            # tasks since Managed Agents only runs Claude.
+            if agent not in ("auto", "claude"):
+                managed_mismatch = [
+                    spec["task"]
+                    for spec, name in zip(launch_specs, resolved_executors)
+                    if name == MANAGED_AGENT
+                ]
+                if managed_mismatch:
+                    titles = ", ".join(
+                        _clean(t.get("title")) or "Untitled" for t in managed_mismatch
+                    )
+                    print(
+                        f"{DIM}Warning: --agent {agent} is ignored for "
+                        f"{len(managed_mismatch)} task(s) routed to managed_agent "
+                        f"(Managed Agents only runs Claude): {titles}{RESET}"
+                    )
+            # Reuse a single executor instance per resolved name so that
+            # executors which may hold connections or shared state (e.g. the
+            # managed-agent path) aren't re-allocated per task in the wave.
+            _executor_cache: dict[str, Any] = {}
+
+            def _get_executor(name: str):
+                cached = _executor_cache.get(name)
+                if cached is None:
+                    cached = build_executor(name, launch=_launch_single_agent)
+                    _executor_cache[name] = cached
+                return cached
+
             agent_coros = [
-                _launch_single_agent(
+                _get_executor(name).run_task(
                     spec["task"],
                     plan,
                     resolved_plan_id,
@@ -5014,7 +5076,9 @@ async def _run_parallel(
                     launch_index=i,
                     use_local_repo_context=use_local_repo_context,
                 )
-                for i, spec in enumerate(launch_specs)
+                for i, (spec, name) in enumerate(
+                    zip(launch_specs, resolved_executors)
+                )
             ]
 
             # Background poller — prints new notes/status as agents work
@@ -7941,6 +8005,20 @@ def _continue_command(
             help="Run agents in dedicated terminal sessions instead of headless. Intended for direct use from a normal user terminal, not from inside another agent session. Uses Collaborator tiles if installed (recommended: https://github.com/collaborator-ai/collab-public), otherwise opens native Terminal.app windows on macOS.",
         ),
     ] = False,
+    executor: Annotated[
+        Optional[str],
+        typer.Option(
+            "--executor",
+            help=(
+                "Override the per-task executor for this run. Values: "
+                "'local_claude_code' (or 'local') to force every task to run in a "
+                "local Claude Code subprocess, or 'managed_agent' (or 'managed') "
+                "to route every task through Anthropic's hosted Claude Managed "
+                "Agents (requires backend support). When omitted, each task runs "
+                "on its configured executor, defaulting to local Claude Code."
+            ),
+        ),
+    ] = None,
 ):
     """Resume execution of a plan."""
 
@@ -7979,7 +8057,53 @@ def _continue_command(
             print(
                 f"{YELLOW}--visible is only supported from a direct user terminal; ignoring it inside {agent_name} and continuing headless.{RESET}"
             )
+    # Resolve --executor override. We accept friendly aliases ('local',
+    # 'managed') and normalize them via the shared executor module so the CLI
+    # and backend agree on identifiers.
+    from .executor import (
+        DEFAULT_EXECUTOR,
+        LOCAL_CLAUDE_CODE,
+        MANAGED_AGENT,
+        normalize_executor as _normalize_executor,
+    )
+
+    executor_override: str | None = None
+    if executor is not None:
+        raw = _clean(executor).lower()
+        alias_map = {
+            "local": LOCAL_CLAUDE_CODE,
+            "claude_code": LOCAL_CLAUDE_CODE,
+            "managed": MANAGED_AGENT,
+            "anthropic": MANAGED_AGENT,
+        }
+        canonical = alias_map.get(raw, raw)
+        normalized = _normalize_executor(canonical)
+        if normalized is None:
+            raise SystemExit(
+                f"Unknown --executor value {executor!r}. "
+                f"Use 'local_claude_code' (or 'local') or "
+                f"'managed_agent' (or 'managed')."
+            )
+        executor_override = normalized
+
+    # --executor managed_agent always runs Anthropic Claude on Anthropic's
+    # infrastructure; pairing it with --agent codex would silently ignore the
+    # user's agent choice. Fail fast so the mismatch is obvious.
+    if executor_override == MANAGED_AGENT and resolved_agent not in ("auto", "claude"):
+        raise SystemExit(
+            f"--executor managed_agent only supports Claude; got --agent {resolved_agent}. "
+            f"Managed Agents runs Anthropic Claude on Anthropic's infrastructure. "
+            f"Drop --agent (or use --agent claude) to proceed, or switch to "
+            f"--executor local_claude_code to run {resolved_agent} locally."
+        )
+
     if not use_parallel:
+        if executor_override == MANAGED_AGENT:
+            raise SystemExit(
+                "--executor managed_agent requires parallel mode; "
+                "remove --no-parallel to enable managed execution "
+                "(it runs through the parallel wave scheduler)."
+            )
         _continue_with_claude(
             resolved_plan_id,
             work_dir=work_dir,
@@ -8002,6 +8126,7 @@ def _continue_command(
                 dry_run=dry_run,
                 agent=resolved_agent,
                 visible=visible,
+                executor_override=executor_override,
             )
         )
 
