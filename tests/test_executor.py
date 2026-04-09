@@ -3,7 +3,7 @@
 PR 3 of the executor-abstraction stack. These tests verify:
 - normalize_executor accepts known values and rejects garbage
 - resolve_task_executor honors the precedence:
-    cli_override > task.executor > fallback
+    cli_override > task.executor > plan_default > fallback
 - LocalClaudeCodeExecutor delegates to the injected launch callable
 - ManagedAgentExecutor refuses cleanly until PR 4 wires it
 - build_executor picks the right concrete implementation
@@ -77,6 +77,42 @@ def test_resolve_task_executor_ignores_invalid_cli_override():
 
 def test_resolve_task_executor_accepts_explicit_fallback():
     assert ex.resolve_task_executor({}, fallback="managed_agent") == "managed_agent"
+
+
+def test_resolve_task_executor_uses_plan_default_when_task_unset():
+    """Legacy plan whose task has no executor → use plan_default."""
+    assert (
+        ex.resolve_task_executor({}, plan_default="managed_agent")
+        == "managed_agent"
+    )
+
+
+def test_resolve_task_executor_task_value_wins_over_plan_default():
+    """A per-task choice always beats the plan-level default."""
+    task = {"executor": "local_claude_code"}
+    assert (
+        ex.resolve_task_executor(task, plan_default="managed_agent")
+        == "local_claude_code"
+    )
+
+
+def test_resolve_task_executor_cli_override_wins_over_plan_default():
+    assert (
+        ex.resolve_task_executor(
+            {"executor": "local_claude_code"},
+            cli_override="managed_agent",
+            plan_default="local_claude_code",
+        )
+        == "managed_agent"
+    )
+
+
+def test_resolve_task_executor_invalid_plan_default_falls_through():
+    """Garbage plan_default values fall through to the hard fallback."""
+    assert (
+        ex.resolve_task_executor({}, plan_default="garbage")
+        == ex.DEFAULT_EXECUTOR
+    )
 
 
 # ---------------------------------------------------------------------------

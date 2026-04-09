@@ -5008,14 +5008,22 @@ async def _run_parallel(
                 for task in actionable
             ]
             # Resolve each task's executor: --executor flag > task.executor >
-            # DEFAULT_EXECUTOR. ``build_executor`` returns the right concrete
-            # implementation for the resolved name; ``LocalClaudeCodeExecutor``
-            # delegates back to ``_launch_single_agent`` (today's behavior),
-            # while ``ManagedAgentExecutor`` will hit the backend session proxy
-            # once that lands. We log per-task selection if any task is set to
-            # something non-default so users can see what's being routed where.
+            # plan.effective_default_executor (server-resolved user→org default,
+            # safety net for legacy plans and post-creation user-default
+            # changes) > DEFAULT_EXECUTOR. ``build_executor`` returns the
+            # right concrete implementation for the resolved name;
+            # ``LocalClaudeCodeExecutor`` delegates back to ``_launch_single_agent``
+            # (today's behavior), while ``ManagedAgentExecutor`` hits the
+            # backend session proxy. We log per-task selection if any task is
+            # set to something non-default so users can see what's being
+            # routed where.
+            plan_default = _clean(plan.get("effective_default_executor")) or None
             resolved_executors = [
-                resolve_task_executor(spec["task"], cli_override=executor_override)
+                resolve_task_executor(
+                    spec["task"],
+                    cli_override=executor_override,
+                    plan_default=plan_default,
+                )
                 for spec in launch_specs
             ]
             non_default = [

@@ -42,6 +42,7 @@ def resolve_task_executor(
     task: dict,
     *,
     cli_override: str | None = None,
+    plan_default: str | None = None,
     fallback: str = DEFAULT_EXECUTOR,
 ) -> str:
     """Decide which executor should run a single task.
@@ -49,7 +50,13 @@ def resolve_task_executor(
     Precedence (highest → lowest):
       1. ``cli_override`` — the ``--executor`` flag, if the user set it.
       2. ``task["executor"]`` — the per-task choice stored on the plan.
-      3. ``fallback`` — the hard default (``local_claude_code``).
+      3. ``plan_default`` — the plan response's
+         ``effective_default_executor`` (resolved server-side from
+         user.default_executor → plan.org.default_executor → None). This
+         covers legacy plans whose tasks were created before per-task
+         hydration landed AND plans where the user changed their personal
+         default after the plan was created.
+      4. ``fallback`` — the hard default (``local_claude_code``).
 
     Invalid values at any level are treated as unset so a typo never
     silently routes traffic to the wrong runtime.
@@ -60,6 +67,9 @@ def resolve_task_executor(
     task_level = normalize_executor((task or {}).get("executor"))
     if task_level is not None:
         return task_level
+    plan_level = normalize_executor(plan_default)
+    if plan_level is not None:
+        return plan_level
     return normalize_executor(fallback) or DEFAULT_EXECUTOR
 
 
