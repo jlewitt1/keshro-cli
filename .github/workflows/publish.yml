@@ -62,6 +62,123 @@ jobs:
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
 
+      - name: Push CLI options spec to Keshro backend
+        # Extracts the Click command tree from the just-built wheel and
+        # uploads it to the backend so the /developers docs page renders
+        # fresh flag tables and version badges without anyone touching
+        # the backend repo. Non-fatal: a missing DEPLOY_SECRET, network
+        # blip, or backend outage must not block the PyPI release.
+        continue-on-error: true
+        env:
+          KESHRO_API_URL: ${{ vars.KESHRO_API_URL || 'https://api.keshro.com' }}
+          DEPLOY_SECRET: ${{ secrets.DEPLOY_SECRET }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DEPLOY_SECRET:-}" ]; then
+            echo "DEPLOY_SECRET not set — skipping CLI options upload."
+            exit 0
+          fi
+          # Install the wheel we just built (faster + deterministic
+          # vs. waiting for PyPI propagation). Also pull keshro-mcp from
+          # PyPI so the upload payload reports its version too — keshro
+          # and keshro-mcp release in lockstep, so the latest published
+          # mcp version is what users will be installing alongside this
+          # CLI.
+          pip install --quiet --upgrade dist/*.whl keshro-mcp
+          python - > cli-options.json <<'PY'
+          import json
+          from datetime import datetime, timezone
+          from importlib.metadata import PackageNotFoundError, version as pkg_version
+          import click
+          from keshro_cli.cli import app as keshro_app
+          from typer.main import get_command
+
+          def _format_default(default, param):
+              if default is None or callable(default):
+                  return None
+              if isinstance(default, bool):
+                  return "true" if default else "false"
+              if isinstance(default, (list, tuple)):
+                  return ", ".join(str(x) for x in default) if default else None
+              return str(default) or None
+
+          def _format_type(param):
+              t = param.type
+              if isinstance(t, click.Choice):
+                  return " | ".join(t.choices)
+              name = getattr(t, "name", None)
+              return None if name in (None, "text") else name
+
+          def _extract_options(cmd):
+              out = []
+              for param in cmd.params:
+                  if not isinstance(param, click.Option) or getattr(param, "hidden", False):
+                      continue
+                  entry = {
+                      "flag": "/".join(param.opts) if param.opts else (param.name or ""),
+                      "description": (param.help or "").strip() or None,
+                  }
+                  if param.secondary_opts:
+                      entry["negation"] = "/".join(param.secondary_opts)
+                  type_str = _format_type(param)
+                  if type_str:
+                      entry["type"] = type_str
+                  if not param.is_flag:
+                      d = _format_default(param.default, param)
+                      if d is not None:
+                          entry["default"] = d
+                  if param.required:
+                      entry["required"] = True
+                  out.append(entry)
+              return out
+
+          def _walk(cmd, path, out):
+              is_group = isinstance(cmd, click.Group)
+              if getattr(cmd, "hidden", False) and not is_group:
+                  return
+              full_name = " ".join(path)
+              options = _extract_options(cmd)
+              if (not is_group or options) and not getattr(cmd, "hidden", False):
+                  out[full_name] = {
+                      "description": (cmd.help or cmd.short_help or "").strip() or None,
+                      "options": options,
+                  }
+              if is_group:
+                  for sub_name in sorted(cmd.commands):
+                      _walk(cmd.commands[sub_name], path + [sub_name], out)
+
+          payload = {
+              "version": None,
+              "mcp_version": None,
+              "generated_at": datetime.now(timezone.utc).isoformat(),
+              "commands": {},
+          }
+          try:
+              payload["version"] = pkg_version("keshro")
+          except PackageNotFoundError:
+              pass
+          try:
+              payload["mcp_version"] = pkg_version("keshro-mcp")
+          except PackageNotFoundError:
+              pass
+
+          root = get_command(keshro_app)
+          commands = {}
+          _walk(root, ["keshro"], commands)
+          if "keshro" in commands and not commands["keshro"]["options"]:
+              del commands["keshro"]
+          payload["commands"] = commands
+          print(json.dumps(payload, indent=2, sort_keys=True))
+          PY
+          echo "Extracted $(python -c 'import json; print(len(json.load(open("cli-options.json"))["commands"]))') commands"
+          curl --fail --show-error --silent \
+            -X PUT \
+            -H "X-Deploy-Secret: ${DEPLOY_SECRET}" \
+            -H "Content-Type: application/json" \
+            --data @cli-options.json \
+            "${KESHRO_API_URL}/v1/cli/options/upload"
+          echo "Uploaded CLI options spec to ${KESHRO_API_URL}"
+
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
