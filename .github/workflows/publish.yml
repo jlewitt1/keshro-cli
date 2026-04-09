@@ -79,12 +79,10 @@ jobs:
             exit 0
           fi
           # Install the wheel we just built (faster + deterministic
-          # vs. waiting for PyPI propagation). Also pull keshro-mcp from
-          # PyPI so the upload payload reports its version too — keshro
-          # and keshro-mcp release in lockstep, so the latest published
-          # mcp version is what users will be installing alongside this
-          # CLI.
-          pip install --quiet --upgrade dist/*.whl keshro-mcp
+          # vs. waiting for PyPI propagation). The CLI release only owns
+          # CLI command metadata + CLI version. MCP reports its own
+          # version separately from the keshro-mcp release workflow.
+          pip install --quiet --upgrade dist/*.whl
           python - > cli-options.json <<'PY'
           import json
           from datetime import datetime, timezone
@@ -134,11 +132,11 @@ jobs:
 
           def _walk(cmd, path, out):
               is_group = isinstance(cmd, click.Group)
-              if getattr(cmd, "hidden", False) and not is_group:
+              if getattr(cmd, "hidden", False):
                   return
               full_name = " ".join(path)
               options = _extract_options(cmd)
-              if (not is_group or options) and not getattr(cmd, "hidden", False):
+              if not is_group or options:
                   out[full_name] = {
                       "description": (cmd.help or cmd.short_help or "").strip() or None,
                       "options": options,
@@ -149,16 +147,11 @@ jobs:
 
           payload = {
               "version": None,
-              "mcp_version": None,
               "generated_at": datetime.now(timezone.utc).isoformat(),
               "commands": {},
           }
           try:
               payload["version"] = pkg_version("keshro")
-          except PackageNotFoundError:
-              pass
-          try:
-              payload["mcp_version"] = pkg_version("keshro-mcp")
           except PackageNotFoundError:
               pass
 
