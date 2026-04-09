@@ -48,6 +48,22 @@ keshro continue
 
 By default, `keshro continue` runs the next ready wave in parallel when the environment supports it. Each launched agent gets its own session ID and heartbeats live status back to Keshro, including touched files, progress messages, recent errors, and mid-task conflict detection. Use `--no-parallel` only when you explicitly want one task at a time.
 
+### Executors
+
+Each task in a plan runs on an *executor* — the runtime that actually executes it. Two executors ship today:
+
+- **`local_claude_code`** (default) — a local Claude Code subprocess running inside an isolated git worktree on your machine.
+- **`managed_agent`** — Anthropic's hosted Claude Managed Agents (the `managed-agents-2026-04-01` beta). Runs the task in a hosted cloud container instead of a local subprocess. Requires Managed Agents config (Agent ID + Environment ID) in your Keshro Account or Org settings; sessions run against your own Anthropic account.
+
+The executor is resolved per task in this order: `--executor` flag → `task.executor` (set per-task in the plan view) → personal default → workspace default → `local_claude_code` as the safe fallback.
+
+```bash
+keshro continue --executor local_claude_code   # Force every task in this run onto local Claude Code
+keshro continue --executor managed_agent       # Force every task onto Anthropic Managed Agents
+keshro continue --executor local               # Friendly alias
+keshro continue --executor managed             # Friendly alias
+```
+
 If a task was marked done too early, reopen it with `keshro task reopen <task-id> -p <plan-id>`. That clears any stale blocker and moves it back to `todo` by default, or you can pass `--status in_progress` to resume work immediately.
 
 ## Monitor
