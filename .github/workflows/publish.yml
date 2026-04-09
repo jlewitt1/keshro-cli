@@ -84,7 +84,7 @@ jobs:
           # and keshro-mcp release in lockstep, so the latest published
           # mcp version is what users will be installing alongside this
           # CLI.
-          pip install --quiet dist/*.whl keshro-mcp
+          pip install --quiet --upgrade dist/*.whl keshro-mcp
           python - > cli-options.json <<'PY'
           import json
           from datetime import datetime, timezone
