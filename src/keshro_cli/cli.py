@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, Any, Optional
 
 import click
 import httpx
@@ -5031,10 +5031,20 @@ async def _run_parallel(
                 for task_obj, name in non_default:
                     title = _clean(task_obj.get("title")) or "Untitled"
                     print(f"  {DIM}→ {title}: {name}{RESET}")
+            # Reuse a single executor instance per resolved name so that
+            # executors which may hold connections or shared state (e.g. the
+            # managed-agent path) aren't re-allocated per task in the wave.
+            _executor_cache: dict[str, Any] = {}
+
+            def _get_executor(name: str):
+                cached = _executor_cache.get(name)
+                if cached is None:
+                    cached = build_executor(name, launch=_launch_single_agent)
+                    _executor_cache[name] = cached
+                return cached
+
             agent_coros = [
-                build_executor(
-                    name, launch=_launch_single_agent
-                ).run_task(
+                _get_executor(name).run_task(
                     spec["task"],
                     plan,
                     resolved_plan_id,
@@ -8061,8 +8071,9 @@ def _continue_command(
     if not use_parallel:
         if executor_override == MANAGED_AGENT:
             raise SystemExit(
-                "--executor managed_agent requires --no-parallel to be off; "
-                "managed execution runs through the parallel wave scheduler."
+                "--executor managed_agent requires parallel mode; "
+                "remove --no-parallel to enable managed execution "
+                "(it runs through the parallel wave scheduler)."
             )
         _continue_with_claude(
             resolved_plan_id,

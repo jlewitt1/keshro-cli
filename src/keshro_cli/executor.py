@@ -60,7 +60,7 @@ def resolve_task_executor(
     task_level = normalize_executor((task or {}).get("executor"))
     if task_level is not None:
         return task_level
-    return fallback
+    return normalize_executor(fallback) or DEFAULT_EXECUTOR
 
 
 class ManagedAgentNotWiredError(RuntimeError):
