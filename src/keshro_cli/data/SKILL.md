@@ -6,6 +6,15 @@ description: |
   TRIGGER when: user asks to migrate, refactor, convert, upgrade, move, replace, or
   plan any multi-step engineering task (e.g., "migrate X to Y", "refactor the auth
   module", "upgrade from Postgres to CockroachDB", "plan this project").
+  ALSO TRIGGER when: user is working through tasks in a Keshro plan — starting tasks,
+  completing tasks, blocking/unblocking, adding notes, recording decisions, checking
+  status, rolling back, or resuming execution. This includes natural language like
+  "what's next", "that's done", "ok next task", "I'm blocked on this", "mark it done",
+  "what's the status", "continue", "keep going", "roll back", or any indication the
+  user finished or is stuck on a task while a Keshro plan is active.
+  Reporting task outcomes back to Keshro is critical — it's what enables learning
+  transfer across tasks. Always feed completion notes, blockers, and decisions back
+  via the CLI so downstream tasks benefit from what earlier tasks discovered.
   DO NOT TRIGGER when: user asks about Keshro internals or is working on the Keshro
   codebase itself.
 ---
