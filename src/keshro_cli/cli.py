@@ -6956,27 +6956,49 @@ def _run_graphify(work_dir: str) -> Path | None:
     if report_path.is_file():
         return report_path
 
-    commands: list[list[str]] = []
-    graphify_exe = shutil.which("graphify")
-    if graphify_exe:
-        commands.append([graphify_exe, work_dir])
-    commands.append([sys.executable, "-m", "graphify", work_dir])
+    try:
+        from graphify.extract import collect_files, extract
+        from graphify.build import build
+        from graphify.cluster import cluster, score_all
+        from graphify.analyze import god_nodes, surprising_connections
+        from graphify.detect import detect as run_detect
+        from graphify.report import generate
+    except ImportError:
+        return None
 
-    for command in commands:
-        try:
-            subprocess.run(
-                command,
-                cwd=work_dir,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=_GRAPHIFY_TIMEOUT_SECONDS,
-            )
-        except Exception:
-            continue
-        if report_path.is_file():
-            return report_path
-    return report_path if report_path.is_file() else None
+    try:
+        import json as _json
+
+        root = Path(work_dir)
+        files = collect_files(root)
+        if not files:
+            return None
+        extraction = extract(files)
+        if not extraction.get("nodes"):
+            return None
+        G = build([extraction])
+        result = cluster(G)
+        communities, labels = (
+            (result, {}) if not isinstance(result, tuple) else result
+        )
+        scores = score_all(G, communities)
+        gods = god_nodes(G)
+        surprises = surprising_connections(G)
+        detection = run_detect(root)
+        token_cost = {"before": 0, "after": 0}
+        rpt = generate(
+            G, communities, scores, labels, gods, surprises,
+            detection, token_cost, str(root),
+        )
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(rpt, encoding="utf-8")
+        graph_path = report_path.parent / "graph.json"
+        graph_path.write_text(
+            _json.dumps(extraction, default=str), encoding="utf-8"
+        )
+        return report_path
+    except Exception:
+        return None
 
 
 def _read_graphify_report(report_path: Path) -> str | None:

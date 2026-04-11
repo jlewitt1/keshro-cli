@@ -2246,6 +2246,36 @@ def test_select_graphify_sections_prefers_planning_relevant_sections():
     assert "## File Inventory" not in out
 
 
+def test_run_graphify_produces_report_via_python_api(tmp_path):
+    """Verify _run_graphify uses the graphify Python API (not the old
+    subprocess call) and produces a real GRAPH_REPORT.md for a directory
+    with at least one parseable source file. If graphify is not installed,
+    the test is skipped — but it must NOT pass silently when graphify IS
+    installed, which is the failure mode we're guarding against."""
+    try:
+        from graphify.extract import collect_files  # noqa: F401
+    except ImportError:
+        pytest.skip("graphify not installed")
+
+    # Create a tiny Python file so graphify has something to parse
+    src = tmp_path / "main.py"
+    src.write_text("def hello():\n    return 'world'\n\ndef goodbye():\n    return hello()\n")
+
+    report_path = cli._run_graphify(str(tmp_path))
+
+    assert report_path is not None, (
+        "_run_graphify returned None — graphify failed silently. "
+        "Check that the Python API (extract → build → cluster → report) "
+        "still works with the installed graphify version."
+    )
+    assert report_path.is_file()
+    content = report_path.read_text()
+    assert len(content) > 50, "Report is suspiciously short"
+    # graph.json should also have been written alongside
+    graph_json = report_path.parent / "graph.json"
+    assert graph_json.is_file(), "graph.json not written by _run_graphify"
+
+
 def test_collect_graphify_context_runs_graphify_and_extracts_summary(
     tmp_path, monkeypatch
 ):
