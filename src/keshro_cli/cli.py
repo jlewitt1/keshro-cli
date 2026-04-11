@@ -1404,6 +1404,7 @@ def _exit_for_agent_clarifier_feedback(
             print(f"     {DIM}{why}{RESET}")
         suggested = _clean(suggested_answers.get(question_id))
         options = list(question.get("answers") or [])
+        input_mode = question.get("input_mode", "select")
         if options:
             for option_index, option in enumerate(options, 1):
                 title = _clean(option.get("answer_title")) or _clean(
@@ -1416,7 +1417,13 @@ def _exit_for_agent_clarifier_feedback(
                     else ""
                 )
                 print(f"     {DIM}{option_index}. {title}{rec}{marker}{RESET}")
-        elif suggested:
+            if input_mode != "free_text":
+                print(f"     {DIM}Or: type a custom answer{RESET}")
+        if input_mode == "free_text":
+            placeholder = _clean(question.get("placeholder"))
+            if placeholder:
+                print(f"     {DIM}{placeholder}{RESET}")
+        elif not options and suggested:
             print(f"     {DIM}Suggested answer: {suggested}{RESET}")
     print(f"\n{DIM}Answers file:{RESET} {CYAN}{answers_file}{RESET}")
     print(f"{DIM}Then rerun:{RESET}")
@@ -6834,6 +6841,7 @@ def _create_migration(
                     qtext = q.get("question", "")
                     why = q.get("why_this_matters", "")
                     options = q.get("answers", [])
+                    input_mode = q.get("input_mode", "select")
                     print(f"\n  {CYAN}{qi}.{RESET} {qtext}")
                     if why:
                         print(f"     {DIM}{why}{RESET}")
@@ -6847,6 +6855,15 @@ def _create_migration(
                             print(
                                 f"     {DIM}{oi}. {opt.get('answer_title', opt.get('value', ''))}{rec}{RESET}"
                             )
+                        if input_mode != "free_text":
+                            # Select questions show options + custom hint
+                            print(
+                                f"     {DIM}Or type your own answer{RESET}"
+                            )
+                    if input_mode == "free_text":
+                        placeholder = q.get("placeholder", "")
+                        if placeholder:
+                            print(f"     {DIM}{placeholder}{RESET}")
                     try:
                         answer = input(f"  {CYAN}>{RESET} ").strip()
                     except (EOFError, KeyboardInterrupt):
