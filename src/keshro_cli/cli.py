@@ -602,6 +602,9 @@ def _fetch_and_display_completion_audit(plan_id: str, plan: dict | None = None) 
     except Exception:
         return
 
+    if not isinstance(audit, dict):
+        return
+
     status = _clean(audit.get("status"))
     if not status or status == "pending":
         return
