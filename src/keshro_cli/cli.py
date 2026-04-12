@@ -606,7 +606,7 @@ def _fetch_and_display_completion_audit(plan_id: str, plan: dict | None = None) 
     if not status or status == "pending":
         return
 
-    confidence = audit.get("completion_confidence", 0)
+    confidence = audit.get("completion_confidence") or 0
     summary = _clean(audit.get("summary"))
     unresolved_risks = audit.get("unresolved_risks") or []
     unresolved_unknowns = audit.get("unresolved_unknowns") or []
@@ -9867,12 +9867,12 @@ def _do_task_done(
     try:
         plan = _get_plan_or_exit(resolved_plan_id)
         steps = plan.get("plan_steps") or []
-        all_done = all(
+        leaf_steps = [s for s in steps if not s.get("child_task_ids")]
+        all_done = bool(leaf_steps) and all(
             _clean(s.get("status") or "").lower() == "completed"
-            for s in steps
-            if not s.get("child_task_ids")
+            for s in leaf_steps
         )
-        if all_done and len(steps) > 0:
+        if all_done:
             print(f"\n{GREEN}All plan tasks completed.{RESET}")
             _fetch_and_display_completion_audit(resolved_plan_id, plan)
     except Exception:
