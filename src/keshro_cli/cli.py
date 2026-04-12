@@ -1384,6 +1384,13 @@ def _load_answer_file_bundle(
         answer_value = _clean(str(value))
         if question_id and answer_value:
             parsed[question_id] = answer_value
+    # Clean up temp answer files created by _write_agent_answers_file
+    resolved = Path(raw_path)
+    if resolved.name.startswith("keshro-answers-") and resolved.name.endswith(".json"):
+        try:
+            resolved.unlink()
+        except OSError:
+            pass
     return parsed, questions, enrichment_context
 
 
