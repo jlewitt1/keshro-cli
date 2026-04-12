@@ -1385,8 +1385,15 @@ def _load_answer_file_bundle(
         if question_id and answer_value:
             parsed[question_id] = answer_value
     # Clean up temp answer files created by _write_agent_answers_file
-    resolved = Path(raw_path)
-    if resolved.name.startswith("keshro-answers-") and resolved.name.endswith(".json"):
+    import tempfile as _tempfile
+
+    resolved = Path(raw_path).resolve()
+    temp_dir = Path(_tempfile.gettempdir()).resolve()
+    if (
+        resolved.name.startswith("keshro-answers-")
+        and resolved.name.endswith(".json")
+        and resolved.parent == temp_dir
+    ):
         try:
             resolved.unlink()
         except OSError:
