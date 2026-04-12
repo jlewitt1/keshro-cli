@@ -592,6 +592,67 @@ def _execution_context_label(plan: dict | None = None) -> str:
     return "migration" if _clean((plan or {}).get("migration_id")) else "project"
 
 
+def _fetch_and_display_completion_audit(plan_id: str, plan: dict | None = None) -> None:
+    """Fetch the completion audit from the API and print a summary."""
+    try:
+        with make_client(_state.api_url, _state.token) as client:
+            res = client.get(f"/v1/agent/plans/{plan_id}/completion-audit")
+            res.raise_for_status()
+            audit = res.json()
+    except Exception:
+        return
+
+    status = _clean(audit.get("status"))
+    if not status or status == "pending":
+        return
+
+    confidence = audit.get("completion_confidence", 0)
+    summary = _clean(audit.get("summary"))
+    unresolved_risks = audit.get("unresolved_risks") or []
+    unresolved_unknowns = audit.get("unresolved_unknowns") or []
+    coverage_gaps = audit.get("coverage_gaps") or []
+
+    print(f"\n{'─' * 40}")
+    if status == "passed":
+        print(f"{GREEN}Completion audit: PASSED ({confidence:.0f}% confidence){RESET}")
+    else:
+        print(f"{YELLOW}Completion audit: NEEDS ATTENTION ({confidence:.0f}% confidence){RESET}")
+
+    if summary:
+        print(f"{DIM}{summary}{RESET}")
+
+    if unresolved_risks:
+        print(f"\n{YELLOW}Unresolved risks ({len(unresolved_risks)}):{RESET}")
+        for r in unresolved_risks[:5]:
+            sev = _clean(r.get("severity")) or "medium"
+            title = _clean(r.get("title")) or "Untitled"
+            reason = _clean(r.get("reason")) or ""
+            color = RED if sev in ("critical", "high") else YELLOW
+            print(f"  {color}[{sev}]{RESET} {title}")
+            if reason:
+                print(f"    {DIM}{reason}{RESET}")
+
+    if unresolved_unknowns:
+        print(f"\n{YELLOW}Unresolved questions ({len(unresolved_unknowns)}):{RESET}")
+        for u in unresolved_unknowns[:5]:
+            question = _clean(u.get("question")) or "?"
+            print(f"  - {question}")
+            reason = _clean(u.get("reason")) or ""
+            if reason:
+                print(f"    {DIM}{reason}{RESET}")
+
+    if coverage_gaps:
+        print(f"\n{YELLOW}Coverage gaps ({len(coverage_gaps)}):{RESET}")
+        for g in coverage_gaps[:5]:
+            title = _clean(g.get("task_title")) or "Untitled"
+            issue = _clean(g.get("issue")) or ""
+            print(f"  - {title}: {issue}")
+
+    dashboard = _execution_dashboard_url(plan=plan, plan_id=plan_id)
+    if dashboard:
+        print(f"\n{DIM}Full audit:{RESET} {dashboard}?tab=audit")
+
+
 def _set_default_plan_after_create(plan: dict, *, announce: bool = True) -> None:
     if _state.json:
         return
@@ -2328,6 +2389,7 @@ When a task is done:
 - ask for confirmation before running `keshro task done`
 - when marking done, report your session cost if available: `keshro task done <task-id> --cost <usd_amount> --tokens <token_count> --model <model_name>` (check your session stats for cost/token info)
 - after `keshro task done`, summarize what was accomplished and ask whether to continue to the next task
+- if `keshro task done` reports that all plan tasks are completed, a completion audit runs automatically. Review the audit output — it checks whether identified risks were mitigated, open questions were resolved, and all tasks have evidence. Share the audit summary and dashboard link with the user.
 - do not automatically start the next task without a clear go-ahead
 
 Ask first before:
@@ -2451,6 +2513,7 @@ def _build_continue_brief(
             "- Only mark the task blocked if work cannot continue. If local sources let you proceed, note the limitation instead.",
             "- If a keshro command fails with a connection error, retry once after 5 seconds. For any other error, say what happened and keep working unless the failure blocks the task.",
             "- Before `keshro task done`, include `Acceptance criteria met:` and `Verification:` in the completion note.",
+            "- When `keshro task done` completes the last task in the plan, a completion audit runs automatically — review the output and share the audit summary and dashboard link with the user.",
             "- You can monitor progress with `keshro status --watch` or `keshro status --tui`.",
         ]
     )
@@ -4895,6 +4958,7 @@ async def _run_parallel(
             total = len(steps)
             if done == total and total > 0:
                 print(f"\n{GREEN}All {total} tasks completed.{RESET}")
+                _fetch_and_display_completion_audit(resolved_plan_id, plan)
             else:
                 blocked = [
                     s
@@ -9792,6 +9856,20 @@ def _do_task_done(
         model=inferred_model or None,
         outcome=outcome,
     )
+    # Check if plan is now fully complete and show audit
+    try:
+        plan = _get_plan_or_exit(resolved_plan_id)
+        steps = plan.get("plan_steps") or []
+        all_done = all(
+            _clean(s.get("status") or "").lower() == "completed"
+            for s in steps
+            if not s.get("child_task_ids")
+        )
+        if all_done and len(steps) > 0:
+            print(f"\n{GREEN}All plan tasks completed.{RESET}")
+            _fetch_and_display_completion_audit(resolved_plan_id, plan)
+    except Exception:
+        pass
 
 
 def _append_task_note(
