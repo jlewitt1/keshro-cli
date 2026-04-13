@@ -3245,14 +3245,25 @@ async def _create_task_pr(
     except Exception:
         return None
 
-    # Detect default branch
+    # Detect default branch — try origin/HEAD first, then common names
+    default_branch = "main"
     try:
-        default_branch = await _git_stdout(
+        raw = await _git_stdout(
             "git", "rev-parse", "--abbrev-ref", "origin/HEAD", cwd=exec_dir
         )
-        default_branch = default_branch.replace("origin/", "")
+        if raw:
+            default_branch = raw.replace("origin/", "")
     except Exception:
-        default_branch = "main"
+        # origin/HEAD not set — probe common default branch names
+        for candidate in ("main", "master", "dev", "develop"):
+            try:
+                await _git_stdout(
+                    "git", "rev-parse", "--verify", f"origin/{candidate}", cwd=exec_dir
+                )
+                default_branch = candidate
+                break
+            except Exception:
+                continue
 
     if branch_name == default_branch:
         return None
@@ -3292,6 +3303,35 @@ async def _create_task_pr(
 
     pr_url: str | None = None
 
+    # Check for existing PR on this branch (avoid duplicates on retry)
+    pr_url = await _find_existing_pr(exec_dir=exec_dir, branch_name=branch_name)
+    if pr_url:
+        # PR already exists — just link it
+        try:
+            existing_links: list[str] = []
+            try:
+                task_resp = await api_client.get(f"/v1/plans/{plan_id}/tasks/{task_id}")
+                if task_resp.status_code == 200:
+                    task_data = task_resp.json()
+                    existing_links = [
+                        str(link).strip()
+                        for link in (task_data.get("artifact_links") or [])
+                        if str(link or "").strip()
+                    ]
+            except Exception:
+                pass
+            if pr_url not in existing_links:
+                await api_client.patch(
+                    f"/v1/plans/{plan_id}/tasks/{task_id}",
+                    json={
+                        "github_pr_url": pr_url,
+                        "artifact_links": [*existing_links, pr_url],
+                    },
+                )
+        except Exception:
+            pass
+        return pr_url
+
     # Strategy 1: try gh CLI
     pr_url = await _create_pr_via_gh(
         exec_dir=exec_dir,
@@ -3324,19 +3364,50 @@ async def _create_task_pr(
         )
         return None
 
-    # Link PR to task
+    # Link PR to task — merge with existing artifact links
     try:
+        existing_links: list[str] = []
+        try:
+            task_resp = await api_client.get(f"/v1/plans/{plan_id}/tasks/{task_id}")
+            if task_resp.status_code == 200:
+                task_data = task_resp.json()
+                existing_links = [
+                    str(link).strip()
+                    for link in (task_data.get("artifact_links") or [])
+                    if str(link or "").strip()
+                ]
+        except Exception:
+            pass
+        merged_links = existing_links if pr_url in existing_links else [*existing_links, pr_url]
         await api_client.patch(
             f"/v1/plans/{plan_id}/tasks/{task_id}",
             json={
                 "github_pr_url": pr_url,
-                "artifact_links": [pr_url],
+                "artifact_links": merged_links,
             },
         )
     except Exception:
         pass
 
     return pr_url
+
+
+async def _find_existing_pr(*, exec_dir: str, branch_name: str) -> str | None:
+    """Check if a PR already exists for this branch via gh CLI."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "gh", "pr", "view", "--head", branch_name, "--json", "url", "-q", ".url",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=exec_dir,
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode == 0:
+            url = (stdout or b"").decode(errors="replace").strip()
+            return url if url else None
+    except Exception:
+        pass
+    return None
 
 
 async def _create_pr_via_gh(
