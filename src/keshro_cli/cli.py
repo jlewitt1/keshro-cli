@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -7014,6 +7015,11 @@ def _create_migration(
                             f"{DIM}No specific template found for {source_tech} → {target_tech}. "
                             f"Continuing as a custom migration path.{RESET}\n"
                         )
+                        app_url = _current_app_url()
+                        print(
+                            f"{DIM}Browse templates: {app_url}/templates\n"
+                            f"Compare targets: {app_url}/migrate{RESET}\n"
+                        )
                     return _create_custom_migration_inner(
                         source_tech,
                         target_tech,
@@ -7026,6 +7032,11 @@ def _create_migration(
                         skip_questions=skip_questions,
                         prompt_for_context=not context_entered_interactively,
                         agent=agent,
+                    )
+                if not _state.json:
+                    print(
+                        f"{GREEN}Matched template:{RESET} {source_tech} → {target_tech} "
+                        f"{DIM}(pre-built discovery, risks, and field definitions){RESET}\n"
                     )
                 answers = _parse_field_assignments(field)
                 if detected_driver:
@@ -7094,6 +7105,11 @@ def _create_migration(
                             source_tech, target_tech
                         )
                         if template_key:
+                            if not _state.json:
+                                print(
+                                    f"{GREEN}Matched template:{RESET} {source_tech} → {target_tech} "
+                                    f"{DIM}(pre-built discovery, risks, and field definitions){RESET}\n"
+                                )
                             answers = _parse_field_assignments(field)
                             if detected_driver:
                                 answers["__detected_driver"] = detected_driver
@@ -7115,6 +7131,11 @@ def _create_migration(
                                 print(
                                     f"{DIM}No specific template found for {source_tech} → {target_tech}. "
                                     f"Continuing as a custom migration path.{RESET}\n"
+                                )
+                                app_url = _current_app_url()
+                                print(
+                                    f"{DIM}Browse templates: {app_url}/templates\n"
+                                    f"Compare targets: {app_url}/migrate{RESET}\n"
                                 )
                             return _create_custom_migration_inner(
                                 source_tech,
@@ -7324,15 +7345,25 @@ _GRAPHIFY_PREFERRED_SECTION_KEYS = (
 )
 _GRAPHIFY_MAX_SECTION_CHARS = 1500
 _GRAPHIFY_MAX_TOTAL_CHARS = 4500
-_GRAPHIFY_REPORT_RELATIVE_PATH = Path("graphify-out") / "GRAPH_REPORT.md"
+_GRAPHIFY_REPORT_RELATIVE_PATH = Path("graphify-out") / "GRAPH_REPORT.md"  # legacy, checked first
 _GRAPHIFY_TIMEOUT_SECONDS = 90
 
 
 
 def _run_graphify(work_dir: str) -> Path | None:
-    report_path = Path(work_dir) / _GRAPHIFY_REPORT_RELATIVE_PATH
-    if report_path.is_file():
-        return report_path
+    import tempfile
+
+    # Check legacy in-repo path first (for backward compat)
+    legacy_path = Path(work_dir) / _GRAPHIFY_REPORT_RELATIVE_PATH
+    if legacy_path.is_file():
+        return legacy_path
+
+    # Check temp cache
+    work_hash = hashlib.sha256(str(Path(work_dir).resolve()).encode()).hexdigest()[:12]
+    temp_dir = Path(tempfile.gettempdir()) / "keshro-graphify" / work_hash
+    cached_report = temp_dir / "GRAPH_REPORT.md"
+    if cached_report.is_file():
+        return cached_report
 
     try:
         from graphify.extract import collect_files, extract
@@ -7368,13 +7399,13 @@ def _run_graphify(work_dir: str) -> Path | None:
             G, communities, scores, labels, gods, surprises,
             detection, token_cost, str(root),
         )
-        report_path.parent.mkdir(parents=True, exist_ok=True)
-        report_path.write_text(rpt, encoding="utf-8")
-        graph_path = report_path.parent / "graph.json"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        cached_report.write_text(rpt, encoding="utf-8")
+        graph_path = temp_dir / "graph.json"
         graph_path.write_text(
             _json.dumps(extraction, default=str), encoding="utf-8"
         )
-        return report_path
+        return cached_report
     except Exception:
         return None
 
@@ -7439,6 +7470,15 @@ def _collect_graphify_context(work_dir: str) -> str | None:
     if not report_path or not report_path.is_file():
         return None
     report = _read_graphify_report(report_path)
+    # Clean up temp graphify files after reading
+    try:
+        import tempfile as _tf
+
+        temp_base = Path(_tf.gettempdir()) / "keshro-graphify"
+        if report_path.resolve().is_relative_to(temp_base.resolve()):
+            shutil.rmtree(report_path.parent, ignore_errors=True)
+    except Exception:
+        pass
     if not report:
         return None
     snippet = _select_graphify_sections(report)
@@ -7447,7 +7487,6 @@ def _collect_graphify_context(work_dir: str) -> str | None:
     return "\n".join(
         [
             "Graphify repo graph context added.",
-            f"Artifact: {_GRAPHIFY_REPORT_RELATIVE_PATH}",
             "Selected planning-relevant sections:",
             snippet,
         ]

@@ -2216,7 +2216,6 @@ def test_collect_generic_discovery_includes_graphify_report(tmp_path):
     assert out is not None
     assert "Detected: Node.js project (package.json)" in out
     assert "Graphify repo graph context added." in out
-    assert "graphify-out/GRAPH_REPORT.md" in out
     assert "## God Nodes" in out
 
 

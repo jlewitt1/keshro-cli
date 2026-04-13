@@ -78,7 +78,8 @@ When you see one of those patterns:
 - do not invent flags like `--no-migration`
 - do not create a generic project first
 - start with `keshro create -m --context "<user request>"`
-- if no saved template exists, Keshro should continue as a custom migration path
+- if no saved template exists, Keshro continues as a custom migration path
+- Keshro has pre-built templates for common migration paths (e.g., Heroku→AWS, Docker Compose→Kubernetes) with path-specific discovery, risks, and field definitions. When a template matches, the CLI will say so. If the user is unsure about their target, suggest they browse templates or compare targets on the Keshro web app.
 
 For longer descriptions, write to a temp file and pass with `--context-file`:
 ```bash
