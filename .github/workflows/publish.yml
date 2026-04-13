@@ -173,6 +173,26 @@ jobs:
             "${KESHRO_API_URL}/v1/cli/options/upload"
           echo "Uploaded CLI options spec to ${KESHRO_API_URL}"
 
+      - name: Upload sdist to backend for keshro upgrade
+        continue-on-error: true
+        env:
+          KESHRO_API_URL: ${{ vars.KESHRO_API_URL || 'https://api.keshro.com' }}
+          DEPLOY_SECRET: ${{ secrets.DEPLOY_SECRET }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DEPLOY_SECRET:-}" ]; then
+            echo "DEPLOY_SECRET not set — skipping sdist upload."
+            exit 0
+          fi
+          SDIST=$(ls dist/*.tar.gz | head -1)
+          echo "Uploading ${SDIST} to ${KESHRO_API_URL}"
+          curl --fail --show-error --silent \
+            -X PUT \
+            -H "X-Deploy-Secret: ${DEPLOY_SECRET}" \
+            -F "file=@${SDIST}" \
+            "${KESHRO_API_URL}/api/v1/cli/upload"
+          echo "Uploaded sdist to backend"
+
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
