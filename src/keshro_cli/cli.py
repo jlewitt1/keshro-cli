@@ -3409,7 +3409,7 @@ async def _find_existing_pr(*, exec_dir: str, branch_name: str) -> str | None:
         stdout, _ = await proc.communicate()
         if proc.returncode == 0:
             url = (stdout or b"").decode(errors="replace").strip()
-            return url if url else None
+            return url if (url and url != "null") else None
     except Exception:
         pass
     return None
