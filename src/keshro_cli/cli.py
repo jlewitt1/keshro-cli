@@ -3207,6 +3207,215 @@ async def _git_stdout(*args: str, cwd: str) -> str:
     return (stdout or b"").decode(errors="replace").strip()
 
 
+def _parse_github_remote(remote_url: str) -> tuple[str, str] | None:
+    """Extract owner/repo from a GitHub remote URL. Returns (owner, repo) or None."""
+    import re
+
+    patterns = [
+        r"github\.com[:/]([^/]+)/([^/.]+?)(?:\.git)?$",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, remote_url)
+        if m:
+            return m.group(1), m.group(2)
+    return None
+
+
+async def _create_task_pr(
+    *,
+    exec_dir: str,
+    task_id: str,
+    task_title: str,
+    plan_title: str,
+    api_client: httpx.AsyncClient,
+    plan_id: str,
+) -> str | None:
+    """Push the current branch and create a PR. Returns the PR URL or None.
+
+    Tries gh CLI first, then GitHub API via GITHUB_TOKEN env var.
+    Warns if neither is available.
+    """
+    # Detect current branch
+    try:
+        branch_name = await _git_stdout(
+            "git", "rev-parse", "--abbrev-ref", "HEAD", cwd=exec_dir
+        )
+        if not branch_name or branch_name == "HEAD":
+            return None
+    except Exception:
+        return None
+
+    # Detect default branch
+    try:
+        default_branch = await _git_stdout(
+            "git", "rev-parse", "--abbrev-ref", "origin/HEAD", cwd=exec_dir
+        )
+        default_branch = default_branch.replace("origin/", "")
+    except Exception:
+        default_branch = "main"
+
+    if branch_name == default_branch:
+        return None
+
+    # Check for commits ahead
+    try:
+        log_output = await _git_stdout(
+            "git", "log", f"origin/{default_branch}..HEAD", "--oneline", cwd=exec_dir
+        )
+        if not log_output.strip():
+            return None
+    except Exception:
+        return None
+
+    # Push
+    try:
+        await _git_stdout(
+            "git", "push", "-u", "origin", branch_name, cwd=exec_dir
+        )
+    except Exception as exc:
+        print(f"    {DIM}Could not push branch {branch_name}: {exc}{RESET}")
+        return None
+
+    # Detect remote provider
+    try:
+        remote_url = await _git_stdout(
+            "git", "remote", "get-url", "origin", cwd=exec_dir
+        )
+    except Exception:
+        remote_url = ""
+
+    pr_body = (
+        f"Keshro task: **{task_title}**\n"
+        f"Plan: {plan_title}\n\n"
+        f"Automated PR from Keshro parallel execution."
+    )
+
+    pr_url: str | None = None
+
+    # Strategy 1: try gh CLI
+    pr_url = await _create_pr_via_gh(
+        exec_dir=exec_dir,
+        task_title=task_title,
+        pr_body=pr_body,
+        default_branch=default_branch,
+        branch_name=branch_name,
+    )
+
+    # Strategy 2: try GitHub API directly
+    if not pr_url:
+        github_info = _parse_github_remote(remote_url) if remote_url else None
+        github_token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or ""
+        if github_info and github_token:
+            pr_url = await _create_pr_via_github_api(
+                owner=github_info[0],
+                repo=github_info[1],
+                token=github_token,
+                title=task_title,
+                body=pr_body,
+                base=default_branch,
+                head=branch_name,
+            )
+
+    if not pr_url:
+        provider = "GitHub" if "github" in remote_url else "remote"
+        print(
+            f"    {YELLOW}Branch pushed but could not create PR.{RESET} "
+            f"{DIM}Install gh CLI or set GITHUB_TOKEN to enable auto-PR for {provider}.{RESET}"
+        )
+        return None
+
+    # Link PR to task
+    try:
+        await api_client.patch(
+            f"/v1/plans/{plan_id}/tasks/{task_id}",
+            json={
+                "github_pr_url": pr_url,
+                "artifact_links": [pr_url],
+            },
+        )
+    except Exception:
+        pass
+
+    return pr_url
+
+
+async def _create_pr_via_gh(
+    *,
+    exec_dir: str,
+    task_title: str,
+    pr_body: str,
+    default_branch: str,
+    branch_name: str,
+) -> str | None:
+    """Create a PR using the gh CLI. Returns PR URL or None."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "gh", "--version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+        if proc.returncode != 0:
+            return None
+    except Exception:
+        return None
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "gh", "pr", "create",
+            "--title", task_title,
+            "--body", pr_body,
+            "--base", default_branch,
+            "--head", branch_name,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=exec_dir,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            return None
+        pr_url = (stdout or b"").decode(errors="replace").strip()
+        return pr_url if pr_url else None
+    except Exception:
+        return None
+
+
+async def _create_pr_via_github_api(
+    *,
+    owner: str,
+    repo: str,
+    token: str,
+    title: str,
+    body: str,
+    base: str,
+    head: str,
+) -> str | None:
+    """Create a PR using the GitHub REST API directly. Returns PR URL or None."""
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"https://api.github.com/repos/{owner}/{repo}/pulls",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+                json={
+                    "title": title,
+                    "body": body,
+                    "base": base,
+                    "head": head,
+                },
+                timeout=15,
+            )
+            if resp.status_code in (201, 200):
+                data = resp.json()
+                return data.get("html_url")
+            return None
+    except Exception:
+        return None
+
+
 async def _git_changed_files(cwd: str, max_files: int = 25) -> list[str]:
     files: list[str] = []
     seen: set[str] = set()
@@ -4827,6 +5036,18 @@ async def _launch_single_agent(
                 )
             except Exception:
                 pass
+
+            # Create PR for the task branch if it has commits
+            pr_url = await _create_task_pr(
+                exec_dir=exec_dir,
+                task_id=task_id,
+                task_title=task_title,
+                plan_title=_clean(plan.get("title")) or "Untitled plan",
+                api_client=api_client,
+                plan_id=plan_id,
+            )
+            if pr_url:
+                print(f"    {GREEN}PR:{RESET} {pr_url}")
         else:
             reason = stderr_text[:200] or result_text[:200] or "Agent exited with error"
             if failure_kind in {"launch", "usage_limit"}:
