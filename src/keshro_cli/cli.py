@@ -3401,7 +3401,7 @@ async def _find_existing_pr(*, exec_dir: str, branch_name: str) -> str | None:
     """Check if a PR already exists for this branch via gh CLI."""
     try:
         proc = await asyncio.create_subprocess_exec(
-            "gh", "pr", "view", "--head", branch_name, "--json", "url", "-q", ".url",
+            "gh", "pr", "list", "--head", branch_name, "--json", "url", "-q", ".[0].url",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=exec_dir,
