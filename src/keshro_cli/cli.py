@@ -3420,7 +3420,7 @@ async def _create_task_pr(
 
 
 async def _find_existing_pr(*, exec_dir: str, branch_name: str) -> str | None:
-    """Check if a PR already exists for this branch via gh CLI."""
+    """Check if a PR already exists for this branch via gh CLI or GitHub API."""
     try:
         proc = await asyncio.create_subprocess_exec(
             "gh", "pr", "list", "--head", branch_name, "--json", "url", "-q", ".[0].url",
@@ -3432,6 +3432,40 @@ async def _find_existing_pr(*, exec_dir: str, branch_name: str) -> str | None:
         if proc.returncode == 0:
             url = (stdout or b"").decode(errors="replace").strip()
             return url if (url and url != "null") else None
+    except Exception:
+        pass
+    try:
+        remote_url = await _git_stdout("git", "remote", "get-url", "origin", cwd=exec_dir)
+    except Exception:
+        remote_url = ""
+    github_info = _parse_github_remote(remote_url) if remote_url else None
+    if not github_info:
+        return None
+    github_token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or ""
+    try:
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        if github_token:
+            headers["Authorization"] = f"Bearer {github_token}"
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"https://api.github.com/repos/{github_info[0]}/{github_info[1]}/pulls",
+                headers=headers,
+                params={
+                    "head": f"{github_info[0]}:{branch_name}",
+                    "state": "open",
+                },
+                timeout=15,
+            )
+        if resp.status_code == 200:
+            pulls = resp.json()
+            if isinstance(pulls, list):
+                for pr in pulls:
+                    pr_url = _clean((pr or {}).get("html_url"))
+                    if pr_url:
+                        return pr_url
     except Exception:
         pass
     return None
@@ -4351,6 +4385,7 @@ async def _launch_single_agent(
         cost_usd = 0.0
         tokens_used = 0
         model_name = ""
+        latest_error = ""
         live_retry_note = ""
         live_retry_count = 0
         last_headless_progress = ""
