@@ -3359,8 +3359,13 @@ async def _create_task_pr(
     if not pr_url:
         provider = "GitHub" if "github" in remote_url else "remote"
         print(
-            f"    {YELLOW}Branch pushed but could not create PR.{RESET} "
-            f"{DIM}Install gh CLI or set GITHUB_TOKEN to enable auto-PR for {provider}.{RESET}"
+            f"    {YELLOW}Branch {CYAN}{branch_name}{YELLOW} pushed but could not create PR.{RESET}"
+        )
+        print(
+            f"    {DIM}Changes are on branch {branch_name} in {exec_dir}{RESET}"
+        )
+        print(
+            f"    {DIM}Install gh CLI or set GITHUB_TOKEN to enable auto-PR for {provider}.{RESET}"
         )
         return None
 
