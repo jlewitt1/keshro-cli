@@ -484,12 +484,51 @@ def _resolve_repo_linked_plan(
     try:
         with make_client(_state.api_url, _state.token) as client:
             res = client.get(f"/v1/plans/{plan_id}")
+            if res.status_code == 404:
+                return None, None
             res.raise_for_status()
             plan = res.json() or {}
             plan_title = _clean(plan.get("title"))
+            # If the plan is migration-scoped but the migration is soft-deleted,
+            # treat the link as stale and ignore it.
+            linked_migration_id = _clean(plan.get("migration_id"))
+            if linked_migration_id and not _migration_exists(linked_migration_id):
+                return None, None
     except Exception:
         pass
     return plan_id, plan_title or plan_id
+
+
+def _repo_link_points_at_deleted_migration(work_dir: str | None = None) -> bool:
+    """Return True if this repo has a server-side link to a plan whose migration was soft-deleted."""
+    repo_root = _discover_repo_root(work_dir)
+    if repo_root is None:
+        return False
+    git_remote_url = _discover_git_remote_url(repo_root)
+    try:
+        with make_client(_state.api_url, _state.token) as client:
+            res = client.get(
+                "/v1/plans/repo-link/resolve",
+                params={
+                    "repo_root": str(repo_root),
+                    "git_remote_url": git_remote_url,
+                },
+            )
+            res.raise_for_status()
+            body = res.json() or {}
+            plan_id = _clean(body.get("plan_id"))
+            if not plan_id:
+                return False
+            plan_res = client.get(f"/v1/plans/{plan_id}")
+            if plan_res.status_code != 200:
+                return False
+            plan = plan_res.json() or {}
+    except Exception:
+        return False
+    linked_migration_id = _clean(plan.get("migration_id"))
+    if not linked_migration_id:
+        return False
+    return not _migration_exists(linked_migration_id)
 
 
 def _link_current_repo_to_plan(
@@ -696,6 +735,13 @@ def _load_plan_context_details(plan_id: str | None) -> dict[str, str | None]:
     try:
         with make_client(_state.api_url, _state.token) as client:
             res = client.get(f"/v1/plans/{resolved_plan_id}")
+            if res.status_code == 404:
+                return {
+                    "plan_id": None,
+                    "plan_title": None,
+                    "migration_id": None,
+                    "kind": None,
+                }
             res.raise_for_status()
             plan = res.json()
     except Exception:
@@ -706,12 +752,42 @@ def _load_plan_context_details(plan_id: str | None) -> dict[str, str | None]:
             "kind": "plan",
         }
     migration_id = _clean(plan.get("migration_id"))
+    # If the plan claims a migration, verify it still exists (migrations are soft-deleted,
+    # so the plan's migration_id can point at a removed migration).
+    if migration_id and not _migration_exists(migration_id):
+        migration_id = ""
     return {
         "plan_id": resolved_plan_id,
         "plan_title": _clean(plan.get("title")) or resolved_plan_id,
-        "migration_id": migration_id,
+        "migration_id": migration_id or None,
         "kind": "migration" if migration_id else "plan",
     }
+
+
+def _plan_exists(plan_id: str) -> bool:
+    """Return True if the plan exists server-side. 404 returns False, all other errors return True (don't spuriously clear)."""
+    pid = _clean(plan_id)
+    if not pid:
+        return False
+    try:
+        with make_client(_state.api_url, _state.token) as client:
+            res = client.get(f"/v1/plans/{pid}")
+            return res.status_code != 404
+    except Exception:
+        return True
+
+
+def _migration_exists(migration_id: str) -> bool:
+    """Return True if the migration exists server-side. 404 returns False."""
+    mid = _clean(migration_id)
+    if not mid:
+        return False
+    try:
+        with make_client(_state.api_url, _state.token) as client:
+            res = client.get(f"/v1/migrations/{mid}")
+            return res.status_code != 404
+    except Exception:
+        return True
 
 
 def _resolve_plan_or_migration_context(
@@ -8215,8 +8291,24 @@ def _migration_delete(
 ):
     """Delete a migration project."""
     with make_client(_state.api_url, _state.token) as client:
+        # Look up linked plan before deletion so we can clear default if it matches
+        linked_plan_id: str | None = None
+        try:
+            res = client.get(f"/v1/migrations/{migration_id}")
+            if res.status_code == 200:
+                data = res.json() or {}
+                linked_plan_id = _clean(data.get("plan_id")) or None
+        except Exception:
+            pass
+
         res = client.delete(f"/v1/migrations/{migration_id}")
         res.raise_for_status()
+
+        # Clear default context if the deleted migration's plan was the default
+        saved_plan_id = _current_plan_id()
+        if linked_plan_id and saved_plan_id == linked_plan_id:
+            update_auth({"default_plan_id": None, "default_plan_title": None})
+
         if _state.json:
             print_output(res.json(), True)
             return
@@ -8230,6 +8322,11 @@ def _migration_delete(
 
 def _config_show():
     auth = load_auth()
+    # Self-heal: if the saved default plan no longer exists, clear it
+    saved_default = _clean(auth.get("default_plan_id"))
+    if saved_default and not _plan_exists(saved_default):
+        update_auth({"default_plan_id": None, "default_plan_title": None})
+        auth = load_auth()
     repo_plan_id, repo_plan_title = _resolve_repo_linked_plan()
     orgs: list[dict] = []
     authenticated = False
@@ -8323,7 +8420,27 @@ def _config_show():
 
 
 @config_app.callback(invoke_without_command=True)
-def _config_callback(ctx: typer.Context):
+def _config_callback(
+    ctx: typer.Context,
+    clear_default: Annotated[
+        bool,
+        typer.Option(
+            "--clear-default",
+            help="Clear saved default project/migration context (plan id, title, work dir).",
+        ),
+    ] = False,
+):
+    if clear_default:
+        update_auth(
+            {
+                "default_plan_id": None,
+                "default_plan_title": None,
+                "default_migration_id": None,
+                "default_work_dir": None,
+            }
+        )
+        print(f"{GREEN}✓{RESET} Cleared saved default project context.")
+        return
     if ctx.invoked_subcommand is None:
         _config_show()
 
@@ -9577,9 +9694,18 @@ def _run_status(plan_id: str | None, watch: bool = False, tui: bool = False) -> 
 
     resolved_plan_id = _current_plan_id(plan_id)
     if not resolved_plan_id:
-        raise SystemExit(
-            "Execution context required. Pass --plan-id <id> or save one with `keshro config set --plan-id <id>`."
-        )
+        if _repo_link_points_at_deleted_migration():
+            print(
+                "This repo's linked project pointed at a deleted migration, so it was skipped."
+            )
+            print(
+                "Link it to something current with `keshro config set --plan-id <id>`, or create a new one with `keshro new`."
+            )
+        else:
+            print(
+                "No project linked to this repo. Pass --plan-id <id>, save one with `keshro config set --plan-id <id>`, or create one with `keshro new`."
+            )
+        return
 
     if tui:
         try:
