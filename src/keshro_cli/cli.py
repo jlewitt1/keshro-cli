@@ -1464,20 +1464,10 @@ def _load_answer_file_bundle(
         answer_value = _clean(str(value))
         if question_id and answer_value:
             parsed[question_id] = answer_value
-    # Clean up temp answer files created by _write_agent_answers_file
-    import tempfile as _tempfile
-
-    resolved = Path(raw_path).resolve()
-    temp_dir = Path(_tempfile.gettempdir()).resolve()
-    if (
-        resolved.name.startswith("keshro-answers-")
-        and resolved.name.endswith(".json")
-        and resolved.parent == temp_dir
-    ):
-        try:
-            resolved.unlink()
-        except OSError:
-            pass
+    # Note: temp answer files (keshro-answers-*.json) are intentionally NOT
+    # deleted here. The agent flow may need to re-read and amend the file when
+    # validation fails for missing answers (e.g. an unfilled question). The OS
+    # cleans /tmp on its own schedule.
     return parsed, questions, enrichment_context
 
 
