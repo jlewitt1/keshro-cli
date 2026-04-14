@@ -3222,6 +3222,44 @@ def _parse_github_remote(remote_url: str) -> tuple[str, str] | None:
     return None
 
 
+def _resolve_default_branch(cwd: str) -> str:
+    """Detect the remote's default branch. Falls back to common names."""
+    # Preferred: ask the remote directly for its HEAD symref
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", "--symref", "origin", "HEAD"],
+            capture_output=True, text=True, cwd=cwd, timeout=5,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                if line.startswith("ref: refs/heads/"):
+                    return line.split("refs/heads/", 1)[1].split()[0]
+    except Exception:
+        pass
+    # Next: locally-cached origin/HEAD symref
+    try:
+        result = subprocess.run(
+            ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+            capture_output=True, text=True, cwd=cwd, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip().startswith("origin/"):
+            return result.stdout.strip().split("origin/", 1)[1]
+    except Exception:
+        pass
+    # Last resort: probe common branch names
+    for candidate in ("main", "master", "dev", "develop"):
+        try:
+            r = subprocess.run(
+                ["git", "rev-parse", "--verify", f"origin/{candidate}"],
+                capture_output=True, cwd=cwd, timeout=5,
+            )
+            if r.returncode == 0:
+                return candidate
+        except Exception:
+            continue
+    return "main"
+
+
 async def _create_task_pr(
     *,
     exec_dir: str,
@@ -3247,25 +3285,7 @@ async def _create_task_pr(
     except Exception:
         return None
 
-    # Detect default branch — try origin/HEAD first, then common names
-    default_branch = "main"
-    try:
-        raw = await _git_stdout(
-            "git", "rev-parse", "--abbrev-ref", "origin/HEAD", cwd=exec_dir
-        )
-        if raw:
-            default_branch = raw.replace("origin/", "")
-    except Exception:
-        # origin/HEAD not set — probe common default branch names
-        for candidate in ("main", "master", "dev", "develop"):
-            try:
-                await _git_stdout(
-                    "git", "rev-parse", "--verify", f"origin/{candidate}", cwd=exec_dir
-                )
-                default_branch = candidate
-                break
-            except Exception:
-                continue
+    default_branch = _resolve_default_branch(exec_dir)
 
     if branch_name == default_branch:
         return None
@@ -5233,6 +5253,11 @@ async def _launch_single_agent(
                     pass
                 if not has_changes:
                     await _cleanup_worktree(work_dir, worktree_dir)
+                else:
+                    print(
+                        f"    {YELLOW}Worktree preserved with uncommitted changes:{RESET} "
+                        f"{DIM}{worktree_dir}{RESET}"
+                    )
         else:
             reason = stderr_text[:200] or result_text[:200] or "Agent exited with error"
             if failure_kind in {"launch", "usage_limit"}:
@@ -5367,16 +5392,8 @@ async def _run_parallel(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
             capture_output=True, text=True, cwd=exec_dir,
         ).stdout.strip()
-        default_branch = "main"
-        for candidate in ("main", "master"):
-            result = subprocess.run(
-                ["git", "rev-parse", "--verify", f"origin/{candidate}"],
-                capture_output=True, cwd=exec_dir,
-            )
-            if result.returncode == 0:
-                default_branch = candidate
-                break
-        if current_branch and current_branch != default_branch:
+        default_branch = _resolve_default_branch(exec_dir)
+        if default_branch and current_branch and current_branch != default_branch:
             print(
                 f"{YELLOW}Warning:{RESET} You are on branch {CYAN}{current_branch}{RESET}, "
                 f"not {CYAN}{default_branch}{RESET}. "
