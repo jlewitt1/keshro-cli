@@ -18,3 +18,4 @@ build/
 # Keshro agent integrations (generated per-project, not for CLI source)
 .cursorrules
 AGENTS.md
+graphify-out/
