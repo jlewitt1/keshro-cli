@@ -669,6 +669,82 @@ def test_launch_single_agent_retries_codex_after_live_conflict(monkeypatch):
     assert any("Resuming after rebasing" in note for note in note_events)
 
 
+def test_launch_single_agent_posts_heartbeat_updates(monkeypatch):
+    import asyncio
+
+    heartbeat_calls = []
+    original_sleep = cli.asyncio.sleep
+
+    class _FakeProc:
+        def __init__(self):
+            self.returncode = 0
+            self.stdout = None
+            self.stderr = None
+
+        async def communicate(self, _input=None):
+            await original_sleep(0)
+            return b"done", b""
+
+        async def wait(self):
+            return self.returncode
+
+    class _FakeAsyncClient:
+        async def post(self, path, json=None):
+            return None
+
+    async def _fast_sleep(_delay, result=None):
+        await original_sleep(0)
+        return result
+
+    async def _fake_create_subprocess_exec(*args, **kwargs):
+        if args[:3] == ("git", "branch", "-D"):
+            return _FakeProc()
+        if args and args[0] == "codex":
+            return _FakeProc()
+        raise AssertionError(f"Unexpected subprocess args: {args}")
+
+    async def _fake_post_agent_heartbeat_async(*args, **kwargs):
+        heartbeat_calls.append(kwargs)
+
+    async def _fake_git_stdout(*args, cwd):
+        return "base-rev"
+
+    monkeypatch.setattr(cli, "_resolve_prompt_agent", lambda agent: ("codex", "codex"))
+    monkeypatch.setattr(
+        cli,
+        "_build_parallel_prompt",
+        lambda plan, task, total_agents, work_dir=None: "prompt",
+    )
+    monkeypatch.setattr(cli, "_mark_task_status_async", lambda *args, **kwargs: original_sleep(0))
+    monkeypatch.setattr(cli, "_git_stdout", _fake_git_stdout)
+    monkeypatch.setattr(cli, "_create_codex_worktree", lambda *args, **kwargs: _fast_sleep(0, result=(True, "")))
+    monkeypatch.setattr(cli, "_cleanup_worktree", lambda *args, **kwargs: original_sleep(0))
+    monkeypatch.setattr(cli, "_merge_codex_worktree_changes", lambda *args, **kwargs: original_sleep(0))
+    monkeypatch.setattr(cli, "_watch_live_conflicts", lambda *args, **kwargs: _fast_sleep(0, result={}))
+    monkeypatch.setattr(cli, "_git_changed_files", lambda *args, **kwargs: _fast_sleep(0, result=[]))
+    monkeypatch.setattr(cli, "_post_agent_heartbeat_async", _fake_post_agent_heartbeat_async)
+    monkeypatch.setattr(cli.asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+    monkeypatch.setattr(cli.asyncio, "sleep", _fast_sleep)
+
+    result = asyncio.run(
+        cli._launch_single_agent(
+            {"id": "task-1", "title": "Test task"},
+            {"id": "plan-1"},
+            "plan-1",
+            "/tmp/project",
+            1,
+            asyncio.Semaphore(1),
+            _FakeAsyncClient(),
+            session_id="session-1",
+            agent="codex",
+        )
+    )
+
+    assert result.exit_code == 0
+    assert heartbeat_calls
+    assert heartbeat_calls[0]["recent_error"] is None
+
+
 class _FakeResponse:
     def __init__(self, payload, status_code=200):
         self._payload = payload
@@ -699,6 +775,57 @@ def test_find_plan_task_supports_all_plan_task_shapes():
     assert cli._find_plan_task({"plan": {"tasks": [{"id": "task-3"}]}}, "task-3") == {
         "id": "task-3"
     }
+
+
+def test_find_existing_pr_falls_back_to_github_api(monkeypatch):
+    class _GhMissingProc:
+        async def communicate(self):
+            return b"", b""
+
+        @property
+        def returncode(self):
+            return 1
+
+    class _FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, headers=None, params=None, timeout=None):
+            assert url == "https://api.github.com/repos/jlewitt1/keshro-cli/pulls"
+            assert params == {
+                "head": "jlewitt1:feature/test-branch",
+                "state": "open",
+            }
+            assert headers["Authorization"] == "Bearer token-123"
+            return _FakeResponse(
+                [{"html_url": "https://github.com/jlewitt1/keshro-cli/pull/40"}]
+            )
+
+    async def _fake_create_subprocess_exec(*args, **kwargs):
+        if args[:4] == ("gh", "pr", "list", "--head"):
+            return _GhMissingProc()
+        raise AssertionError(f"Unexpected subprocess args: {args}")
+
+    async def _fake_git_stdout(*args, cwd):
+        assert args == ("git", "remote", "get-url", "origin")
+        return "git@github.com:jlewitt1/keshro-cli.git"
+
+    monkeypatch.setenv("GITHUB_TOKEN", "token-123")
+    monkeypatch.setattr(cli.asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+    monkeypatch.setattr(cli, "_git_stdout", _fake_git_stdout)
+    monkeypatch.setattr(cli.httpx, "AsyncClient", _FakeAsyncClient)
+
+    pr_url = asyncio.run(
+        cli._find_existing_pr(
+            exec_dir="/tmp/project",
+            branch_name="feature/test-branch",
+        )
+    )
+
+    assert pr_url == "https://github.com/jlewitt1/keshro-cli/pull/40"
 
 
 def test_wait_for_conflict_resolution_skips_first_active_poll(monkeypatch):
