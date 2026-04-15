@@ -1443,6 +1443,56 @@ def test_create_migration_from_path_key_prompts_and_posts_payload(
     assert "keshro continue" not in out
 
 
+def test_create_migration_repairs_missing_required_fields_from_second_discovery_pass(
+    fake_client, monkeypatch, capsys
+):
+    monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "1")
+    monkeypatch.setattr(
+        cli, "_set_default_plan_after_create", lambda created, announce=True: None
+    )
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: "/usr/local/bin/claude" if name == "claude" else None,
+    )
+
+    def _fake_run(cmd, capture_output, text, cwd, check):
+        prompt = cmd[2]
+        if "required field repair" in prompt:
+            stdout = "\n".join(
+                [
+                    "## AWS Batch to Airflow required field repair",
+                    "- AWS Batch workloads: scheduled ETL jobs",
+                ]
+            )
+        else:
+            stdout = "\n".join(
+                [
+                    "## Versions",
+                    "- Source version: 1.0",
+                    "- Target version: 2.9",
+                    "",
+                    "## AWS Batch to Airflow details",
+                    "- Target Airflow deployment: AWS MWAA",
+                    "",
+                    "## Additional context",
+                    "- Anything else that materially affects risk, effort, validation, cutover, rollback, or delivery: none",
+                ]
+            )
+        return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    cli.main(["create", "--template", "aws-batch-to-airflow"])
+
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+    create_call = next(
+        call for call in fake_client.calls if call[1] == "/v1/migrations"
+    )
+    created_payload = create_call[2]
+    assert created_payload["custom_fields"]["batch_workloads"] == "scheduled ETL jobs"
+    assert "Some fields couldn't be discovered automatically" not in out
+
+
 def test_create_migration_from_path_key_can_use_codex(fake_client, monkeypatch, capsys):
     monkeypatch.setenv("CODEX_HOME", "/tmp/codex-home")
     monkeypatch.setattr(
@@ -1553,6 +1603,144 @@ def test_create_migration_from_path_key_applies_shared_clarifiers(
         == "switch back to Batch scheduling immediately"
     )
     assert "Critical clarifications" in created_payload["context"]
+
+
+def test_create_migration_answers_file_rerun_reuses_saved_questions_and_seed_answers(
+    fake_client, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(cli, "_set_default_plan_after_create", lambda *args, **kwargs: None)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+
+    def _fail_discovery(*args, **kwargs):
+        raise AssertionError("discovery should not rerun on answers-file resume")
+
+    def _post(path, json=None, timeout=None):
+        fake_client.calls.append(("POST", path, json))
+        if path == "/v1/migrations/clarifiers":
+            raise AssertionError("clarifiers should not rerun on answers-file resume")
+        if path == "/v1/migrations":
+            return _FakeResponse(
+                {
+                    "id": "migration-123",
+                    "status": "analyzing",
+                    "source_type": "AWS Batch",
+                    "target_type": "Airflow",
+                }
+            )
+        return _FakeResponse({"path": path, "payload": json})
+
+    monkeypatch.setattr(cli, "_collect_discovery_answer_from_claude", _fail_discovery)
+    monkeypatch.setattr(fake_client, "post", _post)
+
+    answers_path = tmp_path / "migration-answers.json"
+    answers_path.write_text(
+        json.dumps(
+            {
+                "heading": "Keshro needs user answers before it can create this migration.",
+                "initial_answers": {
+                    "batch_workloads": "scheduled ETL jobs",
+                    "__keshro_discovered_context": "## AWS Batch to Airflow details\n- AWS Batch workloads: scheduled ETL jobs",
+                },
+                "answers": {"rollback_strategy": "switch back to Batch scheduling immediately"},
+                "questions": [
+                    {
+                        "id": "rollback_strategy",
+                        "question": "What rollback strategy do you want if validation fails?",
+                        "field_target": "rollback_strategy",
+                    }
+                ],
+            }
+        )
+    )
+
+    code = cli.main(
+        [
+            "create",
+            "--template",
+            "aws-batch-to-airflow",
+            "--answers-file",
+            str(answers_path),
+        ]
+    )
+
+    assert code == 0
+    create_call = next(
+        call for call in fake_client.calls if call[1] == "/v1/migrations"
+    )
+    created_payload = create_call[2]
+    assert created_payload["custom_fields"]["batch_workloads"] == "scheduled ETL jobs"
+    assert (
+        created_payload["custom_fields"]["rollback_strategy"]
+        == "switch back to Batch scheduling immediately"
+    )
+    assert created_payload["custom_fields"]["__keshro_discovered_context"]
+    assert not answers_path.exists()
+
+
+def test_load_answer_file_bundle_maps_field_target_aliases_for_required_questions(
+    tmp_path,
+):
+    answers_path = tmp_path / "answers.json"
+    answers_path.write_text(
+        json.dumps(
+            {
+                "answers": {
+                    "batch_workloads": "inventory jobs",
+                    "hosting_environment": "mwaa",
+                },
+                "questions": [
+                    {
+                        "id": "required_batch_workloads",
+                        "question": "List representative Batch jobs",
+                        "field_target": "batch_workloads",
+                    },
+                    {
+                        "id": "target_hosting_environment",
+                        "question": "Where will it run?",
+                        "field_target": "hosting_environment",
+                    },
+                ],
+            }
+        )
+    )
+
+    answers, questions, enrichment_context, initial_answers = cli._load_answer_file_bundle(
+        str(answers_path)
+    )
+
+    assert questions
+    assert enrichment_context == ""
+    assert initial_answers == {}
+    assert answers["required_batch_workloads"] == "inventory jobs"
+    assert answers["target_hosting_environment"] == "mwaa"
+
+
+def test_missing_question_ids_accepts_field_target_aliases():
+    questions = [
+        {
+            "id": "required_batch_workloads",
+            "question": "List representative Batch jobs",
+            "field_target": "batch_workloads",
+        }
+    ]
+
+    missing = cli._missing_question_ids(
+        questions, {"batch_workloads": "inventory jobs"}
+    )
+
+    assert missing == []
+
+
+def test_write_agent_answers_file_uses_global_keshro_directory(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    result = cli._write_agent_answers_file(
+        heading="Need answers",
+        questions=[],
+        suggested_answers={},
+    )
+
+    assert result.startswith(str(tmp_path / ".keshro" / "answers" / "keshro-answers-"))
 
 
 def test_create_migration_from_path_key_requires_claude_code(fake_client, monkeypatch):

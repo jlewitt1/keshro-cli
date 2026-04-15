@@ -166,10 +166,10 @@ def _parse_field_assignments(values: list[str] | None) -> dict[str, str]:
 
 def _load_answer_file_bundle(
     path: str | None,
-) -> tuple[dict[str, str], list[dict], str]:
+) -> tuple[dict[str, str], list[dict], str, dict[str, str]]:
     raw_path = _clean(path)
     if not raw_path:
-        return ({}, [], "")
+        return ({}, [], "", {})
     try:
         payload = json.loads(Path(raw_path).read_text())
     except OSError as exc:
@@ -178,10 +178,17 @@ def _load_answer_file_bundle(
         raise SystemExit(f"Invalid JSON in --answers-file {raw_path}: {exc}") from exc
     questions = []
     enrichment_context = ""
+    initial_answers: dict[str, str] = {}
     if isinstance(payload, dict) and isinstance(payload.get("questions"), list):
         questions = [q for q in payload.get("questions") or [] if isinstance(q, dict)]
     if isinstance(payload, dict):
         enrichment_context = _clean(payload.get("enrichment_context"))
+    if isinstance(payload, dict) and isinstance(payload.get("initial_answers"), dict):
+        for key, value in payload["initial_answers"].items():
+            answer_key = _clean(str(key))
+            answer_value = _clean(str(value))
+            if answer_key and answer_value:
+                initial_answers[answer_key] = answer_value
     if isinstance(payload, dict) and isinstance(payload.get("answers"), dict):
         source = payload["answers"]
     elif isinstance(payload, dict):
@@ -196,15 +203,16 @@ def _load_answer_file_bundle(
         answer_value = _clean(str(value))
         if question_id and answer_value:
             parsed[question_id] = answer_value
+    parsed = _normalize_answers_for_questions(questions, parsed)
     # Note: temp answer files (keshro-answers-*.json) are intentionally NOT
     # deleted here. The agent flow may need to re-read and amend the file when
     # validation fails for missing answers (e.g. an unfilled question). The OS
     # cleans /tmp on its own schedule.
-    return parsed, questions, enrichment_context
+    return parsed, questions, enrichment_context, initial_answers
 
 
 def _load_answer_file(path: str | None) -> dict[str, str]:
-    answers, _questions, _enrichment_context = _load_answer_file_bundle(path)
+    answers, _questions, _enrichment_context, _initial_answers = _load_answer_file_bundle(path)
     return answers
 
 
@@ -214,38 +222,92 @@ def _write_agent_answers_file(
     questions: list[dict],
     suggested_answers: dict[str, str],
     enrichment_context: str = "",
+    initial_answers: dict[str, str] | None = None,
 ) -> str:
-    """Write the clarifier handoff payload to a system tmp file. The agent
+    """Write the clarifier handoff payload to a user-level file. The agent
     Reads / Edits this file to capture the user's answers, then re-invokes
     the CLI with `--answers-file <path>`.
 
-    Lives in the OS tmp dir (`/var/folders/...` on macOS, `/tmp` on Linux)
-    so the OS handles cleanup on its own schedule. Claude Code prompts on
-    first Read / Edit; the prompt offers a 'Yes, allow all edits in T/
-    during this session' option that suppresses further prompts in the
-    same session — see SKILL.md for the user-facing instruction."""
-    import tempfile
-
+    Store these under `~/.keshro/answers/` so they never pollute a user's
+    working tree or git status, while still remaining stable across retries."""
     payload = {
         "heading": heading,
         "answers": suggested_answers,
         "questions": questions,
         "enrichment_context": enrichment_context,
+        "initial_answers": initial_answers or {},
     }
-    fd, path = tempfile.mkstemp(prefix="keshro-answers-", suffix=".json")
-    with os.fdopen(fd, "w") as handle:
-        json.dump(payload, handle, indent=2)
-        handle.write("\n")
-    return path
+    target_dir = Path.home() / ".keshro" / "answers"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    path = target_dir / f"keshro-answers-{uuid.uuid4().hex[:8]}.json"
+    path.write_text(json.dumps(payload, indent=2) + "\n")
+    return str(path)
 
 
 def _missing_question_ids(questions: list[dict], answers: dict[str, str]) -> list[str]:
+    normalized_answers = _normalize_answers_for_questions(questions, answers)
     missing: list[str] = []
     for index, question in enumerate(questions, 1):
         question_id = _clean(question.get("id")) or f"q{index}"
-        if not _clean(answers.get(question_id)):
+        if not _clean(normalized_answers.get(question_id)):
             missing.append(question_id)
     return missing
+
+
+def _normalize_answers_for_questions(
+    questions: list[dict], answers: dict[str, str]
+) -> dict[str, str]:
+    if not questions or not answers:
+        return dict(answers)
+
+    normalized = {
+        _clean(str(key)): _clean(str(value))
+        for key, value in answers.items()
+        if _clean(str(key)) and _clean(str(value))
+    }
+    if not normalized:
+        return {}
+
+    alias_to_question: dict[str, str] = {}
+    duplicate_aliases: set[str] = set()
+
+    def _register_alias(alias: str, question_id: str) -> None:
+        alias = _clean(alias)
+        if not alias or alias == question_id:
+            return
+        existing = alias_to_question.get(alias)
+        if existing and existing != question_id:
+            duplicate_aliases.add(alias)
+            alias_to_question.pop(alias, None)
+            return
+        if alias not in duplicate_aliases:
+            alias_to_question[alias] = question_id
+
+    for index, question in enumerate(questions, 1):
+        question_id = _clean(question.get("id")) or f"q{index}"
+        if not question_id:
+            continue
+        field_target = _clean(question.get("field_target"))
+        _register_alias(field_target, question_id)
+        if question_id.startswith("required_"):
+            _register_alias(question_id.removeprefix("required_"), question_id)
+
+    remapped = dict(normalized)
+    for answer_key, answer_value in normalized.items():
+        if answer_key in remapped and answer_key in alias_to_question:
+            target_question = alias_to_question[answer_key]
+            remapped.setdefault(target_question, answer_value)
+    return remapped
+
+
+def _delete_answers_file(path: str | None) -> None:
+    raw_path = _clean(path)
+    if not raw_path:
+        return
+    try:
+        Path(raw_path).unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def _exit_for_agent_clarifier_feedback(
@@ -255,12 +317,14 @@ def _exit_for_agent_clarifier_feedback(
     suggested_answers: dict[str, str],
     rerun_command: str,
     enrichment_context: str = "",
+    initial_answers: dict[str, str] | None = None,
 ) -> None:
     answers_file = _write_agent_answers_file(
         heading=heading,
         questions=questions,
         suggested_answers=suggested_answers,
         enrichment_context=enrichment_context,
+        initial_answers=initial_answers,
     )
     rerun_command = f"{rerun_command} --answers-file {shlex.quote(answers_file)}"
     if _state.json:
@@ -945,6 +1009,65 @@ def _extract_discovery_answers(template: dict, raw: str) -> dict[str, str]:
             else value
         )
     return answers
+
+
+def _missing_required_template_fields(template: dict, answers: dict[str, str]) -> list[dict]:
+    missing: list[dict] = []
+    for field in template.get("fields") or []:
+        field_id = _clean(field.get("id"))
+        if not field.get("required") or not field_id:
+            continue
+        if _clean(answers.get(field_id)):
+            continue
+        missing.append(field)
+    return missing
+
+
+def _build_required_field_repair_prompt(template: dict, missing_fields: list[dict]) -> str:
+    source = _clean(template.get("source")) or "Source"
+    target = _clean(template.get("target")) or "Target"
+    lines = [
+        f"You are repairing missing required migration discovery fields for {source} -> {target}.",
+        "The first discovery pass missed required template fields that may still be inferable from the repository.",
+        "Inspect the current workspace again and answer only the required fields below.",
+        "Return only the completed markdown template below with the same heading and exact field labels.",
+        "Do not add commentary before or after the template.",
+        "Use `Unknown` only if the repository truly does not provide enough evidence.",
+        "",
+        f"## {source} to {target} required field repair",
+    ]
+    for field in missing_fields:
+        label = _clean(field.get("label")) or _clean(field.get("id")) or "Field"
+        hint = _clean(field.get("hint"))
+        suffix = f" Hint: {hint}" if hint else ""
+        lines.append(f"- {label} (required):{suffix}")
+    return "\n".join(lines)
+
+
+def _repair_missing_required_discovery_answers(
+    template: dict,
+    answers: dict[str, str],
+    *,
+    work_dir: str | None = None,
+    agent: str = "auto",
+) -> dict[str, str]:
+    missing_fields = _missing_required_template_fields(template, answers)
+    if not missing_fields:
+        return {}
+    prompt = _build_required_field_repair_prompt(template, missing_fields)
+    raw = _run_prompt_in_agent(
+        prompt,
+        missing_binary_message=(
+            "Could not find a coding agent binary. Make sure you're running this from within your agent's terminal."
+        ),
+        failure_message_prefix=("Coding agent returned an error: "),
+        empty_message="Coding agent returned no required-field repair response.",
+        work_dir=work_dir,
+        agent=agent,
+    )
+    repair_template = dict(template)
+    repair_template["fields"] = missing_fields
+    return _extract_discovery_answers(repair_template, raw)
 
 
 def _get_migration_clarifiers(client: httpx.Client, payload: dict) -> list[dict]:
@@ -5326,6 +5449,7 @@ def _create_migration(
             file_answers,
             resume_questions,
             resume_enrichment_context,
+            resume_seed_answers,
         ) = _load_answer_file_bundle(answers_file)
         provided_clarifier_answers.update(file_answers)
         context_entered_interactively = False
@@ -5357,6 +5481,9 @@ def _create_migration(
                 org_id,
                 work_dir,
                 clarifier_answers=provided_clarifier_answers,
+                resume_questions=resume_questions,
+                seed_answers=resume_seed_answers,
+                answers_file_path=answers_file,
                 skip_questions=skip_questions,
                 prompt_for_context=not bool(context and context.strip()),
                 agent=agent,
@@ -5468,6 +5595,9 @@ def _create_migration(
                         org_id,
                         work_dir,
                         clarifier_answers=provided_clarifier_answers,
+                        resume_questions=resume_questions,
+                        seed_answers=resume_seed_answers,
+                        answers_file_path=answers_file,
                         skip_questions=skip_questions,
                         prompt_for_context=not context_entered_interactively,
                         agent=agent,
@@ -5495,6 +5625,9 @@ def _create_migration(
                     org_id,
                     work_dir,
                     clarifier_answers=provided_clarifier_answers,
+                    resume_questions=resume_questions,
+                    seed_answers=resume_seed_answers,
+                    answers_file_path=answers_file,
                     skip_questions=skip_questions,
                     prompt_for_context=not context_entered_interactively,
                     agent=agent,
@@ -5567,6 +5700,9 @@ def _create_migration(
                                 org_id,
                                 work_dir,
                                 clarifier_answers=provided_clarifier_answers,
+                                resume_questions=resume_questions,
+                                seed_answers=resume_seed_answers,
+                                answers_file_path=answers_file,
                                 skip_questions=skip_questions,
                                 prompt_for_context=not context_entered_interactively,
                                 agent=agent,
@@ -5591,6 +5727,9 @@ def _create_migration(
                                 org_id,
                                 work_dir,
                                 clarifier_answers=provided_clarifier_answers,
+                                resume_questions=resume_questions,
+                                seed_answers=resume_seed_answers,
+                                answers_file_path=answers_file,
                                 skip_questions=skip_questions,
                                 prompt_for_context=not context_entered_interactively,
                                 agent=agent,
@@ -5769,6 +5908,7 @@ def _create_migration(
             steps = plan.get("plan_steps", [])
 
             _set_default_plan_after_create(plan)
+            _delete_answers_file(answers_file)
 
             if _state.json:
                 print_output(plan)
@@ -6115,6 +6255,9 @@ def _create_migration_inner(
     org_id: str | None,
     work_dir: str | None,
     clarifier_answers: dict[str, str] | None = None,
+    resume_questions: list[dict] | None = None,
+    seed_answers: dict[str, str] | None = None,
+    answers_file_path: str | None = None,
     skip_questions: bool = False,
     prompt_for_context: bool = True,
     agent: str = "auto",
@@ -6138,27 +6281,58 @@ def _create_migration_inner(
                 else f"the project directory ({resolved_work_dir})"
             )
 
-        with _Spinner(
-            f"Analyzing {scan_target} and generating {source} -> {target} "
-            "migration inputs and follow-up questions..."
-        ):
-            try:
-                discovered_answer = _collect_discovery_answer_from_claude(
-                    template, work_dir=resolved_work_dir, agent=agent
-                )
-            except SystemExit as exc:
-                if not _inside_coding_agent():
-                    raise
-                discovered_answer = ""
-                _print_agent_collection_warning(
-                    f"Skipping automatic migration discovery: {exc}"
-                )
+        saved_answers = {
+            _clean(str(key)): _clean(str(value))
+            for key, value in (seed_answers or {}).items()
+            if _clean(str(key)) and _clean(str(value))
+        }
+        discovered_answer = _clean(
+            saved_answers.pop("__keshro_discovered_context", "")
+        )
+        if not discovered_answer:
+            with _Spinner(
+                f"Analyzing {scan_target} and generating {source} -> {target} "
+                "migration inputs and follow-up questions..."
+            ):
+                try:
+                    discovered_answer = _collect_discovery_answer_from_claude(
+                        template, work_dir=resolved_work_dir, agent=agent
+                    )
+                except SystemExit as exc:
+                    if not _inside_coding_agent():
+                        raise
+                    discovered_answer = ""
+                    _print_agent_collection_warning(
+                        f"Skipping automatic migration discovery: {exc}"
+                    )
 
         extracted = _extract_discovery_answers(template, discovered_answer)
+        for key, value in saved_answers.items():
+            if key not in answers or not answers[key]:
+                answers[key] = value
         # Don't overwrite manually provided -f values with empty extracted values
         for key, value in extracted.items():
             if key not in answers or not answers[key]:
                 answers[key] = value
+        missing_required_fields = _missing_required_template_fields(template, answers)
+        if missing_required_fields:
+            try:
+                repaired_answers = _repair_missing_required_discovery_answers(
+                    template,
+                    answers,
+                    work_dir=resolved_work_dir,
+                    agent=agent,
+                )
+            except SystemExit as exc:
+                if not _inside_coding_agent():
+                    raise
+                repaired_answers = {}
+                _print_agent_collection_warning(
+                    f"Skipping required-field discovery repair: {exc}"
+                )
+            for key, value in repaired_answers.items():
+                if key not in answers or not answers[key]:
+                    answers[key] = value
         answers = _prompt_for_migration_template_fields(template, answers)
 
         required_fields = [
@@ -6215,10 +6389,12 @@ def _create_migration_inner(
             "custom_fields": custom_fields or None,
         }
         if not skip_questions:
-            with _Spinner(
-                "Checking for high-impact follow-up questions (this can take a bit)..."
-            ):
-                clarifier_questions = _get_migration_clarifiers(client, payload)
+            clarifier_questions = list(resume_questions or [])
+            if not clarifier_questions:
+                with _Spinner(
+                    "Checking for high-impact follow-up questions (this can take a bit)..."
+                ):
+                    clarifier_questions = _get_migration_clarifiers(client, payload)
             if clarifier_questions:
                 suggested_answers: dict[str, str] = {}
                 provided_clarifier_answers = dict(clarifier_answers or {})
@@ -6253,6 +6429,7 @@ def _create_migration_inner(
                             questions=clarifier_questions,
                             suggested_answers=suggested_answers,
                             rerun_command=rerun_command,
+                            initial_answers=dict(payload.get("custom_fields") or {}),
                         )
                     resolved_clarifier_answers = provided_clarifier_answers
                 else:
@@ -6265,6 +6442,7 @@ def _create_migration_inner(
             elif not _state.json:
                 print("No additional follow-up questions needed.")
     _create_migration_from_payload(payload, template, work_dir=resolved_work_dir)
+    _delete_answers_file(answers_file_path)
 
 
 def _create_custom_migration_inner(
@@ -6276,14 +6454,24 @@ def _create_custom_migration_inner(
     org_id: str | None,
     work_dir: str | None,
     clarifier_answers: dict[str, str] | None = None,
+    resume_questions: list[dict] | None = None,
+    seed_answers: dict[str, str] | None = None,
+    answers_file_path: str | None = None,
     skip_questions: bool = False,
     prompt_for_context: bool = True,
     agent: str = "auto",
 ) -> None:
     with make_client(_state.api_url, _state.token) as client:
         resolved_work_dir = str(Path(work_dir).resolve()) if work_dir else None
-        discovered_context = None
-        if resolved_work_dir and os.path.isdir(resolved_work_dir):
+        saved_answers = {
+            _clean(str(key)): _clean(str(value))
+            for key, value in (seed_answers or {}).items()
+            if _clean(str(key)) and _clean(str(value))
+        }
+        discovered_context = _clean(
+            saved_answers.pop("__keshro_discovered_context", "")
+        )
+        if not discovered_context and resolved_work_dir and os.path.isdir(resolved_work_dir):
             if _should_scan_default_work_dir(
                 resolved_work_dir, explicit_target=bool(work_dir)
             ):
@@ -6313,6 +6501,9 @@ def _create_custom_migration_inner(
                     discovered_context,
                 ]
             )
+        for key, value in saved_answers.items():
+            if key not in custom_fields:
+                custom_fields[key] = value
 
         payload = {
             "source_type": source,
@@ -6326,10 +6517,12 @@ def _create_custom_migration_inner(
             "custom_fields": custom_fields or None,
         }
         if not skip_questions:
-            with _Spinner(
-                "Checking for high-impact follow-up questions (this can take a bit)..."
-            ):
-                clarifier_questions = _get_migration_clarifiers(client, payload)
+            clarifier_questions = list(resume_questions or [])
+            if not clarifier_questions:
+                with _Spinner(
+                    "Checking for high-impact follow-up questions (this can take a bit)..."
+                ):
+                    clarifier_questions = _get_migration_clarifiers(client, payload)
             if clarifier_questions:
                 suggested_answers: dict[str, str] = {}
                 provided_clarifier_answers = dict(clarifier_answers or {})
@@ -6356,6 +6549,7 @@ def _create_custom_migration_inner(
                             questions=clarifier_questions,
                             suggested_answers=suggested_answers,
                             rerun_command=rerun_command,
+                            initial_answers=dict(payload.get("custom_fields") or {}),
                         )
                     resolved_clarifier_answers = provided_clarifier_answers
                 else:
@@ -6368,6 +6562,7 @@ def _create_custom_migration_inner(
             elif not _state.json:
                 print("No additional follow-up questions needed.")
     _create_migration_from_payload(payload, {}, work_dir=resolved_work_dir)
+    _delete_answers_file(answers_file_path)
 
 
 @migration_app.command("list")
