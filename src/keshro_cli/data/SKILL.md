@@ -33,6 +33,11 @@ The command is `keshro login`. There is no `auth` subcommand.
 ## CRITICAL: Never auto-answer interactive prompts
 If any `keshro` command prompts for interactive input or confirmation — initial project description, migration confirmation, follow-up questions, context overrides, or any other interactive choice — relay that prompt to the user and wait for their answer. Do not answer on the user's behalf, do not pipe input, and do not choose the recommended option automatically. The user MUST make these decisions.
 
+## Clarifier answers file lives in OS tmp
+When `keshro create` exits with follow-up questions, the CLI hands you a JSON answers file at `/var/folders/.../keshro-answers-*.json` (macOS) or `/tmp/keshro-answers-*.json` (Linux). Read this file to see the questions, Edit it to write the user's answers, then rerun the printed `--answers-file` command.
+
+The first Read or Edit on this file triggers a Claude Code permission prompt because the path is outside the working directory. The prompt offers a **"Yes, allow all edits in T/ during this session"** option. Tell the user to pick that option on the first prompt — it suppresses every subsequent prompt for the same session, so the rest of the clarifier round-trip is friction-free. Without that choice, every Read and every Edit on the answers file will prompt again.
+
 ## Create a project or migration
 ```bash
 keshro create
@@ -196,12 +201,20 @@ If the user says "stop", "pause", "hold on", or "wait":
 - Run keshro commands via Bash, never as chat messages
 - Do NOT use Keshro MCP tools — always use the CLI
 - Do NOT expose raw `keshro ...` commands in user-facing prose. The CLI is an implementation detail; describe capabilities in plain English. Say "I can create a new project or migration", not "I'll run `keshro create`". Say "I can link an existing plan", not "I'll run `keshro config set --plan-id <id>`". Command names belong in Bash tool invocations, not in chat messages to the user.
-- When relaying clarifier follow-up questions, preserve the CLI's formatting exactly: each option on its own line, lettered in parens — `(a)`, `(b)`, `(c)` — with `[recommended]` inline when marked. DO NOT collapse options into a comma-separated inline list, and DO NOT renumber them — parenthesized letters separate option labels from the parent question's `1.` number so the rendered output is unambiguous. Render like:
+- When relaying clarifier follow-up questions, preserve the CLI's formatting exactly: each option on its own line, lettered in parens — `(a)`, `(b)`, `(c)` — with `[recommended]` inline when marked. DO NOT collapse options into a comma-separated inline list, and DO NOT renumber them — parenthesized letters separate option labels from the parent question's `1.` number so the rendered output is unambiguous. ALWAYS put a blank line between questions so they're scannable; dense back-to-back questions are unreadable. Render like:
   ```
   1. Rollback strategy?
      (a) Immediate rollback [recommended]
      (b) Dual-run rollback
      (c) No quick rollback
+     Or: custom answer
+
+  2. Cutover window?
+     e.g. "Weekend cutover in late April, 2-hour window"
+
+  3. Validation criteria?
+     (a) Pilot + parity checks [recommended]
+     (b) Replay + compare outputs
      Or: custom answer
   ```
 - Do NOT silently accept agent-suggested clarifier answers when Keshro asks follow-up questions. Surface them to the user and let the user confirm or override them.

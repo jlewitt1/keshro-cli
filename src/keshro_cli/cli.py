@@ -1565,6 +1565,15 @@ def _write_agent_answers_file(
     suggested_answers: dict[str, str],
     enrichment_context: str = "",
 ) -> str:
+    """Write the clarifier handoff payload to a system tmp file. The agent
+    Reads / Edits this file to capture the user's answers, then re-invokes
+    the CLI with `--answers-file <path>`.
+
+    Lives in the OS tmp dir (`/var/folders/...` on macOS, `/tmp` on Linux)
+    so the OS handles cleanup on its own schedule. Claude Code prompts on
+    first Read / Edit; the prompt offers a 'Yes, allow all edits in T/
+    during this session' option that suppresses further prompts in the
+    same session — see SKILL.md for the user-facing instruction."""
     import tempfile
 
     payload = {
@@ -2301,17 +2310,24 @@ def _get_migration_clarifiers(client: httpx.Client, payload: dict) -> list[dict]
 def _extract_repo_scan_answer(question: dict) -> str | None:
     """Return the value of a repo-scan-derived recommended option on a
     clarifier question, if one was injected by the backend clarifier
-    (`_attach_discovered_recommendation`). These answers are already known
-    from the earlier discovery pass, so we can skip the second agent call
-    for them and save 1-2 minutes on every `keshro create -m`."""
+    (`_attach_discovered_recommendation`).
+
+    Provenance lives in `answer_explanation` (the backend writes a
+    "Detected from your repo scan." sentinel line there), not in the
+    title. The title now displays the actual discovered value instead of
+    a generic 'Based on repo scan' label, so matching on the title would
+    produce false negatives."""
     for answer in question.get("answers") or []:
-        title = str(answer.get("answer_title") or "").lower()
         if not answer.get("recommended"):
             continue
-        if "repo scan" in title:
-            value = _clean(answer.get("value"))
-            if value and value.lower() != "unknown":
-                return value
+        explanation_lines = answer.get("answer_explanation") or []
+        if not any(
+            "repo scan" in str(line).lower() for line in explanation_lines
+        ):
+            continue
+        value = _clean(answer.get("value"))
+        if value and value.lower() != "unknown":
+            return value
     return None
 
 
