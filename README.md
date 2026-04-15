@@ -76,6 +76,20 @@ If a task was marked done too early, reopen it with `keshro task reopen <task-id
 keshro status
 ```
 
+## Saved team + cost context
+
+Keshro reuses team size, seniority mix, and blended cost defaults across migrations and plans so you don't re-enter them each time. Context is scoped to the active org or your personal account.
+
+```bash
+keshro org context                  # Show saved team + cost context for the active org
+keshro org context --clear-team     # Forget saved org team context
+keshro org context --clear-cost     # Forget saved org cost context
+keshro org context --clear-all      # Forget both
+
+keshro user context                 # Same, but for your personal account
+keshro user context --clear-all     # Clear personal team + cost context
+```
+
 ## Works with
 
 Planning, execution, and parallel mode work with [Claude Code](https://claude.ai/code) and [Codex](https://openai.com/index/introducing-codex/). Both agents run in isolated git worktrees during parallel mode. If one agent is rate-limited, Keshro suggests switching and supports a saved default via `keshro config set --agent ...`.

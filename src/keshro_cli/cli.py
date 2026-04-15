@@ -89,11 +89,15 @@ task_app = typer.Typer(help="Task management")
 migration_app = typer.Typer(help="Migration project management")
 config_app = typer.Typer(help="Configuration", invoke_without_command=True)
 plan_task_app = typer.Typer(help="Plan task management")
+org_app = typer.Typer(help="Organization context (saved team / cost defaults)")
+user_app = typer.Typer(help="Personal context (saved team / cost defaults)")
 
 app.add_typer(plan_app, name="plan", hidden=True)
 app.add_typer(task_app, name="task")
 app.add_typer(migration_app, name="migration", hidden=True)
 app.add_typer(config_app, name="config")
+app.add_typer(org_app, name="org")
+app.add_typer(user_app, name="user")
 plan_app.add_typer(plan_task_app, name="task")
 
 
@@ -590,6 +594,84 @@ def _current_plan_id(
 def _current_context_label() -> str | None:
     auth = load_auth()
     return _clean(auth.get("default_org_name") or auth.get("default_org_id")) or None
+
+
+def _resolve_creation_scope(
+    cli_org_id: str | None,
+    cli_org_name: str | None = None,
+    force_personal: bool = False,
+) -> tuple[str | None, str]:
+    """Pick the org_id under which a new project/migration will be created.
+
+    Resolution priority:
+    1. `--personal` flag → personal scope, ignore everything else.
+    2. `--org-id` flag → use it directly (cheapest, no API roundtrip).
+    3. `--org NAME` flag → resolve name to id via /v1/orgs.
+    4. Saved default from auth.json → last fallback.
+
+    Returns (org_id_or_None, human_readable_label). The label powers the scope
+    banner so the user always sees, before any work happens, exactly where
+    this project will land — same level of clarity as the web UI's org switcher.
+    """
+    if force_personal:
+        return None, "personal"
+    explicit_id = _clean(cli_org_id)
+    if explicit_id:
+        auth = load_auth()
+        # If the explicit id matches the saved default, reuse the cached name
+        # so we don't have to round-trip the API just for a banner.
+        if explicit_id == _clean(auth.get("default_org_id")):
+            label = _clean(auth.get("default_org_name")) or explicit_id
+        else:
+            label = explicit_id
+        return explicit_id, label
+    explicit_name = _clean(cli_org_name)
+    if explicit_name:
+        resolved_id, resolved_name = _resolve_org_context(None, explicit_name)
+        return resolved_id, resolved_name or explicit_name
+    auth = load_auth()
+    saved_id = _clean(auth.get("default_org_id"))
+    if saved_id:
+        label = _clean(auth.get("default_org_name")) or saved_id
+        return saved_id, label
+    return None, "personal"
+
+
+def _print_creation_scope_banner(scope_label: str) -> None:
+    """Tell the user where this project/migration is being created. Mirrors
+    the org switcher pill in the web UI so CLI users aren't guessing whether
+    something landed in their personal scope or under an org."""
+    if _state.json:
+        return
+    if scope_label == "personal":
+        print(f"{DIM}Creating as:{RESET} {YELLOW}personal{RESET}")
+    else:
+        print(f"{DIM}Creating in org:{RESET} {YELLOW}{scope_label}{RESET}")
+
+
+def _print_applied_context_banner(applied: dict | None) -> None:
+    """Surface that the clarifier auto-applied saved team/cost context so the
+    user knows exactly which questions were skipped and where to edit them.
+    Without this the rollup-skip is silent and feels like Keshro 'forgot' to
+    ask — undermining trust in the answers Keshro reaches downstream."""
+    if _state.json or not applied:
+        return
+    parts: list[str] = []
+    if applied.get("applied_team_context"):
+        parts.append("team context")
+    if applied.get("applied_cost_context"):
+        parts.append("cost context")
+    if not parts:
+        return
+    scope = applied.get("scope") or "user"
+    label = _clean(applied.get("scope_label")) or (
+        "your profile" if scope == "user" else "your org"
+    )
+    edit_cmd = "keshro user context" if scope == "user" else "keshro org context"
+    print(
+        f"{GREEN}✓{RESET} Using saved {' + '.join(parts)} from {YELLOW}{label}{RESET}. "
+        f"{DIM}Edit:{RESET} {CYAN}{edit_cmd}{RESET}"
+    )
 
 
 def _current_plan_label(work_dir: str | None = None) -> str | None:
@@ -1483,6 +1565,15 @@ def _write_agent_answers_file(
     suggested_answers: dict[str, str],
     enrichment_context: str = "",
 ) -> str:
+    """Write the clarifier handoff payload to a system tmp file. The agent
+    Reads / Edits this file to capture the user's answers, then re-invokes
+    the CLI with `--answers-file <path>`.
+
+    Lives in the OS tmp dir (`/var/folders/...` on macOS, `/tmp` on Linux)
+    so the OS handles cleanup on its own schedule. Claude Code prompts on
+    first Read / Edit; the prompt offers a 'Yes, allow all edits in T/
+    during this session' option that suppresses further prompts in the
+    same session — see SKILL.md for the user-facing instruction."""
     import tempfile
 
     payload = {
@@ -1551,7 +1642,7 @@ def _exit_for_agent_clarifier_feedback(
         options = list(question.get("answers") or [])
         input_mode = question.get("input_mode", "select")
         if options:
-            for option_index, option in enumerate(options, 1):
+            for option_index, option in enumerate(options):
                 title = _clean(option.get("answer_title")) or _clean(
                     option.get("value")
                 )
@@ -1561,7 +1652,14 @@ def _exit_for_agent_clarifier_feedback(
                     if suggested and suggested == _clean(option.get("value"))
                     else ""
                 )
-                print(f"     {DIM}{option_index}. {title}{rec}{marker}{RESET}")
+                # Letter markers in parens — `(a)`, `(b)`, `(c)` — so option
+                # labels are visually distinct from the parent question's
+                # `1.` numeric label. Avoids the "1." question / "1." option
+                # collision that made rendered output ambiguous in agent
+                # transcripts, and the parens read more clearly than `a.`
+                # next to a `1.` heading.
+                letter = chr(ord("a") + option_index)
+                print(f"     {DIM}({letter}) {title}{rec}{marker}{RESET}")
             if input_mode != "free_text":
                 print(f"     {DIM}Or: type a custom answer{RESET}")
         if input_mode == "free_text":
@@ -1754,23 +1852,233 @@ def _format_recommended_suffix(title: str, recommended: bool) -> str:
     return f" {GREEN}(recommended){RESET}"
 
 
-def _build_path_discovery_prompt(template: dict) -> str:
+_EXPERIENCE_LEVEL_OPTIONS = ["Junior", "Mid-level", "Senior", "Mixed"]
+_FAMILIARITY_OPTIONS = ["None", "Basic", "Proficient", "Expert"]
+
+_COST_SIGNAL_FIELDS = [
+    (
+        "Planned dual-run / overlap period",
+        "Helps estimate temporary vendor overlap and parallel-run costs.",
+    ),
+    (
+        "Current platform monthly spend",
+        "Used to model the cost of staying put and temporary overlap during migration.",
+    ),
+    (
+        "Expected target platform monthly spend",
+        "Used to model destination infra or service costs during rollout and steady state.",
+    ),
+    (
+        "Backfill / data transfer volume",
+        "Helps estimate data transfer, egress, and backfill-related migration costs.",
+    ),
+    (
+        "Expected tooling / outside-services cost",
+        "Use this for paid migration tooling, temporary licenses, or consulting support.",
+    ),
+]
+
+_EXECUTION_SIGNAL_FIELDS = [
+    (
+        "What the migration actually means",
+        "Clarify whether this is full replacement, orchestration moving elsewhere, staged coexistence, or a narrower workflow change.",
+    ),
+    (
+        "Workloads / assets in scope",
+        "How many jobs, workflows, services, tables, or other assets are actually in scope?",
+    ),
+    (
+        "Current triggers / scheduling model",
+        "What triggers the current workloads, and how often do they run?",
+    ),
+    (
+        "Retry and failure-handling requirements",
+        "What retry policies, alerts, or failure-handling behavior must be preserved?",
+    ),
+    (
+        "Target execution model",
+        "Will the target orchestrate the current runtime, replace it, or use a hybrid model?",
+    ),
+    (
+        "Deployment / delivery model",
+        "Will deployment happen through CI/CD, scripted uploads, manual UI changes, or some other path?",
+    ),
+    (
+        "Infrastructure as code / Terraform setup",
+        "Is Terraform or another IaC system already in place for the target environment and permissions model?",
+    ),
+    (
+        "Cloud permissions / IAM setup",
+        "How will permissions, service roles, and deployment access be managed in the target setup?",
+    ),
+    (
+        "Target hosting / deployment environment",
+        "Where will the target system run?",
+    ),
+    (
+        "Cutover window / go-live target",
+        "When can the migration go live, and how much downtime or disruption is acceptable?",
+    ),
+    (
+        "Rollback strategy and triggers",
+        "What would trigger rollback, and what is the fallback path?",
+    ),
+    (
+        "Dependency / ordering constraints",
+        "What dependencies or execution ordering requirements must be preserved?",
+    ),
+    (
+        "Resource / runtime requirements",
+        "What compute, memory, GPU, or environment requirements matter for migration design?",
+    ),
+]
+
+_STANDARD_ROLE_SUGGESTIONS = [
+    "Backend Engineer",
+    "Frontend Engineer",
+    "Full-Stack Engineer",
+    "QA Engineer",
+    "Senior Software Engineer",
+    "Software Engineer",
+    "Data Platform Engineer",
+    "DevOps Engineer",
+    "Platform Engineer",
+]
+
+
+def _build_path_discovery_prompt(template: dict, currency: str = "USD") -> str:
     source = _clean(template.get("source")) or "Source"
     target = _clean(template.get("target")) or "Target"
+    raw_fields = list(template.get("fields") or [])
+
+    def _field_label(field: dict) -> str:
+        return _clean(field.get("label")) or _clean(field.get("id")) or "Detail"
+
+    all_fields = [f for f in raw_fields if _field_label(f) != "Detail" or f.get("id")]
+    required_fields = [f for f in all_fields if f.get("required")]
+
+    tips = [
+        _clean(tip) for tip in (template.get("tips") or []) if _clean(tip)
+    ]
+    required_outputs = [
+        _clean(item) for item in (template.get("required_outputs") or []) if _clean(item)
+    ]
+
+    # Derive inspectFirst from required fields, with a source/target-aware fallback.
+    if required_fields:
+        inspect_first = [_field_label(f) for f in required_fields[:6]]
+    else:
+        inspect_first = [
+            f"Current {source} runtime or platform version",
+            f"Dependencies and integrations tied to {source} that must keep working",
+            f"Production workloads on {source} that cannot regress",
+            f"Current deployment shape and rollback boundary for {source}",
+            f"The smallest representative workload you can safely validate on {target} first",
+        ]
+
+    # Derive discoverFromEnvironment from the full field list, with hints.
+    if all_fields:
+        discover_from_env = []
+        for f in all_fields[:8]:
+            label = _field_label(f)
+            hint = _clean(f.get("hint"))
+            discover_from_env.append(f"{label} — {hint}" if hint else label)
+    else:
+        discover_from_env = [
+            f"The current {source} version actually in production",
+            f"Dependencies, integrations, and surrounding systems tied to {source}",
+            f"Real production workflows, traffic shape, and access patterns that depend on {source}",
+            "Current deployment topology, operating constraints, and rollback boundary",
+            f"Representative {source} workloads, artifacts, or data you can inspect before planning",
+        ]
+
+    # Reviewable checks from required_outputs.
+    if required_outputs:
+        reviewable_checks = [
+            f"{output} — Confirm this is producible for the {source} -> {target} move."
+            for output in required_outputs
+        ]
+    else:
+        reviewable_checks = [
+            f"List the {source} assets in scope — services, jobs, tables, workflows, repos, or configs that will actually move.",
+            "Identify the top workflows that cannot regress — prefer concrete reports, endpoints, jobs, or user journeys over vague success criteria.",
+            f"Draft one safe {source} -> {target} pilot path — validate one representative component before assuming the whole migration shape.",
+        ]
+
+    # Behavioral differences / whatCouldBreak from tips.
+    what_could_break = tips if tips else [
+        f"A core {source} capability may behave differently in {target} even when the migration looks structurally straightforward.",
+        f"Cutover can fail if validation covers only configuration parity and not runtime behavior on {target}.",
+        "Rollback plans are often too vague until ownership, timing, and triggers are explicit.",
+        f"{source} workloads with hidden integrations or operational assumptions are the most common surprise source.",
+    ]
+
     lines = [
         f"You are the migration discovery analyst for a {source} -> {target} migration.",
         "",
-        "Gather the highest-signal migration facts before planning begins.",
-        "Replace the blanks below with concrete answers. Use `Unknown` when you cannot verify a value.",
+        "Your job is to gather the highest-signal migration facts before planning begins.",
+        "Focus on facts that materially affect risk, effort, cutover complexity, validation, rollout shape, and target architecture.",
         "",
-        "## Versions",
-        "- Source version:",
-        "- Target version:",
+        "Operating rules:",
+        "- Prioritize runtime, dependencies, architecture, deployment, and production workflow details.",
+        "- Prefer concrete values from configs, metadata, docs, queries, and runtime inspection.",
+        "- Do not summarize vaguely when a specific fact can be stated.",
+        "- Do not guess at staffing, spend, timeline, or rollout assumptions.",
+        "- If a value is missing or not discoverable, write `Unknown`.",
         "",
-        f"## {source} to {target} details",
+        "Inspect these first before answering:",
     ]
-    for field in template.get("fields") or []:
-        label = _clean(field.get("label")) or _clean(field.get("id")) or "Detail"
+    lines.extend(f"- {item}" for item in inspect_first)
+    lines.extend(["", "Reviewable checks and suggested investigation steps:"])
+    lines.extend(f"- {item}" for item in reviewable_checks)
+    lines.extend(["", "Behavioral differences and what could break:"])
+    lines.extend(f"- {item}" for item in what_could_break)
+    lines.extend(
+        [
+            "",
+            "Return the result in exactly this format so Keshro can parse it:",
+            "",
+            "## Versions",
+            "- Source version:",
+            "- Target version:",
+            "",
+            "## Discover from environment",
+        ]
+    )
+    lines.extend(f"- {item}" for item in discover_from_env)
+    lines.extend(
+        [
+            "",
+            "## Labor planning (team-supplied if known)",
+            "- Team size:",
+            f"- Experience level: Options: {' | '.join(_EXPERIENCE_LEVEL_OPTIONS)}",
+            f"- Familiarity with source: Options: {' | '.join(_FAMILIARITY_OPTIONS)}",
+            f"- Familiarity with target: Options: {' | '.join(_FAMILIARITY_OPTIONS)}",
+            f"- Migration roles involved: Relevant examples: {' | '.join(_STANDARD_ROLE_SUGGESTIONS)}",
+            "- Timeline:",
+            "- Additional team notes:",
+            "",
+            "## Non-labor cost signals (team-supplied if known)",
+        ]
+    )
+    for label, hint in _COST_SIGNAL_FIELDS:
+        lines.append(f"- {label} ({currency}): {hint}")
+    lines.extend(
+        [
+            "",
+            "## Execution, cutover, and operating model (team-supplied if known)",
+        ]
+    )
+    for label, hint in _EXECUTION_SIGNAL_FIELDS:
+        lines.append(f"- {label}: {hint}")
+    lines.extend(
+        [
+            "",
+            f"## {source} to {target} details",
+        ]
+    )
+    for field in all_fields:
+        label = _field_label(field)
         hint = _clean(field.get("hint"))
         option_text = ""
         options = [
@@ -1780,13 +2088,20 @@ def _build_path_discovery_prompt(template: dict) -> str:
         ]
         if options:
             option_text = f" Options: {' | '.join(options)}"
+        required_tag = " (required)" if field.get("required") else ""
         suffix = f" Hint: {hint}" if hint else ""
-        lines.append(f"- {label}:{option_text}{suffix}")
+        lines.append(f"- {label}{required_tag}:{option_text}{suffix}")
     lines.extend(
         [
             "",
             "## Additional context",
-            "- Anything else that materially affects risk, effort, validation, cutover, rollback, or delivery:",
+            "- Anything else that materially affects risk, effort, validation, cutover, rollback, data movement, or delivery:",
+            "",
+            "Quality bar:",
+            "- Use exact field labels.",
+            "- Keep answers concise but specific.",
+            "- Prefer inspected facts over opinions.",
+            "- Do not add sections that are not requested.",
             "",
         ]
     )
@@ -1986,99 +2301,55 @@ def _get_migration_clarifiers(client: httpx.Client, payload: dict) -> list[dict]
     response = client.post("/v1/migrations/clarifiers", json=payload)
     response.raise_for_status()
     body = response.json() or {}
+    applied = body.get("applied_context")
+    if applied:
+        _print_applied_context_banner(applied)
     return list(body.get("questions") or [])
 
 
-def _build_clarifier_prompt(
-    template: dict, payload: dict, questions: list[dict]
-) -> str:
-    source = (
-        _clean(template.get("source")) or _clean(payload.get("source_type")) or "Source"
-    )
-    target = (
-        _clean(template.get("target")) or _clean(payload.get("target_type")) or "Target"
-    )
-    existing_fields = dict(payload.get("custom_fields") or {})
-    existing_context = _clean(payload.get("context"))
-    lines = [
-        f"You are helping finalize a Keshro migration draft for {source} -> {target}.",
-        "Answer the follow-up questions below using the current workspace and the already-gathered migration context.",
-        "Prefer concrete answers grounded in the repository, configs, docs, and runtime clues available locally.",
-        "If something still cannot be verified, use the recommended option when one exists; otherwise write `Unknown`.",
-        "Return only bullet lines in the exact format `- <question id>: <answer>`.",
-        "",
-        "Known draft context:",
-    ]
-    if existing_fields:
-        for key, value in existing_fields.items():
-            if _clean(str(value)):
-                lines.append(f"- {key}: {_clean(str(value))}")
-    elif existing_context:
-        lines.append("- No structured fields yet.")
-    if existing_context:
-        lines.extend(["", "Draft context:", existing_context])
-    lines.extend(["", "Follow-up questions:"])
-    for question in questions:
-        prompt_id = _clean(question.get("id"))
-        prompt_text = _clean(question.get("question"))
-        why = _clean(question.get("why_this_matters"))
-        placeholder = _clean(question.get("placeholder"))
-        lines.append(f"- {prompt_id}: {prompt_text}")
-        if why:
-            lines.append(f"  Why it matters: {why}")
-        options = list(question.get("answers") or [])
-        if options:
-            lines.append("  Options:")
-            for option in options:
-                title = _clean(option.get("answer_title")) or _clean(
-                    option.get("value")
-                )
-                value = _clean(option.get("value"))
-                suffix = " [recommended]" if option.get("recommended") else ""
-                lines.append(f"  - {title}{suffix}: {value}")
-        elif placeholder:
-            lines.append(f"  Hint: {placeholder}")
-    return "\n".join(lines)
+def _extract_repo_scan_answer(question: dict) -> str | None:
+    """Return the value of a repo-scan-derived recommended option on a
+    clarifier question, if one was injected by the backend clarifier
+    (`_attach_discovered_recommendation`).
+
+    Provenance lives in `answer_explanation` (the backend writes a
+    "Detected from your repo scan." sentinel line there), not in the
+    title. The title now displays the actual discovered value instead of
+    a generic 'Based on repo scan' label, so matching on the title would
+    produce false negatives."""
+    for answer in question.get("answers") or []:
+        if not answer.get("recommended"):
+            continue
+        explanation_lines = answer.get("answer_explanation") or []
+        if not any(
+            "repo scan" in str(line).lower() for line in explanation_lines
+        ):
+            continue
+        value = _clean(answer.get("value"))
+        if value and value.lower() != "unknown":
+            return value
+    return None
 
 
-def _collect_clarifier_answers_from_claude(
-    template: dict,
-    payload: dict,
-    questions: list[dict],
-    work_dir: str | None = None,
-    agent: str = "auto",
-) -> dict[str, str]:
-    if not questions:
-        return {}
-    prompt = _build_clarifier_prompt(template, payload, questions)
-    raw = _run_prompt_in_agent(
-        prompt,
-        missing_binary_message=(
-            "Could not find a coding agent binary. Make sure you're running this from within your agent's terminal."
-        ),
-        failure_message_prefix="Coding agent returned an error: ",
-        empty_message="Coding agent returned no clarifier answers.",
-        work_dir=work_dir,
-        agent=agent,
-    )
-    parsed = _parse_discovery_key_values(raw)
-    answers: dict[str, str] = {}
+def _preset_answers_from_repo_scan(questions: list[dict]) -> dict[str, str]:
+    """Seed suggested_answers with values discovery already pulled in via
+    the backend's repo-scan recommendations. The clarifier feedback UI uses
+    these to mark each option with a (suggested) tag, and `--answers-file`
+    resume picks them up if the user just accepts.
+
+    Questions without a repo-scan recommendation get nothing — the user
+    fills them in directly. We deliberately don't call the agent here:
+    discovery already had its shot, and re-asking adds 1-2 minutes per
+    create with no new information."""
+    preset: dict[str, str] = {}
     for question in questions:
         question_id = _clean(question.get("id"))
-        value = _clean(parsed.get(_normalize_prompt_key(question_id)))
-        if value and value.lower() != "unknown":
-            answers[question_id] = value
+        if not question_id:
             continue
-        options = list(question.get("answers") or [])
-        recommended = next(
-            (option for option in options if option.get("recommended")),
-            None,
-        )
-        if recommended:
-            recommended_value = _clean(recommended.get("value"))
-            if recommended_value:
-                answers[question_id] = recommended_value
-    return answers
+        discovered = _extract_repo_scan_answer(question)
+        if discovered is not None:
+            preset[question_id] = discovered
+    return preset
 
 
 def _print_agent_collection_warning(message: str) -> None:
@@ -7000,8 +7271,27 @@ def _create_migration(
         typer.Option("--resource-url", "-u", help="Reference URL to attach."),
     ] = None,
     org_id: Annotated[
-        Optional[str], typer.Option("--org-id", "-o", help="Create under an org.")
+        Optional[str],
+        typer.Option(
+            "--org-id",
+            "-o",
+            help="Create under an org by ID. Defaults to your saved org context (see `keshro config`). Use --personal to force personal scope.",
+        ),
     ] = None,
+    org: Annotated[
+        Optional[str],
+        typer.Option(
+            "--org",
+            help="Create under an org by name (resolved via the orgs API).",
+        ),
+    ] = None,
+    personal: Annotated[
+        bool,
+        typer.Option(
+            "--personal",
+            help="Force personal (user-level) scope, ignoring any saved default org.",
+        ),
+    ] = False,
     work_dir: Annotated[
         Optional[str],
         typer.Option(
@@ -7120,9 +7410,23 @@ def _create_migration(
         ) = _load_answer_file_bundle(answers_file)
         provided_clarifier_answers.update(file_answers)
         context_entered_interactively = False
+        # Resolve the scope (org or personal) once, up front, so it shows in
+        # the banner AND flows through to backend creation calls. Without this
+        # the saved default_org_id never reaches `--org-id`-style code paths
+        # and every keshro create lands at the user level even when the user
+        # set an org default via `keshro config set --org`.
+        if personal and (org_id or org):
+            raise SystemExit(
+                "Cannot combine --personal with --org/--org-id. Pick one."
+            )
+        resolved_org_id, scope_label = _resolve_creation_scope(
+            org_id, org, force_personal=personal
+        )
+        org_id = resolved_org_id
         if template:
             if not _state.json:
                 print(f"{DIM}Using {_prompt_agent_display_name(agent)}{RESET}\n")
+                _print_creation_scope_banner(scope_label)
             # Migration mode — use the existing migration flow
             answers = _parse_field_assignments(field)
             return _create_migration_inner(
@@ -7144,6 +7448,7 @@ def _create_migration(
             resolved_work_dir = str(Path(work_dir or ".").resolve())
             if not _state.json:
                 print(f"{DIM}Using {_prompt_agent_display_name(agent)}{RESET}\n")
+                _print_creation_scope_banner(scope_label)
 
             # If no description provided, prompt for one
             has_description = bool(
@@ -7249,6 +7554,12 @@ def _create_migration(
                         agent=agent,
                     )
                 if not _state.json:
+                    # Restate scope right next to the template match so users
+                    # never create a migration under the wrong scope. The
+                    # earlier "Creating in org:" banner can get collapsed in
+                    # agent-wrapped output; this line rides alongside the
+                    # most prominent progress marker they'll see.
+                    _print_creation_scope_banner(scope_label)
                     print(
                         f"{GREEN}Matched template:{RESET} {source_tech} → {target_tech} "
                         f"{DIM}(pre-built discovery, risks, and field definitions){RESET}\n"
@@ -7379,6 +7690,8 @@ def _create_migration(
                     "description": description,
                     "discovered_context": discovered_context,
                 }
+                if org_id:
+                    preview_payload["org_id"] = org_id
                 try:
                     resp = client.post(
                         "/v1/plans/describe/preview",
@@ -7389,39 +7702,25 @@ def _create_migration(
                     preview = resp.json()
                     questions = preview.get("questions", [])
                     enrichment_context = preview.get("enrichment_context", "")
+                    applied_context = preview.get("applied_context")
+                    if applied_context:
+                        _print_applied_context_banner(applied_context)
                 except Exception as exc:
                     if not _state.json:
                         print(f"{YELLOW}Could not generate questions: {exc}{RESET}")
 
-            # Step 3: Have the coding agent suggest answers, then review them with the user
+            # Step 3: Hand questions straight to the user with discovery's
+            # repo-scan pre-fills baked into suggested_answers. Same change
+            # made to the migration flow — discovery already had its shot at
+            # every question; calling the agent again wastes 1-2 minutes
+            # without producing new info, since the agent has the same
+            # context the discovery pass had.
             answered: dict[str, str] = dict(provided_clarifier_answers)
             if questions and _inside_coding_agent():
                 missing_ids = _missing_question_ids(questions, answered)
-                suggested_answers: dict[str, str] = {}
-                if missing_ids and not _state.json:
-                    print(
-                        f"{CYAN}Asking AI agent to suggest answers for {len(questions)} clarifying questions...{RESET}"
-                    )
+                preset = _preset_answers_from_repo_scan(questions)
+                suggested_answers: dict[str, str] = {**preset, **answered}
                 if missing_ids:
-                    try:
-                        suggested_answers = _answer_questions_via_agent(
-                            questions,
-                            description,
-                            discovered_context,
-                            resolved_work_dir,
-                            agent=agent,
-                        )
-                    except SystemExit as exc:
-                        suggested_answers = {}
-                        _print_agent_collection_warning(
-                            f"Skipping suggested clarifier answers: {exc}"
-                        )
-                if missing_ids:
-                    suggested_for_missing = {
-                        key: value
-                        for key, value in suggested_answers.items()
-                        if key in missing_ids
-                    }
                     rerun_command = (
                         f"keshro create --context {shlex.quote(context or description)}"
                     )
@@ -7430,21 +7729,19 @@ def _create_migration(
                     _exit_for_agent_clarifier_feedback(
                         heading="Keshro needs user answers before it can generate this plan.",
                         questions=questions,
-                        suggested_answers={**answered, **suggested_for_missing},
+                        suggested_answers=suggested_answers,
                         rerun_command=rerun_command,
                         enrichment_context=enrichment_context,
                     )
                 if not _state.json:
-                    suggested_count = sum(
-                        1
-                        for v in suggested_answers.values()
-                        if v and v.lower() != "unknown"
-                    )
                     accepted_count = sum(
                         1 for v in answered.values() if v and v.lower() != "unknown"
                     )
+                    preset_count = sum(
+                        1 for v in preset.values() if v and v.lower() != "unknown"
+                    )
                     print(
-                        f"  Agent suggested {suggested_count}/{len(questions)} answers; accepted {accepted_count}/{len(questions)}."
+                        f"  Pre-filled {preset_count}/{len(questions)} answers from repo scan; accepted {accepted_count}/{len(questions)}."
                     )
             elif questions and sys.stdout.isatty() and not _state.json:
                 # TTY mode — let the user answer interactively
@@ -7515,6 +7812,28 @@ def _create_migration(
             }
             if org_id:
                 generate_payload["org_id"] = org_id
+
+            # Extract any clarifier answers whose IDs map to known team/cost
+            # fields so the backend can persist them to org/user (closes the
+            # loop on saved-context reuse for projects). When the LLM-generated
+            # clarifier doesn't emit team/cost-shaped questions today, these
+            # dicts stay empty and writeback is a no-op — but this keeps the
+            # plumbing in place for when project_questions does start emitting
+            # structured team/cost fields.
+            team_payload = {
+                key: answered[key]
+                for key in _TEAM_CONTEXT_LABELS
+                if key in answered and answered[key]
+            }
+            cost_payload = {
+                key: answered[key]
+                for key in _COST_CONTEXT_LABELS
+                if key in answered and answered[key]
+            }
+            if team_payload:
+                generate_payload["team_context"] = team_payload
+            if cost_payload:
+                generate_payload["cost_context"] = cost_payload
 
             with _Spinner("Generating execution plan..."):
                 try:
@@ -7997,25 +8316,16 @@ def _create_migration_inner(
                         )
                 if _inside_coding_agent():
                     if not provided_clarifier_answers:
-                        with _Spinner(
-                            "Collecting suggested follow-up answers (this can take a bit)..."
-                        ):
-                            try:
-                                suggested_answers = (
-                                    _collect_clarifier_answers_from_claude(
-                                        template,
-                                        payload,
-                                        clarifier_questions,
-                                        work_dir=resolved_work_dir,
-                                        agent=agent,
-                                    )
-                                )
-                            except SystemExit as exc:
-                                suggested_answers = {}
-                                _print_agent_collection_warning(
-                                    f"Skipping suggested clarifier answers: {exc}"
-                                )
-                    if not provided_clarifier_answers:
+                        # Discovery already had the agent's shot at every
+                        # question. Repo-scan answers it found are surfaced
+                        # as recommended options on the clarifier itself —
+                        # for the rest, the user is the one with the missing
+                        # info, so a second agent call doesn't add signal
+                        # and costs ~1-2 min per create. Hand questions
+                        # straight to the user with discovery's pre-fills.
+                        suggested_answers = _preset_answers_from_repo_scan(
+                            clarifier_questions
+                        )
                         rerun_command = (
                             f"keshro create --template {shlex.quote(path)}"
                             f" --context {shlex.quote(context or '')}"
@@ -8117,25 +8427,9 @@ def _create_custom_migration_inner(
                         )
                 if _inside_coding_agent():
                     if not provided_clarifier_answers:
-                        with _Spinner(
-                            "Collecting suggested follow-up answers (this can take a bit)..."
-                        ):
-                            try:
-                                suggested_answers = (
-                                    _collect_clarifier_answers_from_claude(
-                                        {},
-                                        payload,
-                                        clarifier_questions,
-                                        work_dir=resolved_work_dir,
-                                        agent=agent,
-                                    )
-                                )
-                            except SystemExit as exc:
-                                suggested_answers = {}
-                                _print_agent_collection_warning(
-                                    f"Skipping suggested clarifier answers: {exc}"
-                                )
-                    if not provided_clarifier_answers:
+                        suggested_answers = _preset_answers_from_repo_scan(
+                            clarifier_questions
+                        )
                         rerun_command = (
                             f"keshro create -m --context {shlex.quote(context or '')}"
                         ).rstrip()
@@ -8365,10 +8659,17 @@ def _config_show():
         f"{GREEN if payload['authenticated'] else CYAN}{'yes' if payload['authenticated'] else 'no'}{RESET}"
     )
     print(f"{DIM}Default agent:{RESET} {YELLOW}{payload['default_agent']}{RESET}")
-    default_context = (
-        payload["default_org_name"] or payload["default_org_id"] or "personal"
-    )
-    print(f"{DIM}Default context:{RESET} " f"{YELLOW}{default_context}{RESET}")
+    # Scope: explicit org vs personal. "Default context: personal" was too
+    # vague — users couldn't tell from the label whether migrations would
+    # land in their personal space or under an org. The web UI shows the
+    # active org prominently; this mirrors that.
+    org_name = _clean(payload.get("default_org_name"))
+    org_id_value = _clean(payload.get("default_org_id"))
+    if org_name or org_id_value:
+        scope_label = f"org ({YELLOW}{org_name or org_id_value}{RESET})"
+    else:
+        scope_label = f"{YELLOW}personal{RESET}"
+    print(f"{DIM}Scope:{RESET} {scope_label}")
     repo_plan = payload["repo_plan_title"] or payload["repo_plan_id"]
     default_plan = payload["default_plan_title"] or payload["default_plan_id"]
     repo_plan_id = payload.get("repo_plan_id") or ""
@@ -8429,6 +8730,20 @@ def _config_callback(
                 "default_work_dir": None,
             }
         )
+        repo_root = _discover_repo_root()
+        if repo_root is not None:
+            try:
+                with make_client(_state.api_url, _state.token) as client:
+                    client.request(
+                        "DELETE",
+                        "/v1/plans/repo-link",
+                        params={
+                            "repo_root": str(repo_root),
+                            "git_remote_url": _discover_git_remote_url(repo_root),
+                        },
+                    )
+            except Exception:
+                pass
         print(f"{GREEN}✓{RESET} Cleared saved default project context.")
         return
     if ctx.invoked_subcommand is None:
@@ -11990,6 +12305,187 @@ def _print_request_error(exc: httpx.RequestError) -> None:
         print_output(payload, True)
         return
     print(f"{RED}{detail}{RESET}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Saved-context subcommands (`keshro org context`, `keshro user context`)
+# ---------------------------------------------------------------------------
+#
+# Backed by the team_context / cost_context JSON columns added to organizations
+# and users. The migration / project clarifier reads these so users only fill
+# team-size, experience, cost-overlap, etc. once per scope. These commands let
+# the user inspect or wipe what's saved without hunting through the web UI.
+
+_TEAM_CONTEXT_LABELS = {
+    "team_size": "Team size",
+    "experience_level": "Experience level",
+    "familiarity_source": "Familiarity with source",
+    "familiarity_target": "Familiarity with target",
+    "expected_roles": "Migration roles involved",
+    "timeline": "Timeline",
+    "additional_team_notes": "Additional team notes",
+}
+
+_COST_CONTEXT_LABELS = {
+    "dual_run_period": "Planned dual-run / overlap period",
+    "current_platform_monthly_cost_usd": "Current platform monthly spend",
+    "target_platform_monthly_cost_usd": "Expected target platform monthly spend",
+    "data_transfer_volume": "Backfill / data transfer volume",
+    "tooling_or_services_cost_usd": "Expected tooling / outside-services cost",
+}
+
+
+def _print_context_block(title: str, mapping: dict, values: dict | None) -> None:
+    print(f"{CYAN}{title}{RESET}")
+    if not values:
+        print(f"  {DIM}(none saved){RESET}")
+        return
+    for key, label in mapping.items():
+        if key in values and values[key] not in (None, "", []):
+            print(f"  {DIM}{label}:{RESET} {values[key]}")
+    extras = {k: v for k, v in values.items() if k not in mapping and v not in (None, "", [])}
+    for key, value in extras.items():
+        print(f"  {DIM}{key}:{RESET} {value}")
+
+
+def _show_saved_context(*, scope: str) -> int:
+    """Render saved team/cost context for org or user. Returns exit code."""
+    _ensure_authenticated()
+    with make_client(_state.api_url, _state.token) as client:
+        if scope == "org":
+            org_id = _current_org_id()
+            if not org_id:
+                print(
+                    f"{YELLOW}No active org. Set one with `keshro config set --org <name>` "
+                    f"or use `keshro user context` for personal context.{RESET}"
+                )
+                return 1
+            res = client.get(f"/v1/orgs/{org_id}")
+            res.raise_for_status()
+            body = res.json() or {}
+            label = body.get("name") or org_id
+        else:
+            res = client.get("/v1/auth/me")
+            res.raise_for_status()
+            body = res.json() or {}
+            label = body.get("email") or body.get("name") or "you"
+    if _state.json:
+        print_output(
+            {
+                "scope": scope,
+                "scope_label": label,
+                "team_context": body.get("team_context") or None,
+                "cost_context": body.get("cost_context") or None,
+            },
+            True,
+        )
+        return 0
+    header = f"Saved context for {YELLOW}{label}{RESET} ({scope}):"
+    print(header)
+    _print_context_block("Team", _TEAM_CONTEXT_LABELS, body.get("team_context"))
+    _print_context_block("Cost", _COST_CONTEXT_LABELS, body.get("cost_context"))
+    print(
+        f"\n{DIM}This is auto-applied to new "
+        f"{'org' if scope == 'org' else 'personal'} migrations and projects "
+        f"so you aren't asked again.{RESET}"
+    )
+    return 0
+
+
+def _clear_saved_context(
+    *, scope: str, clear_team: bool, clear_cost: bool, clear_all: bool
+) -> int:
+    """PATCH the org or user with team_context/cost_context set to {} (clear).
+    The backend treats empty dict as 'forget this so the clarifier asks again
+    on the next migration / project'."""
+    if clear_all:
+        clear_team = True
+        clear_cost = True
+    if not (clear_team or clear_cost):
+        print(
+            f"{YELLOW}Specify what to clear: --clear-team, --clear-cost, or --clear-all.{RESET}"
+        )
+        return 1
+    _ensure_authenticated()
+    payload: dict = {}
+    if clear_team:
+        payload["team_context"] = {}
+    if clear_cost:
+        payload["cost_context"] = {}
+    with make_client(_state.api_url, _state.token) as client:
+        if scope == "org":
+            org_id = _current_org_id()
+            if not org_id:
+                print(
+                    f"{YELLOW}No active org. Set one with `keshro config set --org <name>` "
+                    f"or use `keshro user context` for personal context.{RESET}"
+                )
+                return 1
+            res = client.patch(f"/v1/orgs/{org_id}", json=payload)
+        else:
+            res = client.patch("/v1/auth/me", json=payload)
+        res.raise_for_status()
+    cleared = []
+    if clear_team:
+        cleared.append("team")
+    if clear_cost:
+        cleared.append("cost")
+    print(
+        f"{GREEN}✓{RESET} Cleared saved {' + '.join(cleared)} context "
+        f"({'org' if scope == 'org' else 'personal'}). "
+        f"Next migration / project will re-ask."
+    )
+    return 0
+
+
+@org_app.command("context")
+def _org_context(
+    clear_team: Annotated[
+        bool, typer.Option("--clear-team", help="Clear saved org team context.")
+    ] = False,
+    clear_cost: Annotated[
+        bool, typer.Option("--clear-cost", help="Clear saved org cost context.")
+    ] = False,
+    clear_all: Annotated[
+        bool, typer.Option("--clear-all", help="Clear both team and cost context.")
+    ] = False,
+):
+    """View or clear the saved team / cost context for the active org."""
+    if clear_team or clear_cost or clear_all:
+        raise SystemExit(
+            _clear_saved_context(
+                scope="org",
+                clear_team=clear_team,
+                clear_cost=clear_cost,
+                clear_all=clear_all,
+            )
+        )
+    raise SystemExit(_show_saved_context(scope="org"))
+
+
+@user_app.command("context")
+def _user_context(
+    clear_team: Annotated[
+        bool, typer.Option("--clear-team", help="Clear saved personal team context.")
+    ] = False,
+    clear_cost: Annotated[
+        bool, typer.Option("--clear-cost", help="Clear saved personal cost context.")
+    ] = False,
+    clear_all: Annotated[
+        bool, typer.Option("--clear-all", help="Clear both team and cost context.")
+    ] = False,
+):
+    """View or clear the saved team / cost context for your personal account."""
+    if clear_team or clear_cost or clear_all:
+        raise SystemExit(
+            _clear_saved_context(
+                scope="user",
+                clear_team=clear_team,
+                clear_cost=clear_cost,
+                clear_all=clear_all,
+            )
+        )
+    raise SystemExit(_show_saved_context(scope="user"))
 
 
 # ---------------------------------------------------------------------------
