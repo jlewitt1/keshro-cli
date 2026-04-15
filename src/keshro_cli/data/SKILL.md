@@ -195,6 +195,15 @@ If the user says "stop", "pause", "hold on", or "wait":
 ## Rules
 - Run keshro commands via Bash, never as chat messages
 - Do NOT use Keshro MCP tools — always use the CLI
+- Do NOT expose raw `keshro ...` commands in user-facing prose. The CLI is an implementation detail; describe capabilities in plain English. Say "I can create a new project or migration", not "I'll run `keshro create`". Say "I can link an existing plan", not "I'll run `keshro config set --plan-id <id>`". Command names belong in Bash tool invocations, not in chat messages to the user.
+- When relaying clarifier follow-up questions, preserve the CLI's formatting exactly: each option on its own line, numbered, with `[recommended]` inline when marked. DO NOT collapse options into a comma-separated inline list — that makes them hard to scan. Render like:
+  ```
+  1. Rollback strategy?
+     1. Immediate rollback [recommended]
+     2. Dual-run rollback
+     3. No quick rollback
+     Or: custom answer
+  ```
 - Do NOT silently accept agent-suggested clarifier answers when Keshro asks follow-up questions. Surface them to the user and let the user confirm or override them.
 - Do NOT dump giant inline `--answer ...` commands back to the user. If Keshro provides an `--answers-file` resume path, use that.
 - Never auto-execute a plan without user confirmation. Always show the plan and ask first.
