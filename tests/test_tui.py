@@ -429,7 +429,7 @@ class TestKeshroStatusApp:
         assert app.token == "tok-123"
         assert app.plan_id == "plan-abc"
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_app_composes_all_widgets(self, monkeypatch):
         """Verify the app mounts all expected panels."""
         import httpx
@@ -469,7 +469,7 @@ class TestKeshroStatusApp:
             assert app.query_one("#graph", TaskGraph)
             assert app.query_one("#events", RecentEvents)
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_fetch_populates_widgets(self, monkeypatch):
         """Verify that a successful fetch updates all widget data."""
         import httpx
@@ -513,7 +513,7 @@ class TestKeshroStatusApp:
             agents = app.query_one("#agents", ActiveAgents)
             assert agents.plan_data is not None
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_fetch_error_sets_error_state(self, monkeypatch):
         """Verify that a failed fetch shows an error in PlanOverview."""
         import httpx
@@ -540,7 +540,7 @@ class TestKeshroStatusApp:
             assert overview._error
             assert "Connection refused" in overview._error
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_app_title_and_subtitle(self, monkeypatch):
         import httpx
 
@@ -575,7 +575,7 @@ class TestKeshroStatusApp:
             assert app.title == "KESHRO STATUS"
             assert "plan-abcdef12345" in app.sub_title
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_quit_binding(self, monkeypatch):
         import httpx
 

@@ -50,7 +50,7 @@ def _codex_versioned_marker() -> str:
     return f"{_CODEX_MARKER_BASE} v{__version__} -->"
 
 
-def _install_claude_integration() -> Path:
+def _install_claude_integration(*, silent: bool = False) -> Path:
     # Install as a skill (auto-triggered) in ~/.claude/skills/keshro/
     skill_dir = CLAUDE_SKILLS_DIR / "keshro"
     skill_dir.mkdir(parents=True, exist_ok=True)
@@ -69,7 +69,7 @@ def _install_claude_integration() -> Path:
     legacy = CLAUDE_COMMANDS_DIR / "keshro.md"
     if legacy.is_symlink() or legacy.exists():
         legacy.unlink()
-    if was_regular_file or was_stale_symlink:
+    if (was_regular_file or was_stale_symlink) and not silent:
         print(f"  Updated agent skill to v{__version__}", file=sys.stderr)
     return target
 
@@ -109,7 +109,6 @@ def _maybe_refresh_codex() -> None:
             return
         if _codex_versioned_marker() not in content:
             _install_codex_integration()
-            print(f"Updated Codex agent skill to v{__version__}", file=sys.stderr)
     except OSError:
         pass
 
@@ -137,7 +136,7 @@ def _maybe_refresh_claude() -> None:
             if skill_target.read_text(errors="replace") != KESHRO_SLASH_COMMAND:
                 needs_update = True
         if needs_update:
-            _install_claude_integration()
+            _install_claude_integration(silent=True)
     except OSError:
         pass
 
