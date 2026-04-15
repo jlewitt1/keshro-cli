@@ -33,10 +33,33 @@ The command is `keshro login`. There is no `auth` subcommand.
 ## CRITICAL: Never auto-answer interactive prompts
 If any `keshro` command prompts for interactive input or confirmation — initial project description, migration confirmation, follow-up questions, context overrides, or any other interactive choice — relay that prompt to the user and wait for their answer. Do not answer on the user's behalf, do not pipe input, and do not choose the recommended option automatically. The user MUST make these decisions.
 
-## Clarifier answers file lives in OS tmp
-When `keshro create` exits with follow-up questions, the CLI hands you a JSON answers file at `/var/folders/.../keshro-answers-*.json` (macOS) or `/tmp/keshro-answers-*.json` (Linux). Read this file to see the questions, Edit it to write the user's answers, then rerun the printed `--answers-file` command.
+## CRITICAL: Clarifier question formatting
+When relaying clarifier follow-up questions to the user, formatting MUST be exactly like this:
 
-The first Read or Edit on this file triggers a Claude Code permission prompt because the path is outside the working directory. The prompt offers a **"Yes, allow all edits in T/ during this session"** option. Tell the user to pick that option on the first prompt — it suppresses every subsequent prompt for the same session, so the rest of the clarifier round-trip is friction-free. Without that choice, every Read and every Edit on the answers file will prompt again.
+```
+1. First question text?
+   (a) First option [recommended]
+   (b) Second option
+   (c) Third option
+   Or: custom answer
+
+2. Second question text?
+   e.g. example placeholder for free-text questions
+
+3. Third question text?
+   (a) First option [recommended]
+   (b) Second option
+   Or: custom answer
+```
+
+Non-negotiable rules:
+- Each option on its own line, lettered `(a)`, `(b)`, `(c)` — never collapsed into a comma-separated inline list.
+- ONE BLANK LINE between every question. Never render two questions back-to-back. Dense, unspaced lists are unscannable; the blank line is what makes the list usable.
+- Never renumber or re-letter — letters separate option labels from the parent question's number so the rendered output is unambiguous.
+- Use exactly the question text and option titles the CLI returned. Do not paraphrase.
+
+## Clarifier answers file
+The CLI exits with a tmp `keshro-answers-*.json` path. Read it to see the questions, Edit it to write the user's answers, then rerun the printed `--answers-file` command. On the first Read/Edit prompt, ask the user to pick "Yes, allow all edits in T/ during this session" — that's it, no extra explanation needed.
 
 ## Create a project or migration
 ```bash
