@@ -11,6 +11,7 @@ import httpx
 import pytest
 
 from keshro_cli import __version__, cli
+from keshro_cli import git_ops
 
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -217,7 +218,7 @@ def test_collect_task_outcome_uses_merge_base_when_no_checkpoint(monkeypatch):
             )
         raise AssertionError(cmd)
 
-    monkeypatch.setattr("keshro_cli.cli.subprocess.run", _fake_run)
+    monkeypatch.setattr("keshro_cli.tasks.subprocess.run", _fake_run)
 
     outcome = cli._collect_task_outcome("/tmp/demo")
 
@@ -271,7 +272,7 @@ def test_collect_task_outcome_falls_back_to_root_commit_without_merge_base(monke
             )
         raise AssertionError(cmd)
 
-    monkeypatch.setattr("keshro_cli.cli.subprocess.run", _fake_run)
+    monkeypatch.setattr("keshro_cli.tasks.subprocess.run", _fake_run)
 
     outcome = cli._collect_task_outcome("/tmp/demo")
 
@@ -814,12 +815,12 @@ def test_find_existing_pr_falls_back_to_github_api(monkeypatch):
         return "git@github.com:jlewitt1/keshro-cli.git"
 
     monkeypatch.setenv("GITHUB_TOKEN", "token-123")
-    monkeypatch.setattr(cli.asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
-    monkeypatch.setattr(cli, "_git_stdout", _fake_git_stdout)
-    monkeypatch.setattr(cli.httpx, "AsyncClient", _FakeAsyncClient)
+    monkeypatch.setattr(git_ops.asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+    monkeypatch.setattr(git_ops, "_git_stdout", _fake_git_stdout)
+    monkeypatch.setattr(git_ops.httpx, "AsyncClient", _FakeAsyncClient)
 
     pr_url = asyncio.run(
-        cli._find_existing_pr(
+        git_ops._find_existing_pr(
             exec_dir="/tmp/project",
             branch_name="feature/test-branch",
         )
@@ -1206,7 +1207,10 @@ class _FakeClient:
 @pytest.fixture
 def fake_client(monkeypatch):
     client = _FakeClient()
-    monkeypatch.setattr(cli, "make_client", lambda api_url=None, token=None: client)
+    _fake_make = lambda api_url=None, token=None: client
+    monkeypatch.setattr(cli, "make_client", _fake_make)
+    monkeypatch.setattr("keshro_cli.context.make_client", _fake_make)
+    monkeypatch.setattr("keshro_cli.tasks.make_client", _fake_make)
     return client
 
 
@@ -1287,6 +1291,7 @@ def test_plan_generate_accepts_non_migration_requests(fake_client, capsys, monke
         "keshro_cli.cli._detect_migration_intent", lambda _description: None
     )
     monkeypatch.setattr("keshro_cli.cli.update_auth", lambda payload: payload)
+    monkeypatch.setattr("keshro_cli.context.update_auth", lambda payload: payload)
 
     original_post = fake_client.post
 
@@ -1565,6 +1570,7 @@ def _bypass_auth(monkeypatch):
 
 def test_continue_prints_prompt_with_task_context(fake_client, monkeypatch, capsys):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.context.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
     _bypass_auth(monkeypatch)
@@ -1582,6 +1588,7 @@ def test_continue_prompt_omits_full_skill_boilerplate_in_non_tty_mode(
     fake_client, monkeypatch, capsys
 ):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.context.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     _bypass_auth(monkeypatch)
 
@@ -1593,9 +1600,9 @@ def test_continue_prompt_omits_full_skill_boilerplate_in_non_tty_mode(
 
 
 def test_spinner_truncates_long_messages_but_keeps_animation(monkeypatch, capsys):
-    monkeypatch.setattr("keshro_cli.cli._stdout_is_tty", lambda: True)
+    monkeypatch.setattr("keshro_cli._state._stdout_is_tty", lambda: True)
     monkeypatch.setattr(
-        "keshro_cli.cli.shutil.get_terminal_size",
+        "keshro_cli._state.shutil.get_terminal_size",
         lambda fallback=(80, 24): os.terminal_size((40, 24)),
     )
 
@@ -1613,6 +1620,7 @@ def test_continue_prompt_mentions_status_tracking_and_blocking_rule(
     fake_client, monkeypatch, capsys
 ):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.context.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
     _bypass_auth(monkeypatch)
@@ -1629,6 +1637,10 @@ def test_continue_prompt_surfaces_plan_risks_unknowns_and_ui_link(
 ):
     monkeypatch.setattr(
         "keshro_cli.cli.load_auth",
+        lambda: {**_auth_with_plan(), "api_url": "http://localhost:8000"},
+    )
+    monkeypatch.setattr(
+        "keshro_cli.context.load_auth",
         lambda: {**_auth_with_plan(), "api_url": "http://localhost:8000"},
     )
     monkeypatch.setattr(
@@ -1680,6 +1692,7 @@ def test_continue_in_agent_mode_resumes_in_progress_task_before_next_todo(
     fake_client, monkeypatch, capsys
 ):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.context.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     _bypass_auth(monkeypatch)
 
@@ -1726,6 +1739,7 @@ def test_continue_in_agent_mode_resumes_in_progress_task_before_next_todo(
 
 def test_continue_prompt_includes_error_guidance(fake_client, monkeypatch, capsys):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.context.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
     _bypass_auth(monkeypatch)
@@ -1741,6 +1755,7 @@ def test_continue_confirms_when_using_implicit_plan_context(
     fake_client, monkeypatch, capsys
 ):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.context.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
     monkeypatch.setattr(
@@ -1775,6 +1790,7 @@ def test_continue_skips_confirmation_when_plan_id_is_explicit(
     fake_client, monkeypatch, capsys
 ):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.context.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
     monkeypatch.setattr("keshro_cli.cli.typer.confirm", lambda *a, **kw: True)
@@ -1796,6 +1812,7 @@ def test_continue_skips_confirmation_when_migration_id_is_explicit(
     fake_client, monkeypatch, capsys
 ):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.context.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
     monkeypatch.setattr(
@@ -1829,6 +1846,7 @@ def test_continue_exits_cleanly_when_implicit_plan_confirmation_is_declined(
     fake_client, monkeypatch, capsys
 ):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.context.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.cli._stdout_is_tty", lambda: True)
     monkeypatch.setattr("typer.confirm", lambda *args, **kwargs: False)
@@ -1843,6 +1861,7 @@ def test_continue_can_override_implicit_plan_with_migration_id(
     fake_client, monkeypatch, capsys
 ):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.context.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
 
     original_get = fake_client.get
@@ -1893,6 +1912,7 @@ def test_continue_prompt_does_not_tell_claude_to_refetch(
     fake_client, monkeypatch, capsys
 ):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.context.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
     _bypass_auth(monkeypatch)
@@ -1906,6 +1926,7 @@ def test_continue_prompt_does_not_tell_claude_to_refetch(
 
 def test_continue_exits_when_not_authenticated(fake_client, monkeypatch):
     monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: {})
+    monkeypatch.setattr("keshro_cli.context.load_auth", lambda: {})
     monkeypatch.setattr("keshro_cli.client.load_auth", lambda: {})
 
     exit_code = cli.main(["continue", "-p", "plan-123"])
@@ -1915,6 +1936,7 @@ def test_continue_exits_when_not_authenticated(fake_client, monkeypatch):
 def test_continue_allows_codex_for_parallel_mode(fake_client, monkeypatch, capsys):
     """Codex should be accepted for parallel mode (no longer rejected)."""
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.context.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
     monkeypatch.setattr(
@@ -1943,6 +1965,7 @@ def test_continue_uses_parallel_mode_inside_coding_agent_by_default(
     fake_client, monkeypatch
 ):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.context.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
     monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: True)
@@ -1966,6 +1989,7 @@ def test_continue_auto_prefers_codex_inside_codex_session(
     fake_client, monkeypatch, capsys
 ):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.context.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
     monkeypatch.setattr(
@@ -1976,6 +2000,8 @@ def test_continue_auto_prefers_codex_inside_codex_session(
     monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
     monkeypatch.delenv("CODEX_HOME", raising=False)
     monkeypatch.delenv("CODEX_SANDBOX", raising=False)
+    monkeypatch.delenv("CLAUDECODE", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_ENTRYPOINT", raising=False)
     monkeypatch.setenv("CODEX_CI", "1")
     monkeypatch.setenv("CODEX_THREAD_ID", "thread-123")
 
@@ -2008,6 +2034,7 @@ def test_continue_no_parallel_stays_single_task_inside_coding_agent(
     fake_client, monkeypatch
 ):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.context.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: True)
     monkeypatch.setattr("keshro_cli.cli._stdout_is_tty", lambda: False)
@@ -2051,6 +2078,10 @@ def test_continue_exits_when_token_expired(fake_client, monkeypatch):
         lambda: {"token": "expired-token", "default_plan_id": "plan-123"},
     )
     monkeypatch.setattr(
+        "keshro_cli.context.load_auth",
+        lambda: {"token": "expired-token", "default_plan_id": "plan-123"},
+    )
+    monkeypatch.setattr(
         "keshro_cli.client.load_auth", lambda: {"token": "expired-token"}
     )
 
@@ -2078,9 +2109,9 @@ def test_continue_exits_when_token_expired(fake_client, monkeypatch):
 
 def test_setup_claude_creates_skill(monkeypatch, tmp_path, capsys):
     skills_dir = tmp_path / "skills"
-    monkeypatch.setattr("keshro_cli.cli.CLAUDE_SKILLS_DIR", skills_dir)
+    monkeypatch.setattr("keshro_cli.integrations.CLAUDE_SKILLS_DIR", skills_dir)
     monkeypatch.setattr(
-        "keshro_cli.cli.CLAUDE_COMMANDS_DIR", tmp_path / "legacy_commands"
+        "keshro_cli.integrations.CLAUDE_COMMANDS_DIR", tmp_path / "legacy_commands"
     )
 
     cli.main(["setup-claude"])
@@ -2134,9 +2165,9 @@ def test_setup_claude_overwrites_existing(monkeypatch, tmp_path, capsys):
     skill_dir = skills_dir / "keshro"
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text("old content")
-    monkeypatch.setattr("keshro_cli.cli.CLAUDE_SKILLS_DIR", skills_dir)
+    monkeypatch.setattr("keshro_cli.integrations.CLAUDE_SKILLS_DIR", skills_dir)
     monkeypatch.setattr(
-        "keshro_cli.cli.CLAUDE_COMMANDS_DIR", tmp_path / "legacy_commands"
+        "keshro_cli.integrations.CLAUDE_COMMANDS_DIR", tmp_path / "legacy_commands"
     )
 
     cli.main(["setup-claude"])
@@ -2149,9 +2180,9 @@ def test_setup_claude_overwrites_existing(monkeypatch, tmp_path, capsys):
 def test_setup_claude_creates_symlink(monkeypatch, tmp_path, capsys):
     """setup-claude should create a symlink to the package's SKILL.md file."""
     skills_dir = tmp_path / "skills"
-    monkeypatch.setattr("keshro_cli.cli.CLAUDE_SKILLS_DIR", skills_dir)
+    monkeypatch.setattr("keshro_cli.integrations.CLAUDE_SKILLS_DIR", skills_dir)
     monkeypatch.setattr(
-        "keshro_cli.cli.CLAUDE_COMMANDS_DIR", tmp_path / "legacy_commands"
+        "keshro_cli.integrations.CLAUDE_COMMANDS_DIR", tmp_path / "legacy_commands"
     )
 
     cli.main(["setup-claude"])
@@ -2168,9 +2199,9 @@ def test_setup_claude_replaces_regular_file_with_symlink(monkeypatch, tmp_path, 
     skill_dir = skills_dir / "keshro"
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text("old copied content")
-    monkeypatch.setattr("keshro_cli.cli.CLAUDE_SKILLS_DIR", skills_dir)
+    monkeypatch.setattr("keshro_cli.integrations.CLAUDE_SKILLS_DIR", skills_dir)
     monkeypatch.setattr(
-        "keshro_cli.cli.CLAUDE_COMMANDS_DIR", tmp_path / "legacy_commands"
+        "keshro_cli.integrations.CLAUDE_COMMANDS_DIR", tmp_path / "legacy_commands"
     )
 
     cli.main(["setup-claude"])
@@ -2194,8 +2225,8 @@ def test_setup_claude_removes_legacy_command(monkeypatch, tmp_path, capsys):
     legacy_dir = tmp_path / "legacy_commands"
     legacy_dir.mkdir(parents=True)
     (legacy_dir / "keshro.md").write_text("old command file")
-    monkeypatch.setattr("keshro_cli.cli.CLAUDE_SKILLS_DIR", skills_dir)
-    monkeypatch.setattr("keshro_cli.cli.CLAUDE_COMMANDS_DIR", legacy_dir)
+    monkeypatch.setattr("keshro_cli.integrations.CLAUDE_SKILLS_DIR", skills_dir)
+    monkeypatch.setattr("keshro_cli.integrations.CLAUDE_COMMANDS_DIR", legacy_dir)
 
     cli.main(["setup-claude"])
 
@@ -2210,8 +2241,8 @@ def test_maybe_refresh_claude_migrates_legacy_command(monkeypatch, tmp_path):
     legacy_dir = tmp_path / "legacy_commands"
     legacy_dir.mkdir(parents=True)
     (legacy_dir / "keshro.md").write_text("old command content")
-    monkeypatch.setattr("keshro_cli.cli.CLAUDE_SKILLS_DIR", skills_dir)
-    monkeypatch.setattr("keshro_cli.cli.CLAUDE_COMMANDS_DIR", legacy_dir)
+    monkeypatch.setattr("keshro_cli.integrations.CLAUDE_SKILLS_DIR", skills_dir)
+    monkeypatch.setattr("keshro_cli.integrations.CLAUDE_COMMANDS_DIR", legacy_dir)
 
     cli._maybe_refresh_claude()
 
@@ -2228,9 +2259,9 @@ def test_maybe_refresh_claude_upgrades_stale_symlink(monkeypatch, tmp_path):
     old_file = tmp_path / "old_skill.md"
     old_file.write_text("stale symlink target")
     target.symlink_to(old_file)
-    monkeypatch.setattr("keshro_cli.cli.CLAUDE_SKILLS_DIR", skills_dir)
+    monkeypatch.setattr("keshro_cli.integrations.CLAUDE_SKILLS_DIR", skills_dir)
     monkeypatch.setattr(
-        "keshro_cli.cli.CLAUDE_COMMANDS_DIR", tmp_path / "legacy_commands"
+        "keshro_cli.integrations.CLAUDE_COMMANDS_DIR", tmp_path / "legacy_commands"
     )
 
     cli._maybe_refresh_claude()
@@ -2247,9 +2278,9 @@ def test_maybe_refresh_claude_skips_when_current(monkeypatch, tmp_path):
     target = skill_dir / "SKILL.md"
     target.symlink_to(cli._SKILL_FILE)
     mtime_before = target.lstat().st_mtime
-    monkeypatch.setattr("keshro_cli.cli.CLAUDE_SKILLS_DIR", skills_dir)
+    monkeypatch.setattr("keshro_cli.integrations.CLAUDE_SKILLS_DIR", skills_dir)
     monkeypatch.setattr(
-        "keshro_cli.cli.CLAUDE_COMMANDS_DIR", tmp_path / "legacy_commands"
+        "keshro_cli.integrations.CLAUDE_COMMANDS_DIR", tmp_path / "legacy_commands"
     )
 
     cli._maybe_refresh_claude()
@@ -2261,9 +2292,9 @@ def test_maybe_refresh_claude_skips_when_not_installed(monkeypatch, tmp_path):
     """Auto-refresh should not create skill dir if not installed."""
     skills_dir = tmp_path / "skills"
     skills_dir.mkdir(parents=True)
-    monkeypatch.setattr("keshro_cli.cli.CLAUDE_SKILLS_DIR", skills_dir)
+    monkeypatch.setattr("keshro_cli.integrations.CLAUDE_SKILLS_DIR", skills_dir)
     monkeypatch.setattr(
-        "keshro_cli.cli.CLAUDE_COMMANDS_DIR", tmp_path / "legacy_commands"
+        "keshro_cli.integrations.CLAUDE_COMMANDS_DIR", tmp_path / "legacy_commands"
     )
 
     cli._maybe_refresh_claude()
@@ -2274,9 +2305,11 @@ def test_maybe_refresh_claude_skips_when_not_installed(monkeypatch, tmp_path):
 def test_create_reads_context_from_file(fake_client, monkeypatch, tmp_path, capsys):
     _auth = {**_auth_with_plan(), "token": "ksh_pat_test"}
     monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: _auth)
+    monkeypatch.setattr("keshro_cli.context.load_auth", lambda: _auth)
     monkeypatch.setattr("keshro_cli.client.load_auth", lambda: _auth)
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
     monkeypatch.setattr("keshro_cli.cli.update_auth", lambda payload: payload)
+    monkeypatch.setattr("keshro_cli.context.update_auth", lambda payload: payload)
     monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
     monkeypatch.setattr("keshro_cli.cli._collect_generic_discovery", lambda _: None)
     monkeypatch.setattr(
@@ -2452,6 +2485,7 @@ def test_create_forwards_graphify_context_into_plan_generation(
 
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
     monkeypatch.setattr("keshro_cli.cli.update_auth", lambda payload: payload)
+    monkeypatch.setattr("keshro_cli.context.update_auth", lambda payload: payload)
     monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
     monkeypatch.setattr(
         "keshro_cli.cli._prompt_agent_display_name", lambda _agent: "Claude Code"
@@ -2515,6 +2549,7 @@ def test_create_skips_default_directory_scan_when_cwd_looks_unrelated(
 
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
     monkeypatch.setattr("keshro_cli.cli.update_auth", lambda payload: payload)
+    monkeypatch.setattr("keshro_cli.context.update_auth", lambda payload: payload)
     monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
     monkeypatch.setattr(
         "keshro_cli.cli._prompt_agent_display_name", lambda _agent: "Claude Code"
@@ -2839,6 +2874,7 @@ def test_create_interactive_migration_prompt_accepts_no_for_general_project(
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
     monkeypatch.setattr("keshro_cli.cli._collect_generic_discovery", lambda _: None)
     monkeypatch.setattr("keshro_cli.cli.update_auth", lambda payload: payload)
+    monkeypatch.setattr("keshro_cli.context.update_auth", lambda payload: payload)
     monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: False)
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
     monkeypatch.setattr(
@@ -3106,6 +3142,7 @@ def test_create_inside_coding_agent_stops_before_generation_when_answers_missing
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
     monkeypatch.setattr("keshro_cli.cli._collect_generic_discovery", lambda _: None)
     monkeypatch.setattr("keshro_cli.cli.update_auth", lambda payload: payload)
+    monkeypatch.setattr("keshro_cli.context.update_auth", lambda payload: payload)
     monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: True)
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
     monkeypatch.setattr(
@@ -3159,6 +3196,7 @@ def test_create_inside_coding_agent_stops_for_clarifiers_until_user_answers(
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
     monkeypatch.setattr("keshro_cli.cli._collect_generic_discovery", lambda _: None)
     monkeypatch.setattr("keshro_cli.cli.update_auth", lambda payload: payload)
+    monkeypatch.setattr("keshro_cli.context.update_auth", lambda payload: payload)
     monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: True)
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
     monkeypatch.setattr(
@@ -3213,6 +3251,7 @@ def test_create_inside_coding_agent_accepts_answer_flags_on_rerun(
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
     monkeypatch.setattr("keshro_cli.cli._collect_generic_discovery", lambda _: None)
     monkeypatch.setattr("keshro_cli.cli.update_auth", lambda payload: payload)
+    monkeypatch.setattr("keshro_cli.context.update_auth", lambda payload: payload)
     monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: True)
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
     monkeypatch.setattr(
@@ -3272,6 +3311,7 @@ def test_create_inside_coding_agent_rerun_with_answers_file_skips_new_preview(
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
     monkeypatch.setattr("keshro_cli.cli._collect_generic_discovery", lambda _: None)
     monkeypatch.setattr("keshro_cli.cli.update_auth", lambda payload: payload)
+    monkeypatch.setattr("keshro_cli.context.update_auth", lambda payload: payload)
     monkeypatch.setattr("keshro_cli.cli._inside_coding_agent", lambda: True)
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
     monkeypatch.setattr(
@@ -3407,6 +3447,7 @@ def test_create_as_migration_uses_explicit_source_and_target(fake_client, monkey
 
 def test_create_as_migration_requires_both_source_and_target(monkeypatch, capsys):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.context.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
     code = cli.main(
         ["create", "--as-migration", "--source-type", "AWS Batch", "--context", "x"]
@@ -3449,9 +3490,14 @@ def test_find_migration_template_normalizes_airflow_mwaa_variant(fake_client):
 def test_plan_create_saves_default_plan_automatically(fake_client, monkeypatch, capsys):
     saved = {}
     monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: {})
+    monkeypatch.setattr("keshro_cli.context.load_auth", lambda: {})
     monkeypatch.setattr("keshro_cli.client.load_auth", lambda: {})
     monkeypatch.setattr(
         "keshro_cli.cli.update_auth",
+        lambda payload: saved.update(payload) or payload,
+    )
+    monkeypatch.setattr(
+        "keshro_cli.context.update_auth",
         lambda payload: saved.update(payload) or payload,
     )
     cli.main(
@@ -3472,9 +3518,14 @@ def test_plan_create_saves_default_plan_automatically(fake_client, monkeypatch, 
 def test_config_set_saves_default_agent(monkeypatch, capsys):
     saved = {}
     monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: {})
+    monkeypatch.setattr("keshro_cli.context.load_auth", lambda: {})
     monkeypatch.setattr("keshro_cli.client.load_auth", lambda: {})
     monkeypatch.setattr(
         "keshro_cli.cli.update_auth",
+        lambda payload: saved.update(payload) or saved,
+    )
+    monkeypatch.setattr(
+        "keshro_cli.context.update_auth",
         lambda payload: saved.update(payload) or saved,
     )
 
@@ -3494,6 +3545,10 @@ def test_plan_create_does_not_save_default_plan_in_json_mode(
         "keshro_cli.cli.update_auth",
         lambda payload: saved.update(payload) or payload,
     )
+    monkeypatch.setattr(
+        "keshro_cli.context.update_auth",
+        lambda payload: saved.update(payload) or payload,
+    )
     cli.main(
         [
             "--json",
@@ -3511,6 +3566,7 @@ def test_plan_create_does_not_save_default_plan_in_json_mode(
 
 def test_migration_list_is_concise_by_default(fake_client, capsys, monkeypatch):
     monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: {})
+    monkeypatch.setattr("keshro_cli.context.load_auth", lambda: {})
     monkeypatch.setattr("keshro_cli.client.load_auth", lambda: {})
     cli.main(["migration", "list"])
     out = capsys.readouterr().out
@@ -3541,6 +3597,7 @@ def test_migration_list_latest_limits_rows(fake_client, capsys):
 
 def test_migration_view_shows_detail(fake_client, capsys, monkeypatch):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_org)
+    monkeypatch.setattr("keshro_cli.context.load_auth", _auth_with_org)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_org)
     cli.main(["migration", "view", "migration-123"])
     out = capsys.readouterr().out
@@ -3846,6 +3903,7 @@ def test_migration_list_json_outputs_machine_readable_rows(fake_client, capsys):
 
 def test_plan_list_is_concise_by_default(fake_client, capsys, monkeypatch):
     monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: {})
+    monkeypatch.setattr("keshro_cli.context.load_auth", lambda: {})
     monkeypatch.setattr("keshro_cli.client.load_auth", lambda: {})
     monkeypatch.setattr(cli, "_format_plan_timestamp", lambda value: "Today 10:30")
     cli.main(["plan", "list"])
@@ -3866,8 +3924,9 @@ def test_plan_list_is_concise_by_default(fake_client, capsys, monkeypatch):
 def test_plan_list_verbose_includes_summary_and_timestamp(
     fake_client, capsys, monkeypatch
 ):
+    from keshro_cli import formatting
     monkeypatch.setattr(
-        cli, "_format_verbose_timestamp", lambda value: "2026-03-11 10:30 PDT"
+        formatting, "_format_verbose_timestamp", lambda value: "2026-03-11 10:30 PDT"
     )
     cli.main(["plan", "list", "--verbose"])
     out = capsys.readouterr().out
@@ -3886,6 +3945,7 @@ def test_plan_list_latest_limits_rows(fake_client, capsys):
 
 def test_plan_list_empty_state_shows_org_context(fake_client, capsys, monkeypatch):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_org)
+    monkeypatch.setattr("keshro_cli.context.load_auth", _auth_with_org)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_org)
 
     class _EmptyClient(_FakeClient):
@@ -3904,6 +3964,7 @@ def test_plan_list_empty_state_shows_org_context(fake_client, capsys, monkeypatc
 
 def test_plan_view_shows_active_org_context(fake_client, capsys, monkeypatch):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_org)
+    monkeypatch.setattr("keshro_cli.context.load_auth", _auth_with_org)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_org)
     cli.main(["plan", "view", "plan-123"])
     out = capsys.readouterr().out
@@ -3912,6 +3973,7 @@ def test_plan_view_shows_active_org_context(fake_client, capsys, monkeypatch):
 
 def test_plan_view_is_human_readable_by_default(fake_client, capsys, monkeypatch):
     monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: {})
+    monkeypatch.setattr("keshro_cli.context.load_auth", lambda: {})
     monkeypatch.setattr("keshro_cli.client.load_auth", lambda: {})
     cli.main(["plan", "view", "plan-123"])
     out = capsys.readouterr().out
@@ -3944,6 +4006,7 @@ def test_task_delete_accepts_plan_id_option(fake_client, capsys):
 
 def test_plan_task_delete_uses_saved_plan_context(fake_client, capsys, monkeypatch):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.context.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     monkeypatch.setattr("typer.confirm", lambda *args, **kwargs: True)
     cli.main(["plan", "task", "delete", "task-456"])
@@ -3953,6 +4016,7 @@ def test_plan_task_delete_uses_saved_plan_context(fake_client, capsys, monkeypat
 
 def test_plan_task_view_uses_saved_plan_context(fake_client, capsys, monkeypatch):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.context.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     cli.main(["plan", "task", "view", "review-schedules"])
     out = capsys.readouterr().out
@@ -3978,6 +4042,10 @@ def test_config_set_persists_default_org_by_id(monkeypatch, capsys):
         "keshro_cli.cli.update_auth",
         lambda payload: {"api_url": "http://localhost:8000", **payload},
     )
+    monkeypatch.setattr(
+        "keshro_cli.context.update_auth",
+        lambda payload: {"api_url": "http://localhost:8000", **payload},
+    )
     code = cli.main(["config", "set", "--org-id", "org-123"])
     out = capsys.readouterr().out.strip()
     assert code == 0
@@ -3987,6 +4055,10 @@ def test_config_set_persists_default_org_by_id(monkeypatch, capsys):
 def test_config_set_can_resolve_default_org_by_name(fake_client, monkeypatch, capsys):
     monkeypatch.setattr(
         "keshro_cli.cli.update_auth",
+        lambda payload: {"api_url": "http://localhost:8000", **payload},
+    )
+    monkeypatch.setattr(
+        "keshro_cli.context.update_auth",
         lambda payload: {"api_url": "http://localhost:8000", **payload},
     )
     code = cli.main(["config", "set", "--org", "Acme"])
@@ -4002,6 +4074,10 @@ def test_config_set_can_resolve_default_org_by_partial_name(
         "keshro_cli.cli.update_auth",
         lambda payload: {"api_url": "http://localhost:8000", **payload},
     )
+    monkeypatch.setattr(
+        "keshro_cli.context.update_auth",
+        lambda payload: {"api_url": "http://localhost:8000", **payload},
+    )
     code = cli.main(["config", "set", "--org", "demo"])
     out = capsys.readouterr().out.strip()
     assert code == 0
@@ -4011,6 +4087,10 @@ def test_config_set_can_resolve_default_org_by_partial_name(
 def test_config_set_can_save_default_plan(fake_client, monkeypatch, capsys):
     monkeypatch.setattr(
         "keshro_cli.cli.update_auth",
+        lambda payload: {"api_url": "http://localhost:8000", **payload},
+    )
+    monkeypatch.setattr(
+        "keshro_cli.context.update_auth",
         lambda payload: {"api_url": "http://localhost:8000", **payload},
     )
     monkeypatch.setattr("keshro_cli.cli._ensure_authenticated", lambda: None)
@@ -4032,7 +4112,15 @@ def test_require_plan_context_can_resolve_repo_link(monkeypatch):
             "token": "jwt-123",
         },
     )
+    monkeypatch.setattr(
+        "keshro_cli.context.load_auth",
+        lambda: {
+            "api_url": "http://localhost:8000",
+            "token": "jwt-123",
+        },
+    )
     monkeypatch.setattr("keshro_cli.cli.update_auth", lambda payload: payload)
+    monkeypatch.setattr("keshro_cli.context.update_auth", lambda payload: payload)
 
     class _ResolveClient:
         def __enter__(self):
@@ -4063,7 +4151,11 @@ def test_require_plan_context_can_resolve_repo_link(monkeypatch):
     monkeypatch.setattr(
         "keshro_cli.cli.make_client", lambda api_url=None, token=None: _ResolveClient()
     )
-    monkeypatch.setattr("keshro_cli.cli.subprocess.run", _fake_run)
+    monkeypatch.setattr(
+        "keshro_cli.context.make_client", lambda api_url=None, token=None: _ResolveClient()
+    )
+    monkeypatch.setattr("keshro_cli.tasks.subprocess.run", _fake_run)
+    monkeypatch.setattr("keshro_cli.context.subprocess.run", _fake_run)
 
     assert cli._require_plan_context(None) == "plan-123"
 
@@ -4077,13 +4169,23 @@ def test_current_plan_id_prefers_repo_resolution_before_cached_default(monkeypat
             "default_plan_title": "Cached plan",
         },
     )
+    monkeypatch.setattr(
+        "keshro_cli.context.load_auth",
+        lambda: {
+            "default_plan_id": "plan-cached",
+            "default_plan_title": "Cached plan",
+        },
+    )
     saved = {}
 
     monkeypatch.setattr(
         "keshro_cli.cli.update_auth", lambda payload: saved.update(payload) or payload
     )
     monkeypatch.setattr(
-        "keshro_cli.cli._resolve_repo_linked_plan",
+        "keshro_cli.context.update_auth", lambda payload: saved.update(payload) or payload
+    )
+    monkeypatch.setattr(
+        "keshro_cli.context._resolve_repo_linked_plan",
         lambda *args, **kwargs: ("plan-linked", "Repo linked plan"),
     )
 
@@ -4100,6 +4202,10 @@ def test_resolve_continue_work_dir_uses_saved_dir_when_it_matches_plan(
 
     monkeypatch.setattr(
         "keshro_cli.cli.load_auth",
+        lambda: {"default_work_dir": str(saved_dir)},
+    )
+    monkeypatch.setattr(
+        "keshro_cli.context.load_auth",
         lambda: {"default_work_dir": str(saved_dir)},
     )
     monkeypatch.setattr(
@@ -4127,6 +4233,10 @@ def test_resolve_continue_work_dir_ignores_saved_dir_for_other_plan(
 
     monkeypatch.setattr(
         "keshro_cli.cli.load_auth",
+        lambda: {"default_work_dir": str(saved_dir)},
+    )
+    monkeypatch.setattr(
+        "keshro_cli.context.load_auth",
         lambda: {"default_work_dir": str(saved_dir)},
     )
     monkeypatch.setattr(
@@ -4162,6 +4272,7 @@ def test_resolve_continue_work_dir_prompts_before_using_linked_cwd_repo(
     cwd_dir.mkdir()
 
     monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: {})
+    monkeypatch.setattr("keshro_cli.context.load_auth", lambda: {})
     monkeypatch.setattr(
         "keshro_cli.cli._discover_repo_root",
         lambda work_dir=None: Path(work_dir) if work_dir else Path(cwd_dir),
@@ -4198,6 +4309,7 @@ def test_resolve_continue_work_dir_does_not_auto_use_linked_cwd_repo_without_pro
     cwd_dir.mkdir()
 
     monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: {})
+    monkeypatch.setattr("keshro_cli.context.load_auth", lambda: {})
     monkeypatch.setattr(
         "keshro_cli.cli._discover_repo_root",
         lambda work_dir=None: Path(work_dir) if work_dir else Path(cwd_dir),
@@ -4217,7 +4329,7 @@ def test_resolve_continue_work_dir_does_not_auto_use_linked_cwd_repo_without_pro
 
 def test_current_plan_id_resolves_explicit_migration_id(monkeypatch):
     monkeypatch.setattr(
-        "keshro_cli.cli._resolve_plan_or_migration_context",
+        "keshro_cli.context._resolve_plan_or_migration_context",
         lambda value: ("plan-123", "AWS Batch to Airflow pilot")
         if value == "migration-123"
         else (None, None),
@@ -4236,11 +4348,29 @@ def test_get_plan_or_exit_clears_stale_cached_default_on_404(monkeypatch):
         },
     )
     monkeypatch.setattr(
-        "keshro_cli.cli._resolve_repo_linked_plan",
-        lambda *args, **kwargs: (None, None),
+        "keshro_cli.context.load_auth",
+        lambda: {
+            "default_plan_id": "plan-stale",
+            "default_plan_title": "Stale plan",
+        },
     )
     monkeypatch.setattr(
+        "keshro_cli.context._resolve_repo_linked_plan",
+        lambda *args, **kwargs: (None, None),
+    )
+    _auth_fn = lambda: {
+        "default_plan_id": "plan-stale",
+        "default_plan_title": "Stale plan",
+    }
+    monkeypatch.setattr("keshro_cli.tasks.load_auth", _auth_fn)
+    monkeypatch.setattr(
         "keshro_cli.cli.update_auth", lambda payload: saved.update(payload) or payload
+    )
+    monkeypatch.setattr(
+        "keshro_cli.context.update_auth", lambda payload: saved.update(payload) or payload
+    )
+    monkeypatch.setattr(
+        "keshro_cli.tasks.update_auth", lambda payload: saved.update(payload) or payload
     )
 
     class _404Response:
@@ -4271,6 +4401,10 @@ def test_get_plan_or_exit_clears_stale_cached_default_on_404(monkeypatch):
         "keshro_cli.cli.make_client",
         lambda api_url=None, token=None: _MissingPlanClient(),
     )
+    monkeypatch.setattr(
+        "keshro_cli.tasks.make_client",
+        lambda api_url=None, token=None: _MissingPlanClient(),
+    )
 
     with pytest.raises(httpx.HTTPStatusError):
         cli._get_plan_or_exit(None)
@@ -4284,7 +4418,7 @@ def test_install_codex_integration_replaces_existing_managed_block(
 ):
     """Codex integration should replace old (un-versioned or stale-versioned)
     keshro blocks with the current versioned block."""
-    monkeypatch.setattr("keshro_cli.cli.CODEX_HOME_DIR", tmp_path)
+    monkeypatch.setattr("keshro_cli.integrations.CODEX_HOME_DIR", tmp_path)
     target = tmp_path / "AGENTS.md"
     # Simulate an old un-versioned marker from a previous install
     old_block = (
@@ -4309,7 +4443,7 @@ def test_install_codex_integration_replaces_existing_managed_block(
 
 def test_install_codex_integration_replaces_old_versioned_block(monkeypatch, tmp_path):
     """Codex integration should replace a block from an older CLI version."""
-    monkeypatch.setattr("keshro_cli.cli.CODEX_HOME_DIR", tmp_path)
+    monkeypatch.setattr("keshro_cli.integrations.CODEX_HOME_DIR", tmp_path)
     target = tmp_path / "AGENTS.md"
     old_block = (
         "<!-- keshro-agent-instructions v0.0.1 -->\n"
@@ -4333,7 +4467,7 @@ def test_install_codex_integration_replaces_old_versioned_block(monkeypatch, tmp
 
 def test_maybe_refresh_codex_updates_stale_version(monkeypatch, tmp_path):
     """Auto-refresh should rewrite Codex AGENTS.md when version is stale."""
-    monkeypatch.setattr("keshro_cli.cli.CODEX_HOME_DIR", tmp_path)
+    monkeypatch.setattr("keshro_cli.integrations.CODEX_HOME_DIR", tmp_path)
     target = tmp_path / "AGENTS.md"
     old_block = (
         "<!-- keshro-agent-instructions v0.0.1 -->\n"
@@ -4355,7 +4489,7 @@ def test_maybe_refresh_codex_updates_stale_version(monkeypatch, tmp_path):
 
 def test_maybe_refresh_codex_skips_when_current(monkeypatch, tmp_path):
     """Auto-refresh should not touch AGENTS.md if version already matches."""
-    monkeypatch.setattr("keshro_cli.cli.CODEX_HOME_DIR", tmp_path)
+    monkeypatch.setattr("keshro_cli.integrations.CODEX_HOME_DIR", tmp_path)
     target = tmp_path / "AGENTS.md"
     # Install current version first
     cli._install_codex_integration()
@@ -4368,7 +4502,7 @@ def test_maybe_refresh_codex_skips_when_current(monkeypatch, tmp_path):
 
 def test_maybe_refresh_codex_skips_when_no_file(monkeypatch, tmp_path):
     """Auto-refresh should not create AGENTS.md if it doesn't exist."""
-    monkeypatch.setattr("keshro_cli.cli.CODEX_HOME_DIR", tmp_path)
+    monkeypatch.setattr("keshro_cli.integrations.CODEX_HOME_DIR", tmp_path)
     tmp_path.mkdir(exist_ok=True)
 
     cli._maybe_refresh_codex()
@@ -4395,6 +4529,10 @@ def test_config_set_can_save_api_url(monkeypatch, capsys):
         "keshro_cli.cli.update_auth",
         lambda payload: {"default_org_id": None, "default_org_name": None, **payload},
     )
+    monkeypatch.setattr(
+        "keshro_cli.context.update_auth",
+        lambda payload: {"default_org_id": None, "default_org_name": None, **payload},
+    )
     code = cli.main(["config", "set", "--api-url", "https://api.keshro.test"])
     out = capsys.readouterr().out
     assert code == 0
@@ -4404,6 +4542,10 @@ def test_config_set_can_save_api_url(monkeypatch, capsys):
 def test_config_set_short_alias_can_save_api_url(monkeypatch, capsys):
     monkeypatch.setattr(
         "keshro_cli.cli.update_auth",
+        lambda payload: {"default_org_id": None, "default_org_name": None, **payload},
+    )
+    monkeypatch.setattr(
+        "keshro_cli.context.update_auth",
         lambda payload: {"default_org_id": None, "default_org_name": None, **payload},
     )
     code = cli.main(["config", "set", "-u", "https://api.keshro.test"])
@@ -4549,6 +4691,7 @@ def test_task_edit_accepts_feedback_reason(fake_client, capsys):
 
 def test_task_edit_uses_saved_plan_context(fake_client, capsys, monkeypatch):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.context.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     cli.main(
         [
@@ -4810,6 +4953,8 @@ def test_task_done_appends_to_existing_notes(fake_client, monkeypatch, capsys):
         return plan
 
     monkeypatch.setattr(cli, "_get_plan_or_exit", _plan_with_existing_notes)
+    from keshro_cli import tasks as _tasks_mod
+    monkeypatch.setattr(_tasks_mod, "_get_plan_or_exit", _plan_with_existing_notes)
 
     cli.main(
         [
@@ -5005,6 +5150,7 @@ def test_task_plan_human_output_shows_owner(fake_client, capsys):
 
 def test_task_next_uses_saved_plan_context(fake_client, capsys, monkeypatch):
     monkeypatch.setattr("keshro_cli.cli.load_auth", _auth_with_plan)
+    monkeypatch.setattr("keshro_cli.context.load_auth", _auth_with_plan)
     monkeypatch.setattr("keshro_cli.client.load_auth", _auth_with_plan)
     cli.main(["task", "next"])
     method, path, _ = fake_client.calls[-1]
@@ -5030,6 +5176,7 @@ def test_plan_replan_notes_accepts_plan_id_option(fake_client, capsys):
 
 def test_task_edit_without_plan_context_fails(capsys, monkeypatch):
     monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: {})
+    monkeypatch.setattr("keshro_cli.context.load_auth", lambda: {})
     monkeypatch.setattr("keshro_cli.client.load_auth", lambda: {})
     code = cli.main(["task", "edit", "task-456", "--status", "in_progress"])
     assert code == 1
@@ -5076,6 +5223,14 @@ def test_config_prints_saved_auth_metadata(monkeypatch, capsys):
         },
     )
     monkeypatch.setattr(
+        "keshro_cli.context.load_auth",
+        lambda: {
+            "api_url": "https://app.keshro.test",
+            "token": "jwt-123",
+            "user": {"email": "cli@example.com", "name": "CLI User"},
+        },
+    )
+    monkeypatch.setattr(
         "keshro_cli.cli.make_client", lambda api_url=None, token=None: _ConfigClient()
     )
 
@@ -5098,6 +5253,14 @@ def test_config_prints_org_memberships(fake_client, monkeypatch, capsys):
             "user": {"email": "cli@example.com", "name": "CLI User"},
         },
     )
+    monkeypatch.setattr(
+        "keshro_cli.context.load_auth",
+        lambda: {
+            "api_url": "https://app.keshro.test",
+            "token": "jwt-123",
+            "user": {"email": "cli@example.com", "name": "CLI User"},
+        },
+    )
 
     cli.main(["config"])
     out = capsys.readouterr().out
@@ -5109,6 +5272,16 @@ def test_config_prints_org_memberships(fake_client, monkeypatch, capsys):
 def test_config_prints_current_repo_migration_context(fake_client, monkeypatch, capsys):
     monkeypatch.setattr(
         "keshro_cli.cli.load_auth",
+        lambda: {
+            "api_url": "http://localhost:8000",
+            "token": "jwt-123",
+            "default_plan_id": "plan-123",
+            "default_plan_title": "AWS Batch to Airflow",
+            "user": {"email": "cli@example.com", "name": "CLI User"},
+        },
+    )
+    monkeypatch.setattr(
+        "keshro_cli.context.load_auth",
         lambda: {
             "api_url": "http://localhost:8000",
             "token": "jwt-123",
@@ -5149,11 +5322,19 @@ def test_auth_login_with_token_prints_human_text_by_default(monkeypatch, capsys)
         "keshro_cli.auth.save_auth", lambda payload: saved.update(payload)
     )
     monkeypatch.setattr(
-        "keshro_cli.cli._install_claude_integration",
+        "keshro_cli.integrations._install_claude_integration",
         lambda: Path("/tmp/keshro.md"),
     )
     monkeypatch.setattr(
-        "keshro_cli.cli._install_codex_integration",
+        "keshro_cli.integrations._install_codex_integration",
+        lambda: Path("/tmp/codex-AGENTS.md"),
+    )
+    monkeypatch.setattr(
+        "keshro_cli.integrations._install_claude_integration",
+        lambda: Path("/tmp/keshro.md"),
+    )
+    monkeypatch.setattr(
+        "keshro_cli.integrations._install_codex_integration",
         lambda: Path("/tmp/codex-AGENTS.md"),
     )
 
@@ -5185,11 +5366,11 @@ def test_auth_login_with_token_validates_with_auth_me(monkeypatch, capsys):
         "keshro_cli.auth.save_auth", lambda payload: saved.update(payload)
     )
     monkeypatch.setattr(
-        "keshro_cli.cli._install_claude_integration",
+        "keshro_cli.integrations._install_claude_integration",
         lambda: Path("/tmp/keshro.md"),
     )
     monkeypatch.setattr(
-        "keshro_cli.cli._install_codex_integration",
+        "keshro_cli.integrations._install_codex_integration",
         lambda: Path("/tmp/codex-AGENTS.md"),
     )
 
@@ -5204,6 +5385,14 @@ def test_config_json_outputs_machine_readable_metadata(
 ):
     monkeypatch.setattr(
         "keshro_cli.cli.load_auth",
+        lambda: {
+            "api_url": "https://app.keshro.test",
+            "token": "jwt-123",
+            "user": {"email": "cli@example.com"},
+        },
+    )
+    monkeypatch.setattr(
+        "keshro_cli.context.load_auth",
         lambda: {
             "api_url": "https://app.keshro.test",
             "token": "jwt-123",
@@ -5248,6 +5437,14 @@ def test_config_marks_stale_token_as_not_authenticated(monkeypatch, capsys):
 
     monkeypatch.setattr(
         "keshro_cli.cli.load_auth",
+        lambda: {
+            "api_url": "https://app.keshro.test",
+            "token": "jwt-stale",
+            "user": {"email": "cli@example.com", "name": "CLI User"},
+        },
+    )
+    monkeypatch.setattr(
+        "keshro_cli.context.load_auth",
         lambda: {
             "api_url": "https://app.keshro.test",
             "token": "jwt-stale",
@@ -5456,6 +5653,10 @@ def test_request_errors_render_connection_help(monkeypatch, capsys):
         lambda: {"api_url": "http://localhost:8000", "token": "jwt-123"},
     )
     monkeypatch.setattr(
+        "keshro_cli.context.load_auth",
+        lambda: {"api_url": "http://localhost:8000", "token": "jwt-123"},
+    )
+    monkeypatch.setattr(
         "keshro_cli.client.load_auth",
         lambda: {"api_url": "http://localhost:8000", "token": "jwt-123"},
     )
@@ -5474,6 +5675,7 @@ def test_request_errors_render_connection_help(monkeypatch, capsys):
 def test_plan_push(fake_client, capsys, monkeypatch):
     auth = {**_auth_with_plan(), "token": "ksh_pat_test"}
     monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: auth)
+    monkeypatch.setattr("keshro_cli.context.load_auth", lambda: auth)
     monkeypatch.setattr("keshro_cli.client.load_auth", lambda: auth)
     code = cli.main(["plan", "push", "-p", "plan-123", "--provider", "linear"])
     captured = capsys.readouterr()
@@ -5485,6 +5687,7 @@ def test_plan_push(fake_client, capsys, monkeypatch):
 def test_plan_sync_pull(fake_client, capsys, monkeypatch):
     _auth = {**_auth_with_plan(), "token": "ksh_pat_test"}
     monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: _auth)
+    monkeypatch.setattr("keshro_cli.context.load_auth", lambda: _auth)
     monkeypatch.setattr("keshro_cli.client.load_auth", lambda: _auth)
     code = cli.main(["plan", "sync-pull", "-p", "plan-123"])
     captured = capsys.readouterr()
@@ -5496,8 +5699,10 @@ def test_plan_sync_pull(fake_client, capsys, monkeypatch):
 def test_plan_generate_shows_enrichment(fake_client, capsys, monkeypatch):
     _auth = {**_auth_with_plan(), "token": "ksh_pat_test"}
     monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: _auth)
+    monkeypatch.setattr("keshro_cli.context.load_auth", lambda: _auth)
     monkeypatch.setattr("keshro_cli.client.load_auth", lambda: _auth)
     monkeypatch.setattr("keshro_cli.cli.update_auth", lambda payload: payload)
+    monkeypatch.setattr("keshro_cli.context.update_auth", lambda payload: payload)
     original_post = fake_client.post
 
     def _post_gen(path, json=None, timeout=None):
@@ -5539,6 +5744,7 @@ def test_plan_generate_shows_enrichment(fake_client, capsys, monkeypatch):
 def test_status_shows_cost_summary(fake_client, capsys, monkeypatch):
     _auth = {**_auth_with_plan(), "token": "ksh_pat_test"}
     monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: _auth)
+    monkeypatch.setattr("keshro_cli.context.load_auth", lambda: _auth)
     monkeypatch.setattr("keshro_cli.client.load_auth", lambda: _auth)
     original_get = fake_client.get
 
@@ -5597,6 +5803,7 @@ def test_status_surfaces_enrichment_analysis_and_ui_review_link(
         "api_url": "http://localhost:8000",
     }
     monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: _auth)
+    monkeypatch.setattr("keshro_cli.context.load_auth", lambda: _auth)
     monkeypatch.setattr("keshro_cli.client.load_auth", lambda: _auth)
     original_get = fake_client.get
 
@@ -5658,6 +5865,7 @@ def test_status_shows_task_ids_inline(fake_client, capsys, monkeypatch):
         "api_url": "http://localhost:8000",
     }
     monkeypatch.setattr("keshro_cli.cli.load_auth", lambda: _auth)
+    monkeypatch.setattr("keshro_cli.context.load_auth", lambda: _auth)
     monkeypatch.setattr("keshro_cli.client.load_auth", lambda: _auth)
     original_get = fake_client.get
 

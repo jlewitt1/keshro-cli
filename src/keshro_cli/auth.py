@@ -169,7 +169,7 @@ def cmd_auth_login(
 def _install_integrations(json_output: bool = False):
     """Install agent integrations for Claude Code and Codex on this machine."""
     try:
-        from .cli import _install_claude_integration, _install_codex_integration
+        from .integrations import _install_claude_integration, _install_codex_integration
 
         claude_target = _install_claude_integration()
         codex_target = _install_codex_integration()
