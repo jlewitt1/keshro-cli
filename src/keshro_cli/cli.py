@@ -6500,6 +6500,8 @@ def _create_migration_inner(
                             initial_answers=dict(payload.get("custom_fields") or {}),
                         )
                     resolved_clarifier_answers = provided_clarifier_answers
+                elif provided_clarifier_answers:
+                    resolved_clarifier_answers = provided_clarifier_answers
                 else:
                     resolved_clarifier_answers = _prompt_for_migration_clarifiers(
                         clarifier_questions, suggested_answers
@@ -6619,6 +6621,8 @@ def _create_custom_migration_inner(
                             rerun_command=rerun_command,
                             initial_answers=dict(payload.get("custom_fields") or {}),
                         )
+                    resolved_clarifier_answers = provided_clarifier_answers
+                elif provided_clarifier_answers:
                     resolved_clarifier_answers = provided_clarifier_answers
                 else:
                     resolved_clarifier_answers = _prompt_for_migration_clarifiers(
