@@ -4,6 +4,7 @@ import re
 import subprocess
 import tempfile
 import asyncio
+import time
 from pathlib import Path
 
 import click
@@ -1610,6 +1611,7 @@ def test_create_migration_answers_file_rerun_reuses_saved_questions_and_seed_ans
 ):
     monkeypatch.setattr(cli, "_set_default_plan_after_create", lambda *args, **kwargs: None)
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("resume should not prompt for template review")))
 
     def _fail_discovery(*args, **kwargs):
         raise AssertionError("discovery should not rerun on answers-file resume")
@@ -1741,6 +1743,57 @@ def test_write_agent_answers_file_uses_global_keshro_directory(tmp_path, monkeyp
     )
 
     assert result.startswith(str(tmp_path / ".keshro" / "answers" / "keshro-answers-"))
+
+
+def test_write_agent_answers_file_prunes_stale_answers_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    answers_dir = tmp_path / ".keshro" / "answers"
+    answers_dir.mkdir(parents=True, exist_ok=True)
+    stale = answers_dir / "keshro-answers-stale.json"
+    stale.write_text("{}\n")
+    stale_mtime = time.time() - (cli._ANSWERS_FILE_RETENTION_SECONDS + 60)
+    os.utime(stale, (stale_mtime, stale_mtime))
+
+    result = cli._write_agent_answers_file(
+        heading="Need answers",
+        questions=[],
+        suggested_answers={},
+    )
+
+    assert Path(result).exists()
+    assert not stale.exists()
+
+
+def test_write_agent_answers_file_prunes_oldest_excess_answers_files(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    answers_dir = tmp_path / ".keshro" / "answers"
+    answers_dir.mkdir(parents=True, exist_ok=True)
+    base_time = time.time()
+    original_limit = cli._ANSWERS_FILE_MAX_COUNT
+    monkeypatch.setattr(cli, "_ANSWERS_FILE_MAX_COUNT", 3)
+
+    oldest = answers_dir / "keshro-answers-oldest.json"
+    middle = answers_dir / "keshro-answers-middle.json"
+    newest_existing = answers_dir / "keshro-answers-newest-existing.json"
+    for index, path in enumerate([oldest, middle, newest_existing]):
+        path.write_text("{}\n")
+        mtime = base_time + index
+        os.utime(path, (mtime, mtime))
+
+    result = cli._write_agent_answers_file(
+        heading="Need answers",
+        questions=[],
+        suggested_answers={},
+    )
+
+    remaining = sorted(path.name for path in answers_dir.glob("keshro-answers-*.json"))
+    assert "keshro-answers-oldest.json" not in remaining
+    assert "keshro-answers-middle.json" in remaining
+    assert "keshro-answers-newest-existing.json" in remaining
+    assert Path(result).name in remaining
+    assert len(remaining) == 3
 
 
 def test_create_migration_from_path_key_requires_claude_code(fake_client, monkeypatch):

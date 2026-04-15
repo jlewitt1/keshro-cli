@@ -89,6 +89,8 @@ _codex_merge_lock = asyncio.Lock()
 _LIVE_CONFLICT_POLL_SECONDS = 3
 _LIVE_CONFLICT_WAIT_TIMEOUT_SECONDS = 15 * 60
 _LIVE_CONFLICT_MAX_RETRIES = 3
+_ANSWERS_FILE_RETENTION_SECONDS = 7 * 24 * 60 * 60
+_ANSWERS_FILE_MAX_COUNT = 10
 
 
 def _resolve_task_target(
@@ -241,7 +243,70 @@ def _write_agent_answers_file(
     target_dir.mkdir(parents=True, exist_ok=True)
     path = target_dir / f"keshro-answers-{uuid.uuid4().hex[:8]}.json"
     path.write_text(json.dumps(payload, indent=2) + "\n")
+    _prune_agent_answers_files(target_dir, keep_path=path)
     return str(path)
+
+
+def _prune_agent_answers_files(
+    target_dir: Path,
+    *,
+    keep_path: Path | None = None,
+) -> None:
+    try:
+        candidates = [
+            item
+            for item in target_dir.glob("keshro-answers-*.json")
+            if item.is_file()
+        ]
+    except OSError:
+        return
+
+    now = time.time()
+    protected = str(keep_path.resolve()) if keep_path else ""
+
+    for candidate in list(candidates):
+        try:
+            resolved = str(candidate.resolve())
+            stat = candidate.stat()
+        except OSError:
+            continue
+        if protected and resolved == protected:
+            continue
+        if now - stat.st_mtime <= _ANSWERS_FILE_RETENTION_SECONDS:
+            continue
+        try:
+            candidate.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    try:
+        remaining = [
+            item
+            for item in target_dir.glob("keshro-answers-*.json")
+            if item.is_file()
+        ]
+    except OSError:
+        return
+
+    sortable: list[tuple[float, Path]] = []
+    for candidate in remaining:
+        try:
+            sortable.append((candidate.stat().st_mtime, candidate))
+        except OSError:
+            continue
+    sortable.sort(reverse=True)
+
+    for _, candidate in sortable[_ANSWERS_FILE_MAX_COUNT:]:
+        try:
+            resolved = str(candidate.resolve())
+        except OSError:
+            resolved = ""
+        if protected and resolved == protected:
+            continue
+        try:
+            candidate.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _missing_question_ids(questions: list[dict], answers: dict[str, str]) -> list[str]:
@@ -6333,7 +6398,8 @@ def _create_migration_inner(
             for key, value in repaired_answers.items():
                 if key not in answers or not answers[key]:
                     answers[key] = value
-        answers = _prompt_for_migration_template_fields(template, answers)
+        if not answers_file_path:
+            answers = _prompt_for_migration_template_fields(template, answers)
 
         required_fields = [
             _clean(item.get("label")) or _clean(item.get("id"))
