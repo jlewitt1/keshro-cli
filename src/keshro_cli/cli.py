@@ -5550,7 +5550,9 @@ def _create_migration(
                 seed_answers=resume_seed_answers,
                 answers_file_path=answers_file,
                 skip_questions=skip_questions,
-                prompt_for_context=not bool(context and context.strip()),
+                prompt_for_context=not (
+                    answers_file or bool(context and context.strip())
+                ),
                 agent=agent,
             )
         else:
