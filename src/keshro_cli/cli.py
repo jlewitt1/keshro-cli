@@ -1633,7 +1633,7 @@ def _exit_for_agent_clarifier_feedback(
         options = list(question.get("answers") or [])
         input_mode = question.get("input_mode", "select")
         if options:
-            for option_index, option in enumerate(options, 1):
+            for option_index, option in enumerate(options):
                 title = _clean(option.get("answer_title")) or _clean(
                     option.get("value")
                 )
@@ -1643,7 +1643,14 @@ def _exit_for_agent_clarifier_feedback(
                     if suggested and suggested == _clean(option.get("value"))
                     else ""
                 )
-                print(f"     {DIM}{option_index}. {title}{rec}{marker}{RESET}")
+                # Letter markers in parens — `(a)`, `(b)`, `(c)` — so option
+                # labels are visually distinct from the parent question's
+                # `1.` numeric label. Avoids the "1." question / "1." option
+                # collision that made rendered output ambiguous in agent
+                # transcripts, and the parens read more clearly than `a.`
+                # next to a `1.` heading.
+                letter = chr(ord("a") + option_index)
+                print(f"     {DIM}({letter}) {title}{rec}{marker}{RESET}")
             if input_mode != "free_text":
                 print(f"     {DIM}Or: type a custom answer{RESET}")
         if input_mode == "free_text":
@@ -2291,58 +2298,6 @@ def _get_migration_clarifiers(client: httpx.Client, payload: dict) -> list[dict]
     return list(body.get("questions") or [])
 
 
-def _build_clarifier_prompt(
-    template: dict, payload: dict, questions: list[dict]
-) -> str:
-    source = (
-        _clean(template.get("source")) or _clean(payload.get("source_type")) or "Source"
-    )
-    target = (
-        _clean(template.get("target")) or _clean(payload.get("target_type")) or "Target"
-    )
-    existing_fields = dict(payload.get("custom_fields") or {})
-    existing_context = _clean(payload.get("context"))
-    lines = [
-        f"You are helping finalize a Keshro migration draft for {source} -> {target}.",
-        "Answer the follow-up questions below using the current workspace and the already-gathered migration context.",
-        "Prefer concrete answers grounded in the repository, configs, docs, and runtime clues available locally.",
-        "If something still cannot be verified, use the recommended option when one exists; otherwise write `Unknown`.",
-        "Return only bullet lines in the exact format `- <question id>: <answer>`.",
-        "",
-        "Known draft context:",
-    ]
-    if existing_fields:
-        for key, value in existing_fields.items():
-            if _clean(str(value)):
-                lines.append(f"- {key}: {_clean(str(value))}")
-    elif existing_context:
-        lines.append("- No structured fields yet.")
-    if existing_context:
-        lines.extend(["", "Draft context:", existing_context])
-    lines.extend(["", "Follow-up questions:"])
-    for question in questions:
-        prompt_id = _clean(question.get("id"))
-        prompt_text = _clean(question.get("question"))
-        why = _clean(question.get("why_this_matters"))
-        placeholder = _clean(question.get("placeholder"))
-        lines.append(f"- {prompt_id}: {prompt_text}")
-        if why:
-            lines.append(f"  Why it matters: {why}")
-        options = list(question.get("answers") or [])
-        if options:
-            lines.append("  Options:")
-            for option in options:
-                title = _clean(option.get("answer_title")) or _clean(
-                    option.get("value")
-                )
-                value = _clean(option.get("value"))
-                suffix = " [recommended]" if option.get("recommended") else ""
-                lines.append(f"  - {title}{suffix}: {value}")
-        elif placeholder:
-            lines.append(f"  Hint: {placeholder}")
-    return "\n".join(lines)
-
-
 def _extract_repo_scan_answer(question: dict) -> str | None:
     """Return the value of a repo-scan-derived recommended option on a
     clarifier question, if one was injected by the backend clarifier
@@ -2360,20 +2315,16 @@ def _extract_repo_scan_answer(question: dict) -> str | None:
     return None
 
 
-def _split_clarifier_questions_for_agent(
-    questions: list[dict],
-) -> tuple[list[dict], dict[str, str]]:
-    """Partition clarifier questions into (still needs agent suggestion,
-    pre-populated from repo-scan recommendations). Questions whose answer
-    is already known from discovery don't need a second agent call — we
-    seed suggested_answers directly and the user still sees the confirmation
-    UI with the discovered value pre-selected.
+def _preset_answers_from_repo_scan(questions: list[dict]) -> dict[str, str]:
+    """Seed suggested_answers with values discovery already pulled in via
+    the backend's repo-scan recommendations. The clarifier feedback UI uses
+    these to mark each option with a (suggested) tag, and `--answers-file`
+    resume picks them up if the user just accepts.
 
-    This is the optimization that turns the second-agent-call-for-every-
-    question pattern into 'only call the agent for the questions that
-    actually need it'. When all questions have repo-scan answers, we skip
-    the agent call entirely."""
-    needs_agent: list[dict] = []
+    Questions without a repo-scan recommendation get nothing — the user
+    fills them in directly. We deliberately don't call the agent here:
+    discovery already had its shot, and re-asking adds 1-2 minutes per
+    create with no new information."""
     preset: dict[str, str] = {}
     for question in questions:
         question_id = _clean(question.get("id"))
@@ -2382,49 +2333,7 @@ def _split_clarifier_questions_for_agent(
         discovered = _extract_repo_scan_answer(question)
         if discovered is not None:
             preset[question_id] = discovered
-        else:
-            needs_agent.append(question)
-    return needs_agent, preset
-
-
-def _collect_clarifier_answers_from_claude(
-    template: dict,
-    payload: dict,
-    questions: list[dict],
-    work_dir: str | None = None,
-    agent: str = "auto",
-) -> dict[str, str]:
-    if not questions:
-        return {}
-    prompt = _build_clarifier_prompt(template, payload, questions)
-    raw = _run_prompt_in_agent(
-        prompt,
-        missing_binary_message=(
-            "Could not find a coding agent binary. Make sure you're running this from within your agent's terminal."
-        ),
-        failure_message_prefix="Coding agent returned an error: ",
-        empty_message="Coding agent returned no clarifier answers.",
-        work_dir=work_dir,
-        agent=agent,
-    )
-    parsed = _parse_discovery_key_values(raw)
-    answers: dict[str, str] = {}
-    for question in questions:
-        question_id = _clean(question.get("id"))
-        value = _clean(parsed.get(_normalize_prompt_key(question_id)))
-        if value and value.lower() != "unknown":
-            answers[question_id] = value
-            continue
-        options = list(question.get("answers") or [])
-        recommended = next(
-            (option for option in options if option.get("recommended")),
-            None,
-        )
-        if recommended:
-            recommended_value = _clean(recommended.get("value"))
-            if recommended_value:
-                answers[question_id] = recommended_value
-    return answers
+    return preset
 
 
 def _print_agent_collection_warning(message: str) -> None:
@@ -7350,7 +7259,7 @@ def _create_migration(
         typer.Option(
             "--org-id",
             "-o",
-            help="Create under an org by ID. Defaults to your saved org context (see `keshro config`); pass an empty value to force personal scope.",
+            help="Create under an org by ID. Defaults to your saved org context (see `keshro config`). Use --personal to force personal scope.",
         ),
     ] = None,
     org: Annotated[
@@ -7784,35 +7693,18 @@ def _create_migration(
                     if not _state.json:
                         print(f"{YELLOW}Could not generate questions: {exc}{RESET}")
 
-            # Step 3: Have the coding agent suggest answers, then review them with the user
+            # Step 3: Hand questions straight to the user with discovery's
+            # repo-scan pre-fills baked into suggested_answers. Same change
+            # made to the migration flow — discovery already had its shot at
+            # every question; calling the agent again wastes 1-2 minutes
+            # without producing new info, since the agent has the same
+            # context the discovery pass had.
             answered: dict[str, str] = dict(provided_clarifier_answers)
             if questions and _inside_coding_agent():
                 missing_ids = _missing_question_ids(questions, answered)
-                suggested_answers: dict[str, str] = {}
-                if missing_ids and not _state.json:
-                    print(
-                        f"{CYAN}Asking AI agent to suggest answers for {len(questions)} clarifying questions...{RESET}"
-                    )
+                preset = _preset_answers_from_repo_scan(questions)
+                suggested_answers: dict[str, str] = {**preset, **answered}
                 if missing_ids:
-                    try:
-                        suggested_answers = _answer_questions_via_agent(
-                            questions,
-                            description,
-                            discovered_context,
-                            resolved_work_dir,
-                            agent=agent,
-                        )
-                    except SystemExit as exc:
-                        suggested_answers = {}
-                        _print_agent_collection_warning(
-                            f"Skipping suggested clarifier answers: {exc}"
-                        )
-                if missing_ids:
-                    suggested_for_missing = {
-                        key: value
-                        for key, value in suggested_answers.items()
-                        if key in missing_ids
-                    }
                     rerun_command = (
                         f"keshro create --context {shlex.quote(context or description)}"
                     )
@@ -7821,21 +7713,19 @@ def _create_migration(
                     _exit_for_agent_clarifier_feedback(
                         heading="Keshro needs user answers before it can generate this plan.",
                         questions=questions,
-                        suggested_answers={**answered, **suggested_for_missing},
+                        suggested_answers=suggested_answers,
                         rerun_command=rerun_command,
                         enrichment_context=enrichment_context,
                     )
                 if not _state.json:
-                    suggested_count = sum(
-                        1
-                        for v in suggested_answers.values()
-                        if v and v.lower() != "unknown"
-                    )
                     accepted_count = sum(
                         1 for v in answered.values() if v and v.lower() != "unknown"
                     )
+                    preset_count = sum(
+                        1 for v in preset.values() if v and v.lower() != "unknown"
+                    )
                     print(
-                        f"  Agent suggested {suggested_count}/{len(questions)} answers; accepted {accepted_count}/{len(questions)}."
+                        f"  Pre-filled {preset_count}/{len(questions)} answers from repo scan; accepted {accepted_count}/{len(questions)}."
                     )
             elif questions and sys.stdout.isatty() and not _state.json:
                 # TTY mode — let the user answer interactively
@@ -8410,33 +8300,16 @@ def _create_migration_inner(
                         )
                 if _inside_coding_agent():
                     if not provided_clarifier_answers:
-                        # Only call the agent for questions that don't already
-                        # have a repo-scan answer from discovery. Everything
-                        # else is pre-populated from discovery's recommended
-                        # options, saving 1-2 minutes per create.
-                        needs_agent, preset = _split_clarifier_questions_for_agent(
+                        # Discovery already had the agent's shot at every
+                        # question. Repo-scan answers it found are surfaced
+                        # as recommended options on the clarifier itself —
+                        # for the rest, the user is the one with the missing
+                        # info, so a second agent call doesn't add signal
+                        # and costs ~1-2 min per create. Hand questions
+                        # straight to the user with discovery's pre-fills.
+                        suggested_answers = _preset_answers_from_repo_scan(
                             clarifier_questions
                         )
-                        suggested_answers = dict(preset)
-                        if needs_agent:
-                            with _Spinner(
-                                f"Collecting suggested answers for {len(needs_agent)} remaining follow-up question(s)..."
-                            ):
-                                try:
-                                    agent_answers = _collect_clarifier_answers_from_claude(
-                                        template,
-                                        payload,
-                                        needs_agent,
-                                        work_dir=resolved_work_dir,
-                                        agent=agent,
-                                    )
-                                except SystemExit as exc:
-                                    agent_answers = {}
-                                    _print_agent_collection_warning(
-                                        f"Skipping suggested clarifier answers: {exc}"
-                                    )
-                            suggested_answers.update(agent_answers)
-                    if not provided_clarifier_answers:
                         rerun_command = (
                             f"keshro create --template {shlex.quote(path)}"
                             f" --context {shlex.quote(context or '')}"
@@ -8538,29 +8411,9 @@ def _create_custom_migration_inner(
                         )
                 if _inside_coding_agent():
                     if not provided_clarifier_answers:
-                        needs_agent, preset = _split_clarifier_questions_for_agent(
+                        suggested_answers = _preset_answers_from_repo_scan(
                             clarifier_questions
                         )
-                        suggested_answers = dict(preset)
-                        if needs_agent:
-                            with _Spinner(
-                                f"Collecting suggested answers for {len(needs_agent)} remaining follow-up question(s)..."
-                            ):
-                                try:
-                                    agent_answers = _collect_clarifier_answers_from_claude(
-                                        {},
-                                        payload,
-                                        needs_agent,
-                                        work_dir=resolved_work_dir,
-                                        agent=agent,
-                                    )
-                                except SystemExit as exc:
-                                    agent_answers = {}
-                                    _print_agent_collection_warning(
-                                        f"Skipping suggested clarifier answers: {exc}"
-                                    )
-                            suggested_answers.update(agent_answers)
-                    if not provided_clarifier_answers:
                         rerun_command = (
                             f"keshro create -m --context {shlex.quote(context or '')}"
                         ).rstrip()
