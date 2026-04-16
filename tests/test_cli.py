@@ -5621,6 +5621,43 @@ def test_auth_login_with_token_validates_with_auth_me(monkeypatch, capsys):
     assert saved["token"] == "ksh_pat_test"
 
 
+def test_auth_login_with_expired_token_shows_account_regeneration_link(
+    monkeypatch, capsys
+):
+    class _UnauthorizedClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, path, headers=None):
+            request = httpx.Request("GET", "http://localhost:8000/v1/auth/me")
+            response = httpx.Response(
+                401, request=request, json={"detail": "Authentication required"}
+            )
+            raise httpx.HTTPStatusError(
+                "Client error '401 Unauthorized' for url",
+                request=request,
+                response=response,
+            )
+
+    monkeypatch.setattr(
+        "keshro_cli.auth.httpx.Client", lambda **kwargs: _UnauthorizedClient()
+    )
+    monkeypatch.setattr(
+        "keshro_cli.auth._account_api_url",
+        lambda base_url: "http://localhost:3000/account?tab=api",
+    )
+
+    code = cli.main(["login", "ksh_pat_expired"])
+    captured = capsys.readouterr()
+    assert code == 1
+    cleaned = ANSI_RE.sub("", captured.err)
+    assert "This API token is invalid or expired." in cleaned
+    assert "http://localhost:3000/account?tab=api" in cleaned
+
+
 def test_config_json_outputs_machine_readable_metadata(
     fake_client, monkeypatch, capsys
 ):
@@ -5700,6 +5737,73 @@ def test_config_marks_stale_token_as_not_authenticated(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Authenticated:" in out
     assert "no" in out
+
+
+def test_config_hides_cached_context_urls_when_not_authenticated(monkeypatch, capsys):
+    class _UnauthorizedResponse:
+        def raise_for_status(self):
+            request = httpx.Request("GET", "http://localhost:8000/v1/auth/me")
+            response = httpx.Response(
+                401, request=request, json={"detail": "Authentication required"}
+            )
+            raise httpx.HTTPStatusError(
+                "Client error '401 Unauthorized' for url",
+                request=request,
+                response=response,
+            )
+
+        def json(self):
+            return {"detail": "Authentication required"}
+
+    class _StaleClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, path, params=None):
+            assert path == "/v1/auth/me"
+            return _UnauthorizedResponse()
+
+    monkeypatch.setattr(
+        "keshro_cli.cli.load_auth",
+        lambda: {
+            "api_url": "http://localhost:8000",
+            "token": "jwt-stale",
+            "default_plan_id": "plan-123",
+            "default_plan_title": "AWS Batch to Airflow",
+            "user": {"email": "cli@example.com", "name": "CLI User"},
+        },
+    )
+    monkeypatch.setattr(
+        "keshro_cli.context.load_auth",
+        lambda: {
+            "api_url": "http://localhost:8000",
+            "token": "jwt-stale",
+            "default_plan_id": "plan-123",
+            "default_plan_title": "AWS Batch to Airflow",
+            "user": {"email": "cli@example.com", "name": "CLI User"},
+        },
+    )
+    monkeypatch.setattr(
+        "keshro_cli.cli._resolve_repo_linked_plan",
+        lambda work_dir=None: ("plan-123", "AWS Batch to Airflow"),
+    )
+    monkeypatch.setattr(
+        "keshro_cli.cli.make_client", lambda api_url=None, token=None: _StaleClient()
+    )
+
+    cli.main(["config"])
+    out = ANSI_RE.sub("", capsys.readouterr().out)
+    assert "Authenticated:" in out
+    assert "no" in out
+    assert "Current repo migration:" not in out
+    assert "Current repo project:" not in out
+    assert "Default migration:" not in out
+    assert "Default project:" not in out
+    assert "Migration URL:" not in out
+    assert "Project URL:" not in out
 
 
 def test_auth_login_requires_token_argument(monkeypatch, capsys):

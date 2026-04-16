@@ -6856,32 +6856,33 @@ def _config_show():
     repo_plan = payload["repo_plan_title"] or payload["repo_plan_id"]
     default_plan = payload["default_plan_title"] or payload["default_plan_id"]
     repo_plan_id = payload.get("repo_plan_id") or ""
-    if repo_plan:
-        app_url = _app_url_from_api_url(payload["api_url"])
-        repo_migration_id = payload.get("repo_context_migration_id") or ""
-        if repo_migration_id:
-            print(f"{DIM}Current repo migration:{RESET} {YELLOW}{repo_plan}{RESET}")
-            print(
-                f"{DIM}Migration URL:{RESET} {CYAN}{app_url}/migrations/{repo_migration_id}{RESET}"
-            )
-        else:
-            repo_plan_url = f"{app_url}/plans/{repo_plan_id}" if repo_plan_id else ""
-            print(f"{DIM}Current repo project:{RESET} {YELLOW}{repo_plan}{RESET}")
-            if repo_plan_url:
-                print(f"{DIM}Project URL:{RESET} {CYAN}{repo_plan_url}{RESET}")
-    if default_plan and plan_id != repo_plan_id:
-        app_url = _app_url_from_api_url(payload["api_url"])
-        default_migration_id = payload.get("default_context_migration_id") or ""
-        if default_migration_id:
-            print(f"{DIM}Default migration:{RESET} {YELLOW}{default_plan}{RESET}")
-            print(
-                f"{DIM}Migration URL:{RESET} {CYAN}{app_url}/migrations/{default_migration_id}{RESET}"
-            )
-        else:
-            plan_url = f"{app_url}/plans/{plan_id}" if plan_id else ""
-            print(f"{DIM}Default project:{RESET} {YELLOW}{default_plan}{RESET}")
-            if plan_url:
-                print(f"{DIM}Project URL:{RESET} {CYAN}{plan_url}{RESET}")
+    if payload["authenticated"]:
+        if repo_plan:
+            app_url = _app_url_from_api_url(payload["api_url"])
+            repo_migration_id = payload.get("repo_context_migration_id") or ""
+            if repo_migration_id:
+                print(f"{DIM}Current repo migration:{RESET} {YELLOW}{repo_plan}{RESET}")
+                print(
+                    f"{DIM}Migration URL:{RESET} {CYAN}{app_url}/migrations/{repo_migration_id}{RESET}"
+                )
+            else:
+                repo_plan_url = f"{app_url}/plans/{repo_plan_id}" if repo_plan_id else ""
+                print(f"{DIM}Current repo project:{RESET} {YELLOW}{repo_plan}{RESET}")
+                if repo_plan_url:
+                    print(f"{DIM}Project URL:{RESET} {CYAN}{repo_plan_url}{RESET}")
+        if default_plan and plan_id != repo_plan_id:
+            app_url = _app_url_from_api_url(payload["api_url"])
+            default_migration_id = payload.get("default_context_migration_id") or ""
+            if default_migration_id:
+                print(f"{DIM}Default migration:{RESET} {YELLOW}{default_plan}{RESET}")
+                print(
+                    f"{DIM}Migration URL:{RESET} {CYAN}{app_url}/migrations/{default_migration_id}{RESET}"
+                )
+            else:
+                plan_url = f"{app_url}/plans/{plan_id}" if plan_id else ""
+                print(f"{DIM}Default project:{RESET} {YELLOW}{default_plan}{RESET}")
+                if plan_url:
+                    print(f"{DIM}Project URL:{RESET} {CYAN}{plan_url}{RESET}")
     if user.get("email"):
         print(f"{DIM}User:{RESET} {CYAN}{user['email']}{RESET}")
     if user.get("name"):

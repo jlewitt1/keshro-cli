@@ -5,6 +5,7 @@ import httpx
 
 from .client import get_api_url, print_output
 from .config import clear_auth, load_auth, save_auth
+from .context import _app_url_from_api_url
 
 RESET = "\033[0m"
 DIM = "\033[2m"
@@ -21,6 +22,10 @@ def _fetch_user(base_url: str, token: str) -> dict:
         )
         res.raise_for_status()
         return res.json()
+
+
+def _account_api_url(base_url: str) -> str:
+    return f"{_app_url_from_api_url(base_url).rstrip('/')}/account?tab=api"
 
 
 def _browser_login(base_url: str, json_output: bool = False) -> dict | None:
@@ -154,7 +159,15 @@ def cmd_auth_login(
             "Get a token from Account -> API at keshro.com"
         )
 
-    user = _fetch_user(base_url, token)
+    try:
+        user = _fetch_user(base_url, token)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code in {401, 403}:
+            raise SystemExit(
+                "This API token is invalid or expired.\n"
+                f"Generate a new token in Account -> API: {_account_api_url(base_url)}"
+            ) from exc
+        raise
     body = {"token": token, "user": user}
     save_auth({"token": body["token"], "user": body["user"], "api_url": base_url})
     if json_output:
