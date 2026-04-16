@@ -46,6 +46,20 @@ def test_build_agent_exec_command_omits_add_dir_for_codex():
     assert command[:3] == ["codex", "exec", "do the thing"]
 
 
+def test_build_agent_exec_command_omits_worktree_when_disabled():
+    command = cli._build_agent_exec_command(
+        "claude",
+        "claude",
+        "do the thing",
+        task_title="Test task",
+        work_dir="/tmp/demo",
+        worktree_name="keshro-demo",
+        use_worktree=False,
+    )
+
+    assert "--worktree" not in command
+
+
 def test_merge_codex_worktree_changes_applies_worktree_diff():
     with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as worktree_parent:
         subprocess.run(

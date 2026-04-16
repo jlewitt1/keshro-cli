@@ -43,6 +43,15 @@ from .context import (
     _resolve_plan_context, _resolve_plan_or_migration_context,
     _resolve_repo_linked_plan, _set_default_plan_after_create,
 )
+from .execution_policies import (
+    DEFAULT_PR_POLICY,
+    DEFAULT_WORKTREE_POLICY,
+    normalize_pr_policy,
+    normalize_worktree_policy,
+    resolve_pr_policy,
+    resolve_worktree_policy,
+    should_use_isolated_worktree,
+)
 from .formatting import (
     _clear_saved_context, _COST_CONTEXT_LABELS, _elapsed_runtime_from_events,
     _event_status, _extract_error_detail, _extract_source_titles,
@@ -2670,6 +2679,7 @@ def _build_agent_exec_command(
     task_order: int | None = None,
     work_dir: str,
     worktree_name: str,
+    use_worktree: bool = True,
 ) -> list[str]:
     if agent_name == "codex":
         return [
@@ -2685,12 +2695,10 @@ def _build_agent_exec_command(
             "never",
             "--ephemeral",
         ]
-    return [
+    command = [
         agent_bin,
         "-p",
         prompt,
-        "--worktree",
-        worktree_name,
         "--output-format",
         "json",
         "--permission-mode",
@@ -2701,6 +2709,9 @@ def _build_agent_exec_command(
         "--add-dir",
         work_dir,
     ]
+    if use_worktree:
+        command[3:3] = ["--worktree", worktree_name]
+    return command
 
 
 def _build_visible_agent_exec_command(
@@ -2712,6 +2723,7 @@ def _build_visible_agent_exec_command(
     task_order: int | None = None,
     work_dir: str,
     worktree_name: str,
+    use_worktree: bool = True,
 ) -> list[str]:
     if agent_name == "codex":
         return [
@@ -2725,12 +2737,10 @@ def _build_visible_agent_exec_command(
             "--skip-git-repo-check",
             "--ephemeral",
         ]
-    return [
+    command = [
         agent_bin,
         "-p",
         prompt,
-        "--worktree",
-        worktree_name,
         "--permission-mode",
         "bypassPermissions",
         "--name",
@@ -2738,6 +2748,9 @@ def _build_visible_agent_exec_command(
         "--add-dir",
         work_dir,
     ]
+    if use_worktree:
+        command[3:3] = ["--worktree", worktree_name]
+    return command
 
 
 def _shell_command_with_prompt_placeholder(
@@ -2851,6 +2864,8 @@ async def _launch_single_agent(
     visible: bool = False,
     launch_index: int = 0,
     use_local_repo_context: bool = True,
+    worktree_policy: str = DEFAULT_WORKTREE_POLICY,
+    pr_policy: str = DEFAULT_PR_POLICY,
 ) -> AgentResult:
     global _active_agent_procs, _active_terminal_titles, _active_temp_files, _active_terminal_pid_files
     task_id = _clean(task.get("id")) or "unknown"
@@ -2860,6 +2875,9 @@ async def _launch_single_agent(
 
     # Resolve agent binary (_resolve_prompt_agent raises SystemExit if not found)
     agent_name, agent_bin = _resolve_prompt_agent(agent)
+    use_isolated_worktree = should_use_isolated_worktree(
+        task, policy=worktree_policy
+    )
 
     # Stagger agent launches to avoid git worktree lock contention
     if launch_index > 0:
@@ -2905,7 +2923,7 @@ async def _launch_single_agent(
         codex_worktree_path = ""
         codex_worktree_base_rev = ""
         codex_worktree_branch = ""
-        if agent_name == "codex":
+        if agent_name == "codex" and use_isolated_worktree:
             import tempfile
             import shutil
 
@@ -2970,7 +2988,7 @@ async def _launch_single_agent(
                     failure_kind="launch",
                 )
 
-        exec_dir = codex_worktree_path if agent_name == "codex" else work_dir
+        exec_dir = codex_worktree_path if codex_worktree_path else work_dir
         agent_env = os.environ.copy()
         agent_env["KESHRO_ACTIVE_PLAN_ID"] = plan_id
         agent_env["KESHRO_AGENT_CLIENT"] = "Codex" if agent_name == "codex" else "Claude Code"
@@ -3193,6 +3211,7 @@ async def _launch_single_agent(
                 task_order=task_order,
                 work_dir=exec_dir,
                 worktree_name=worktree_name,
+                use_worktree=use_isolated_worktree,
             )
             visible_command = _build_visible_agent_exec_command(
                 agent_name,
@@ -3202,6 +3221,7 @@ async def _launch_single_agent(
                 task_order=task_order,
                 work_dir=exec_dir,
                 worktree_name=worktree_name,
+                use_worktree=use_isolated_worktree,
             )
 
             heartbeat_active = True
@@ -3795,37 +3815,41 @@ async def _launch_single_agent(
             except Exception:
                 pass
 
-            # Record branch and worktree path on the task
             worktree_dir = str(Path(work_dir) / ".claude" / "worktrees" / worktree_name)
-            try:
-                wt_branch = await _git_stdout(
-                    "git", "rev-parse", "--abbrev-ref", "HEAD",
-                    cwd=worktree_dir if Path(worktree_dir).is_dir() else exec_dir,
-                )
-                if wt_branch and wt_branch != "HEAD":
-                    await api_client.patch(
-                        f"/v1/plans/{plan_id}/tasks/{task_id}",
-                        json={"github_branch": wt_branch},
-                    )
-            except Exception:
-                pass
-
-            # Create PR for the task branch if it has commits
-            pr_exec_dir = worktree_dir if Path(worktree_dir).is_dir() else exec_dir
-            pr_url = await _create_task_pr(
-                exec_dir=pr_exec_dir,
-                task_id=task_id,
-                task_title=task_title,
-                plan_title=_clean(plan.get("title")) or "Untitled plan",
-                task=task,
-                api_client=api_client,
-                plan_id=plan_id,
+            task_branch_dir = (
+                worktree_dir
+                if Path(worktree_dir).is_dir()
+                else (exec_dir if use_isolated_worktree else "")
             )
-            if pr_url:
-                print(f"    {GREEN}PR:{RESET} {pr_url}")
-                # Clean up worktree — branch is pushed, worktree no longer needed
-                if Path(worktree_dir).is_dir():
-                    await _cleanup_worktree(work_dir, worktree_dir)
+            branch_pushed = False
+            if task_branch_dir:
+                try:
+                    wt_branch = await _git_stdout(
+                        "git", "rev-parse", "--abbrev-ref", "HEAD", cwd=task_branch_dir
+                    )
+                    if wt_branch and wt_branch != "HEAD":
+                        await api_client.patch(
+                            f"/v1/plans/{plan_id}/tasks/{task_id}",
+                            json={"github_branch": wt_branch},
+                        )
+                except Exception:
+                    pass
+
+                pr_url, branch_pushed = await _create_task_pr(
+                    exec_dir=task_branch_dir,
+                    task_id=task_id,
+                    task_title=task_title,
+                    plan_title=_clean(plan.get("title")) or "Untitled plan",
+                    task=task,
+                    api_client=api_client,
+                    plan_id=plan_id,
+                    pr_policy=pr_policy,
+                )
+                if pr_url:
+                    print(f"    {GREEN}PR:{RESET} {pr_url}")
+
+            if Path(worktree_dir).is_dir() and branch_pushed:
+                await _cleanup_worktree(work_dir, worktree_dir)
             elif Path(worktree_dir).is_dir():
                 # No PR created — check if worktree is clean (no new commits)
                 has_changes = False
@@ -4141,6 +4165,8 @@ async def _run_parallel(
             # set to something non-default so users can see what's being
             # routed where.
             plan_default = _clean(plan.get("effective_default_executor")) or None
+            plan_worktree_policy = resolve_worktree_policy(plan)
+            plan_pr_policy = resolve_pr_policy(plan)
             resolved_executors = [
                 resolve_task_executor(
                     spec["task"],
@@ -4206,6 +4232,8 @@ async def _run_parallel(
                     visible=visible,
                     launch_index=i,
                     use_local_repo_context=use_local_repo_context,
+                    worktree_policy=plan_worktree_policy,
+                    pr_policy=plan_pr_policy,
                 )
                 for i, (spec, name) in enumerate(
                     zip(launch_specs, resolved_executors)
@@ -6836,12 +6864,10 @@ def _config_show():
         print_output(payload, True)
         return
     user = payload["user"] or {}
-    print(f"{DIM}API URL:{RESET} {CYAN}{payload['api_url']}{RESET}")
     print(
         f"{DIM}Authenticated:{RESET} "
         f"{GREEN if payload['authenticated'] else CYAN}{'yes' if payload['authenticated'] else 'no'}{RESET}"
     )
-    print(f"{DIM}Default agent:{RESET} {YELLOW}{payload['default_agent']}{RESET}")
     # Scope: explicit org vs personal. "Default context: personal" was too
     # vague — users couldn't tell from the label whether migrations would
     # land in their personal space or under an org. The web UI shows the
@@ -6852,7 +6878,7 @@ def _config_show():
         scope_label = f"org ({YELLOW}{org_name or org_id_value}{RESET})"
     else:
         scope_label = f"{YELLOW}personal{RESET}"
-    print(f"{DIM}Scope:{RESET} {scope_label}")
+    print(f"{DIM}Current scope:{RESET} {scope_label}")
     repo_plan = payload["repo_plan_title"] or payload["repo_plan_id"]
     default_plan = payload["default_plan_title"] or payload["default_plan_id"]
     repo_plan_id = payload.get("repo_plan_id") or ""
@@ -6874,24 +6900,50 @@ def _config_show():
             app_url = _app_url_from_api_url(payload["api_url"])
             default_migration_id = payload.get("default_context_migration_id") or ""
             if default_migration_id:
-                print(f"{DIM}Default migration:{RESET} {YELLOW}{default_plan}{RESET}")
+                print(f"{DIM}Current migration:{RESET} {YELLOW}{default_plan}{RESET}")
                 print(
                     f"{DIM}Migration URL:{RESET} {CYAN}{app_url}/migrations/{default_migration_id}{RESET}"
                 )
             else:
                 plan_url = f"{app_url}/plans/{plan_id}" if plan_id else ""
-                print(f"{DIM}Default project:{RESET} {YELLOW}{default_plan}{RESET}")
+                print(f"{DIM}Current project:{RESET} {YELLOW}{default_plan}{RESET}")
                 if plan_url:
                     print(f"{DIM}Project URL:{RESET} {CYAN}{plan_url}{RESET}")
     if user.get("email"):
         print(f"{DIM}User:{RESET} {CYAN}{user['email']}{RESET}")
     if user.get("name"):
         print(f"{DIM}Name:{RESET} {user['name']}")
-    if payload["orgs"]:
-        org_names = ", ".join(
-            org.get("name") or org.get("id") or "Unknown org" for org in payload["orgs"]
+    if payload["authenticated"]:
+        current_org = None
+        if org_id_value:
+            current_org = next(
+                (org for org in payload["orgs"] if _clean(org.get("id")) == org_id_value),
+                None,
+            )
+        org_executor = _clean((current_org or {}).get("default_executor")) or ""
+        org_worktree = _clean((current_org or {}).get("worktree_policy")) or ""
+        org_pr = _clean((current_org or {}).get("pr_policy")) or ""
+        personal_executor_raw = _clean(user.get("default_executor"))
+        personal_worktree_raw = normalize_worktree_policy(user.get("worktree_policy")) or ""
+        personal_pr_raw = normalize_pr_policy(user.get("pr_policy")) or ""
+        effective_executor = personal_executor_raw or org_executor or "local_claude_code"
+        effective_worktree = (
+            personal_worktree_raw or org_worktree or DEFAULT_WORKTREE_POLICY
         )
-        print(f"{DIM}Organizations:{RESET} {org_names}")
+        effective_pr = personal_pr_raw or org_pr or DEFAULT_PR_POLICY
+
+        print(
+            f"{DIM}Execution defaults:{RESET} "
+            f"{YELLOW}executor={effective_executor}; create_worktrees={effective_worktree}; open_prs={effective_pr}{RESET}"
+        )
+        if current_org:
+            org_executor = org_executor or "unset"
+            org_worktree = org_worktree or DEFAULT_WORKTREE_POLICY
+            org_pr = org_pr or DEFAULT_PR_POLICY
+            print(
+                f"{DIM}Workspace defaults:{RESET} "
+                f"{YELLOW}executor={org_executor}; create_worktrees={org_worktree}; open_prs={org_pr}{RESET}"
+            )
 
 
 @config_app.callback(invoke_without_command=True)
