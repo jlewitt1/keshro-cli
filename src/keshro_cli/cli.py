@@ -6930,8 +6930,10 @@ def _config_show():
                 None,
             )
         org_executor = _clean((current_org or {}).get("default_executor")) or ""
-        org_worktree = _clean((current_org or {}).get("worktree_policy")) or ""
-        org_pr = _clean((current_org or {}).get("pr_policy")) or ""
+        org_worktree = (
+            normalize_worktree_policy((current_org or {}).get("worktree_policy")) or ""
+        )
+        org_pr = normalize_pr_policy((current_org or {}).get("pr_policy")) or ""
         personal_executor_raw = _clean(user.get("default_executor"))
         personal_worktree_raw = normalize_worktree_policy(user.get("worktree_policy")) or ""
         personal_pr_raw = normalize_pr_policy(user.get("pr_policy")) or ""

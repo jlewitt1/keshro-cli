@@ -201,10 +201,15 @@ async def _create_task_pr(
     plan_id: str,
     pr_policy: str = "auto",
 ) -> tuple[str | None, bool]:
-    """Push the current branch and create a PR. Returns the PR URL or None.
+    """Push the current branch and (optionally) create a PR.
 
-    Tries gh CLI first, then GitHub API via GITHUB_TOKEN env var.
-    Warns if neither is available.
+    Returns a tuple of (pr_url, branch_pushed). pr_url is the created or
+    existing PR URL, or None when no PR was created (disabled policy, no
+    commits ahead, etc). branch_pushed indicates whether the branch was
+    pushed to origin so callers can condition worktree cleanup on it.
+
+    Tries gh CLI first, then GitHub API via GITHUB_TOKEN env var. Warns if
+    neither is available.
     """
     # Detect current branch
     try:

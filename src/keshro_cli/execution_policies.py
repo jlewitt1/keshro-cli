@@ -84,9 +84,6 @@ def task_likely_requires_code_changes(task: dict) -> bool:
         "audit",
         "inventory",
     )
-    if any(marker in text for marker in non_code_markers):
-        return False
-
     code_markers = (
         "implement",
         "update code",
@@ -103,7 +100,14 @@ def task_likely_requires_code_changes(task: dict) -> bool:
         "workflow",
         "schema",
     )
-    return any(marker in text for marker in code_markers)
+    # Code markers win over non-code markers for mixed-signal tasks like
+    # "Performance analysis and fix the memory leak" so strong code intent
+    # is not suppressed by a co-occurring discovery/review word.
+    if any(marker in text for marker in code_markers):
+        return True
+    if any(marker in text for marker in non_code_markers):
+        return False
+    return False
 
 
 def should_use_isolated_worktree(task: dict, *, policy: str) -> bool:
