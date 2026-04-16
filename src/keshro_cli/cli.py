@@ -7662,13 +7662,41 @@ def _print_plan_status(plan: dict) -> None:
     todo = [s for s in steps if _clean(s.get("status")).lower() == "todo"]
     plan_status = _clean(plan.get("status")).lower()
 
-    # Header
+    # Header. When there are no tasks, surface the authoritative status so
+    # agents reading the Bash output header don't have to guess. Agents
+    # routinely miss the truncated middle lines, so if the header says
+    # anything other than the literal state they invent one (e.g. read
+    # "[no tasks]" → assert "analysis still running" even when analysis
+    # was terminal minutes ago).
+    #
+    # Priority for the label:
+    # 1. Steps exist → show task progress.
+    # 2. Migration info attached and in a terminal / analyzing state →
+    #    show that, since migration.status is the source of truth for
+    #    whether the analysis that produces plan tasks is done.
+    # 3. Fall back to plan_status.
+    migration = plan.get("_migration") or {}
+    migration_status = _clean(migration.get("status")).lower()
     if steps:
         progress_label = f"[{len(done)}/{len(steps)} done]"
+    elif migration_status in {"analyzing", "queued", "pending"}:
+        progress_label = f"[{migration_status}]"
+    elif migration_status == "completed":
+        progress_label = "[analysis complete — 0 tasks]"
+    elif migration_status == "failed":
+        progress_label = "[analysis failed — 0 tasks]"
     elif plan_status == "analyzing":
         progress_label = "[analyzing]"
+    elif plan_status:
+        # Non-migration (project) plans: generation is synchronous in
+        # /plans/generate, so a plan row existing at all means generation
+        # is done. "0 tasks" here is definitive, not provisional — the
+        # plan came back with whatever tasks the LLM decided to emit.
+        # Labeling with "plan generated" makes this unambiguous to the
+        # agent reading only the truncated Bash header line.
+        progress_label = f"[plan generated ({plan_status}) — 0 tasks]"
     else:
-        progress_label = "[no tasks]"
+        progress_label = "[plan generated — 0 tasks]"
     print(f"\n{CYAN}{title}{RESET} {DIM}{path_label}{RESET} {progress_label}")
     print()
 
@@ -8068,6 +8096,25 @@ def _run_status(plan_id: str | None, watch: bool = False, tui: bool = False) -> 
         return
 
     plan = _get_plan_or_exit(resolved_plan_id)
+
+    # When the plan is linked to a migration, fetch the migration's status
+    # too — the plan's own status ("draft" / "ready" / "active" / "completed")
+    # doesn't tell us whether the UNDERLYING analysis (the thing that
+    # produces the plan steps in the first place) is still running, has
+    # failed, or is genuinely done but produced zero tasks. Without this,
+    # "no tasks" means "we cannot tell" and the agent has to guess.
+    migration_id = _clean(plan.get("migration_id"))
+    if migration_id:
+        try:
+            with make_client(_state.api_url, _state.token) as client:
+                migration_res = client.get(f"/v1/migrations/{migration_id}")
+                if migration_res.status_code == 200:
+                    plan["_migration"] = migration_res.json()
+        except Exception:
+            # Best-effort. If the migration fetch fails the header falls back
+            # to plan-level status — not worse than the previous behaviour.
+            pass
+
     if _state.json:
         print_output(plan, True)
         return
