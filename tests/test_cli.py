@@ -2,10 +2,12 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import asyncio
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import click
 import httpx
@@ -4147,6 +4149,84 @@ def test_migration_create_does_not_retry_linked_plan_poll_on_non_404_http_error(
 
     assert attempts["count"] == 1
     assert sleeps == []
+
+
+def test_watch_via_polling_enriches_migration_status_each_refresh(monkeypatch):
+    seen: list[dict] = []
+
+    monkeypatch.setattr(
+        cli,
+        "_get_plan_or_exit",
+        lambda plan_id: {"id": plan_id, "migration_id": "mig-123", "plan_steps": []},
+    )
+    monkeypatch.setattr(
+        cli,
+        "_enrich_plan_with_migration_status",
+        lambda plan: {**plan, "_migration": {"status": "analyzing"}},
+    )
+    monkeypatch.setattr(cli, "_print_plan_status", lambda plan: seen.append(plan))
+    monkeypatch.setattr(
+        cli.time,
+        "sleep",
+        lambda seconds: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    cli._watch_via_polling("plan-123")
+
+    assert len(seen) == 1
+    assert seen[0]["_migration"]["status"] == "analyzing"
+
+
+def test_watch_via_sse_enriches_migration_status_on_refresh(monkeypatch):
+    helper_calls: list[str] = []
+    printed: list[dict] = []
+    get_calls = {"count": 0}
+
+    class _FakeSSE:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def iter_sse(self):
+            return iter(
+                [
+                    SimpleNamespace(event="plan_updated"),
+                    SimpleNamespace(event="comment"),
+                ]
+            )
+
+    class _FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def _fake_get_plan(plan_id):
+        get_calls["count"] += 1
+        return {"id": plan_id, "migration_id": "mig-123", "seq": str(get_calls["count"])}
+
+    def _fake_enrich(plan):
+        helper_calls.append(plan["seq"])
+        return {**plan, "_migration": {"status": "analyzing"}}
+
+    monkeypatch.setattr(cli, "_get_plan_or_exit", _fake_get_plan)
+    monkeypatch.setattr(cli, "_enrich_plan_with_migration_status", _fake_enrich)
+    monkeypatch.setattr(cli, "_print_plan_status", lambda plan: printed.append(plan))
+    monkeypatch.setattr(cli.httpx, "Client", lambda *args, **kwargs: _FakeClient())
+    monkeypatch.setitem(
+        sys.modules,
+        "httpx_sse",
+        SimpleNamespace(connect_sse=lambda client, method, path: _FakeSSE()),
+    )
+
+    cli._watch_via_sse("plan-123")
+
+    assert helper_calls == ["1", "2"]
+    assert printed[0]["_migration"]["status"] == "analyzing"
+    assert printed[-1]["seq"] == "2"
 
 
 def test_migration_list_json_outputs_machine_readable_rows(fake_client, capsys):
