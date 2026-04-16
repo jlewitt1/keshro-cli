@@ -199,11 +199,17 @@ async def _create_task_pr(
     task: dict,
     api_client: httpx.AsyncClient,
     plan_id: str,
-) -> str | None:
-    """Push the current branch and create a PR. Returns the PR URL or None.
+    pr_policy: str = "auto",
+) -> tuple[str | None, bool]:
+    """Push the current branch and (optionally) create a PR.
 
-    Tries gh CLI first, then GitHub API via GITHUB_TOKEN env var.
-    Warns if neither is available.
+    Returns a tuple of (pr_url, branch_pushed). pr_url is the created or
+    existing PR URL, or None when no PR was created (disabled policy, no
+    commits ahead, etc). branch_pushed indicates whether the branch was
+    pushed to origin so callers can condition worktree cleanup on it.
+
+    Tries gh CLI first, then GitHub API via GITHUB_TOKEN env var. Warns if
+    neither is available.
     """
     # Detect current branch
     try:
@@ -211,14 +217,14 @@ async def _create_task_pr(
             "git", "rev-parse", "--abbrev-ref", "HEAD", cwd=exec_dir
         )
         if not branch_name or branch_name == "HEAD":
-            return None
+            return None, False
     except Exception:
-        return None
+        return None, False
 
     default_branch = _resolve_default_branch(exec_dir)
 
     if branch_name == default_branch:
-        return None
+        return None, False
 
     # Check for commits ahead
     try:
@@ -226,9 +232,16 @@ async def _create_task_pr(
             "git", "log", f"origin/{default_branch}..HEAD", "--oneline", cwd=exec_dir
         )
         if not log_output.strip():
-            return None
+            return None, False
     except Exception:
-        return None
+        return None, False
+
+    normalized_pr_policy = str(pr_policy or "auto").strip().lower() or "auto"
+    if normalized_pr_policy == "disabled":
+        print(
+            f"    {DIM}PR policy disabled; leaving branch {branch_name} local only.{RESET}"
+        )
+        return None, False
 
     # Push
     try:
@@ -237,7 +250,7 @@ async def _create_task_pr(
         )
     except Exception as exc:
         print(f"    {DIM}Could not push branch {branch_name}: {exc}{RESET}")
-        return None
+        return None, False
 
     # Detect remote provider
     try:
@@ -302,7 +315,13 @@ async def _create_task_pr(
                 )
         except Exception:
             pass
-        return pr_url
+        return pr_url, True
+
+    if normalized_pr_policy == "manual":
+        print(
+            f"    {DIM}Branch {branch_name} pushed; PR policy is manual, so no pull request was opened.{RESET}"
+        )
+        return None, True
 
     # Strategy 1: try gh CLI
     pr_url = await _create_pr_via_gh(
@@ -339,7 +358,7 @@ async def _create_task_pr(
         print(
             f"    {DIM}Install gh CLI or set GITHUB_TOKEN to enable auto-PR for {provider}.{RESET}"
         )
-        return None
+        return None, True
 
     # Link PR to task — merge with existing artifact links
     try:
@@ -366,7 +385,7 @@ async def _create_task_pr(
     except Exception:
         pass
 
-    return pr_url
+    return pr_url, True
 
 
 async def _find_existing_pr(*, exec_dir: str, branch_name: str) -> str | None:
