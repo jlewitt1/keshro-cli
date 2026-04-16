@@ -7662,13 +7662,41 @@ def _print_plan_status(plan: dict) -> None:
     todo = [s for s in steps if _clean(s.get("status")).lower() == "todo"]
     plan_status = _clean(plan.get("status")).lower()
 
-    # Header
+    # Header. When there are no tasks, surface the authoritative status so
+    # agents reading the Bash output header don't have to guess. Agents
+    # routinely miss the truncated middle lines, so if the header says
+    # anything other than the literal state they invent one (e.g. read
+    # "[no tasks]" → assert "analysis still running" even when analysis
+    # was terminal minutes ago).
+    #
+    # Priority for the label:
+    # 1. Steps exist → show task progress.
+    # 2. Migration info attached and in a terminal / analyzing state →
+    #    show that, since migration.status is the source of truth for
+    #    whether the analysis that produces plan tasks is done.
+    # 3. Fall back to plan_status.
+    migration = plan.get("_migration") or {}
+    migration_status = _clean(migration.get("status")).lower()
     if steps:
         progress_label = f"[{len(done)}/{len(steps)} done]"
+    elif migration_status in {"analyzing", "queued", "pending"}:
+        progress_label = f"[{migration_status}]"
+    elif migration_status == "completed":
+        progress_label = "[analysis complete — 0 tasks]"
+    elif migration_status == "failed":
+        progress_label = "[analysis failed — 0 tasks]"
     elif plan_status == "analyzing":
         progress_label = "[analyzing]"
+    elif plan_status:
+        # Non-migration (project) plans: generation is synchronous in
+        # /plans/generate, so a plan row existing at all means generation
+        # is done. "0 tasks" here is definitive, not provisional — the
+        # plan came back with whatever tasks the LLM decided to emit.
+        # Labeling with "plan generated" makes this unambiguous to the
+        # agent reading only the truncated Bash header line.
+        progress_label = f"[plan generated ({plan_status}) — 0 tasks]"
     else:
-        progress_label = "[no tasks]"
+        progress_label = "[plan generated — 0 tasks]"
     print(f"\n{CYAN}{title}{RESET} {DIM}{path_label}{RESET} {progress_label}")
     print()
 
@@ -7993,7 +8021,7 @@ def _watch_via_sse(plan_id: str) -> None:
         "Authorization": f"Bearer {_state.token}",
         "Accept": "text/event-stream",
     }
-    plan = _get_plan_or_exit(plan_id)
+    plan = _enrich_plan_with_migration_status(_get_plan_or_exit(plan_id))
     print("\033[2J\033[H", end="")
     _print_plan_status(plan)
     print(f"  {DIM}Connecting to SSE...{RESET}")
@@ -8008,7 +8036,9 @@ def _watch_via_sse(plan_id: str) -> None:
                 print(f"  {GREEN}● live{RESET} · SSE connected · Ctrl+C to stop")
                 for event in sse.iter_sse():
                     if event.event and event.event != "comment":
-                        plan = _get_plan_or_exit(plan_id)
+                        plan = _enrich_plan_with_migration_status(
+                            _get_plan_or_exit(plan_id)
+                        )
                         print("\033[2J\033[H", end="")
                         _print_plan_status(plan)
                         print(
@@ -8025,12 +8055,29 @@ def _watch_via_polling(plan_id: str) -> None:
     try:
         while True:
             print("\033[2J\033[H", end="")
-            plan = _get_plan_or_exit(plan_id)
+            plan = _enrich_plan_with_migration_status(_get_plan_or_exit(plan_id))
             _print_plan_status(plan)
             print(f"  {YELLOW}● polling{RESET} · refreshes every 10s · Ctrl+C to stop")
             _time.sleep(10)
     except KeyboardInterrupt:
         print("\nStopped watching.")
+
+
+def _enrich_plan_with_migration_status(plan: dict) -> dict:
+    migration_id = _clean(plan.get("migration_id"))
+    if not migration_id:
+        return plan
+
+    try:
+        with make_client(_state.api_url, _state.token) as client:
+            migration_res = client.get(f"/v1/migrations/{migration_id}")
+            if migration_res.status_code == 200:
+                plan["_migration"] = migration_res.json()
+    except Exception:
+        # Best-effort. If the migration fetch fails the header falls back
+        # to plan-level status — not worse than the previous behaviour.
+        pass
+    return plan
 
 
 def _run_status(plan_id: str | None, watch: bool = False, tui: bool = False) -> None:
@@ -8067,7 +8114,8 @@ def _run_status(plan_id: str | None, watch: bool = False, tui: bool = False) -> 
         run_tui(api_url=api_url, token=token, plan_id=resolved_plan_id)
         return
 
-    plan = _get_plan_or_exit(resolved_plan_id)
+    plan = _enrich_plan_with_migration_status(_get_plan_or_exit(resolved_plan_id))
+
     if _state.json:
         print_output(plan, True)
         return
