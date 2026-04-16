@@ -6868,6 +6868,7 @@ def _config_show():
         f"{DIM}Authenticated:{RESET} "
         f"{GREEN if payload['authenticated'] else CYAN}{'yes' if payload['authenticated'] else 'no'}{RESET}"
     )
+    print(f"{DIM}API URL:{RESET} {CYAN}{payload['api_url']}{RESET}")
     # Scope: explicit org vs personal. "Default context: personal" was too
     # vague — users couldn't tell from the label whether migrations would
     # land in their personal space or under an org. The web UI shows the
@@ -6913,6 +6914,14 @@ def _config_show():
         print(f"{DIM}User:{RESET} {CYAN}{user['email']}{RESET}")
     if user.get("name"):
         print(f"{DIM}Name:{RESET} {user['name']}")
+    if payload["authenticated"] and payload["orgs"]:
+        org_labels = [
+            _clean(org.get("name")) or _clean(org.get("id"))
+            for org in payload["orgs"]
+        ]
+        org_labels = [label for label in org_labels if label]
+        if org_labels:
+            print(f"{DIM}Organizations:{RESET} {YELLOW}{', '.join(org_labels)}{RESET}")
     if payload["authenticated"]:
         current_org = None
         if org_id_value:
