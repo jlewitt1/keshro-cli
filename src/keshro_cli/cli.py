@@ -6926,7 +6926,11 @@ def _config_show():
         current_org = None
         if org_id_value:
             current_org = next(
-                (org for org in payload["orgs"] if _clean(org.get("id")) == org_id_value),
+                (
+                    org
+                    for org in (payload.get("orgs") or [])
+                    if _clean(org.get("id")) == org_id_value
+                ),
                 None,
             )
         org_executor = _clean((current_org or {}).get("default_executor")) or ""
