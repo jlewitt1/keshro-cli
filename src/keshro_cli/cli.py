@@ -156,8 +156,8 @@ def _read_runbook_file(path: str | None) -> str | None:
     if not path:
         return None
     try:
-        text = Path(path).read_text()
-    except OSError as exc:
+        text = Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
         raise typer.BadParameter(f"Could not read runbook file {path}: {exc}") from exc
     text = text.strip()
     if not text:
@@ -5999,6 +5999,18 @@ def _create_migration(
                     for q in questions
                 )
                 full_description += f"\n\n---\nClarifying question answers:\n{qa_text}"
+
+            # /v1/plans/generate does not accept user_runbook (it's a
+            # migration-only field). If the user passed --runbook on a
+            # generic-project invocation, surface that the file is being
+            # ignored rather than dropping it silently.
+            if runbook_text and not _state.json:
+                print(
+                    f"{YELLOW}Warning:{RESET} --runbook is only used for migration plans; "
+                    f"ignoring it for this generic project. Re-run with --template, "
+                    f"--source-type/--target-type, or a migration-shaped description "
+                    f"to attach the runbook."
+                )
 
             generate_payload: dict[str, Any] = {
                 "description": full_description,
