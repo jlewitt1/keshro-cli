@@ -146,6 +146,30 @@ def _read_context_file(path: str | None) -> str | None:
         raise typer.BadParameter(f"Could not read context file {path}: {exc}") from exc
 
 
+# Server caps user_runbook at 200_000 chars (see schemas.MigrationRequest);
+# clamp here too so a too-large file produces a helpful CLI error instead of
+# a 422 from the API.
+_MAX_RUNBOOK_CHARS = 200_000
+
+
+def _read_runbook_file(path: str | None) -> str | None:
+    if not path:
+        return None
+    try:
+        text = Path(path).read_text()
+    except OSError as exc:
+        raise typer.BadParameter(f"Could not read runbook file {path}: {exc}") from exc
+    text = text.strip()
+    if not text:
+        return None
+    if len(text) > _MAX_RUNBOOK_CHARS:
+        raise typer.BadParameter(
+            f"Runbook {path} is {len(text):,} chars; max is {_MAX_RUNBOOK_CHARS:,}. "
+            f"Trim it or split it before passing --runbook."
+        )
+    return text
+
+
 def _interactive_cli_prompts_allowed() -> bool:
     return not _state.json and sys.stdout.isatty() and not _inside_coding_agent()
 
@@ -5398,6 +5422,18 @@ def _create_migration(
             help="Read additional context from a file.",
         ),
     ] = None,
+    runbook: Annotated[
+        Optional[str],
+        typer.Option(
+            "--runbook",
+            help=(
+                "Path to a markdown runbook (e.g. RUNBOOK.md, CUTOVER.md) you "
+                "already maintain. Sections become cited evidence in the "
+                "deepening pass so surfaced risks can map back to specific "
+                "documented steps as `runbook:<section-slug>`."
+            ),
+        ),
+    ] = None,
     github_url: Annotated[
         Optional[str], typer.Option("--github-url", "-g", help="GitHub URL to attach.")
     ] = None,
@@ -5492,6 +5528,7 @@ def _create_migration(
             "--template already selects migration mode. Do not combine it with --as-migration, --source-type, or --target-type."
         )
 
+    runbook_text = _read_runbook_file(runbook)
     file_context = _read_context_file(context_file)
     if file_context:
         context = "\n\n".join(
@@ -5582,6 +5619,7 @@ def _create_migration(
                     answers_file or bool(context and context.strip())
                 ),
                 agent=agent,
+                user_runbook=runbook_text,
             )
         else:
             # Generic project mode — scan, get questions, agent answers, generate plan
@@ -5696,6 +5734,7 @@ def _create_migration(
                         skip_questions=skip_questions,
                         prompt_for_context=not context_entered_interactively,
                         agent=agent,
+                        user_runbook=runbook_text,
                     )
                 if not _state.json:
                     # Restate scope right next to the template match so users
@@ -5726,6 +5765,7 @@ def _create_migration(
                     skip_questions=skip_questions,
                     prompt_for_context=not context_entered_interactively,
                     agent=agent,
+                    user_runbook=runbook_text,
                 )
 
             # Detect migration intent and offer the migration pipeline
@@ -5801,6 +5841,7 @@ def _create_migration(
                                 skip_questions=skip_questions,
                                 prompt_for_context=not context_entered_interactively,
                                 agent=agent,
+                                user_runbook=runbook_text,
                             )
                         else:
                             if not _state.json:
@@ -5828,6 +5869,7 @@ def _create_migration(
                                 skip_questions=skip_questions,
                                 prompt_for_context=not context_entered_interactively,
                                 agent=agent,
+                                user_runbook=runbook_text,
                             )
 
             client = make_client()
@@ -6356,6 +6398,7 @@ def _create_migration_inner(
     skip_questions: bool = False,
     prompt_for_context: bool = True,
     agent: str = "auto",
+    user_runbook: str | None = None,
 ) -> None:
     with make_client(_state.api_url, _state.token) as client:
         template_res = client.get(
@@ -6483,6 +6526,7 @@ def _create_migration_inner(
                 else []
             ),
             "custom_fields": custom_fields or None,
+            "user_runbook": user_runbook or None,
         }
         if not skip_questions:
             clarifier_questions = list(resume_questions or [])
@@ -6558,6 +6602,7 @@ def _create_custom_migration_inner(
     skip_questions: bool = False,
     prompt_for_context: bool = True,
     agent: str = "auto",
+    user_runbook: str | None = None,
 ) -> None:
     with make_client(_state.api_url, _state.token) as client:
         resolved_work_dir = str(Path(work_dir).resolve()) if work_dir else None
@@ -6613,6 +6658,7 @@ def _create_custom_migration_inner(
             "resource_url": _clean(resource_url) or None,
             "org_id": _clean(org_id) or None,
             "custom_fields": custom_fields or None,
+            "user_runbook": user_runbook or None,
         }
         if not skip_questions:
             clarifier_questions = list(resume_questions or [])
