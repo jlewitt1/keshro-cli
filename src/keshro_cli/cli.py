@@ -6116,6 +6116,16 @@ def _run_graphify(work_dir: str) -> Path | None:
     except ImportError:
         return None
 
+    import shutil
+
+    # graphify.extract() infers a cache root from the common parent of the
+    # input file paths and writes <root>/graphify-out/cache/{hash}.json with
+    # no API to override. When the user points keshro at their own project
+    # we end up polluting their working tree. Sweep that directory after
+    # we're done so the user never sees it. Skip the sweep if a real
+    # graphify-out predates the call (legacy in-repo workflow).
+    polluted_dir = Path(work_dir) / "graphify-out"
+    sweep_polluted = not polluted_dir.exists()
     try:
         import json as _json
 
@@ -6149,6 +6159,9 @@ def _run_graphify(work_dir: str) -> Path | None:
         return cached_report
     except Exception:
         return None
+    finally:
+        if sweep_polluted and polluted_dir.exists():
+            shutil.rmtree(polluted_dir, ignore_errors=True)
 
 
 def _read_graphify_report(report_path: Path) -> str | None:
