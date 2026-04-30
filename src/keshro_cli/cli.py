@@ -6092,7 +6092,6 @@ _GRAPHIFY_TIMEOUT_SECONDS = 90
 
 
 def _run_graphify(work_dir: str) -> Path | None:
-    import shutil
     import tempfile
 
     # Check legacy in-repo path first (for backward compat)
@@ -6116,6 +6115,8 @@ def _run_graphify(work_dir: str) -> Path | None:
         from graphify.report import generate
     except ImportError:
         return None
+
+    import shutil
 
     # graphify.extract() infers a cache root from the common parent of the
     # input file paths and writes <root>/graphify-out/cache/{hash}.json with
